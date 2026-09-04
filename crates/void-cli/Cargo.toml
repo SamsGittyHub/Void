@@ -1,0 +1,22 @@
+[package]
+name = "void-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Void reference CLI client and relay runner."
+
+[dependencies]
+void-crypto = { path = "../void-crypto" }
+void-proto = { path = "../void-proto" }
+void-store = { path = "../void-store" }
+void-client = { path = "../void-client" }
+void-relay = { path = "../void-relay" }
+
+[[bin]]
+name = "void"
+path = "src/main.rs"
+
+[[bin]]
+name = "void-relayd"
+path = "src/relayd.rs"

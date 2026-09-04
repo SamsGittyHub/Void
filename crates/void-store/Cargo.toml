@@ -1,0 +1,15 @@
+[package]
+name = "void-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Void encrypted local storage, hardware key wrapping, duress destruction, retention."
+
+[dependencies]
+void-crypto = { path = "../void-crypto" }
+void-proto = { path = "../void-proto" }
+
+[lib]
+name = "void_store"
+path = "src/lib.rs"

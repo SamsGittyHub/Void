@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleDisplayName</key>
+	<string>Void</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+
+	<!-- FR-DIST-03: Void's cryptography goes well past the TLS-only export
+	     exemption (ML-KEM, ML-DSA, XChaCha20-Poly1305, Argon2id implemented
+	     or used directly, not merely HTTPS to a server). `true` here is the
+	     honest answer, not the convenient one — it routes App Store Connect
+	     through the standard export-compliance questionnaire on submission
+	     rather than skipping it. That questionnaire is a distribution-time
+	     step for whoever submits the build; this key only states the fact
+	     the questionnaire is triggered by. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<true/>
+
+	<!-- FR-DISC-01: QR scanning for contact establishment. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Void uses the camera to scan a contact's invite code. Nothing else. No photo is
+	saved, and Void does not use the camera anywhere else in the app.</string>
+
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIRequiresFullScreen</key>
+	<false/>
+</dict>
+</plist>

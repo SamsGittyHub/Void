@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Required for any socket at all, including the Tor circuit
+         void-tor opens — FR-TRANS-03 is enforced by never dialling anything
+         outside that seam, not by withholding this permission (withholding
+         it would break the one connection Void is supposed to make). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- FR-DISC-01: QR scanning for contact establishment. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <application
+        android:name="app.void.VoidApplication"
+        android:allowBackup="false"
+        android:label="Void"
+        android:theme="@style/Theme.Void"
+        android:hardwareAccelerated="true">
+        <!-- android:allowBackup="false" is FR-STOR-05's Android counterpart
+             to iOS's isExcludedFromBackup: nothing Void writes should reach
+             adb backup or Auto Backup for Apps. -->
+
+        <!-- Fully-qualified, not ".MainActivity": AGP resolves a relative
+             android:name against `namespace` (app.voidmessenger, chosen only
+             because "void" can't be a Java package segment — see
+             app/build.gradle.kts), not against these classes' own `package
+             app.void` declaration. A relative name here previously pointed
+             the manifest at app.voidmessenger.MainActivity, which doesn't
+             exist, and the app failed to launch. -->
+        <activity
+            android:name="app.void.MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,0 +1,6 @@
+# NFR-SEC-04: "a documented toolchain produces a bit-identical artifact hash on
+# any machine." Pinning the toolchain is the first half of that; the profile
+# settings in Cargo.toml are the second.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

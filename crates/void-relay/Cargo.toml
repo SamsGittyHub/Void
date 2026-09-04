@@ -1,0 +1,15 @@
+[package]
+name = "void-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Void untrusted mailbox relay: per-contact queues, sealed deposits, TTL, wake signals."
+
+[dependencies]
+void-crypto = { path = "../void-crypto" }
+void-proto = { path = "../void-proto" }
+
+[lib]
+name = "void_relay"
+path = "src/lib.rs"

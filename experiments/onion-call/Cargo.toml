@@ -1,0 +1,36 @@
+# Throwaway latency probe for the onion-to-onion calling question.
+#
+# Deliberately its own workspace, and deliberately outside `crates/`: none of
+# the CI checks scan this path, and nothing here is meant to ship. It exists to
+# answer one question with a number — can a Tor onion circuit carry a voice
+# packet stream — before any of that shape gets written into the protocol.
+[workspace]
+
+[package]
+name = "onion-call-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+arti-client = { version = "0.45", default-features = false, features = [
+    "tokio",
+    "rustls",
+    "onion-service-client",
+    "onion-service-service",
+] }
+tor-rtcompat = { version = "0.45", features = ["tokio"] }
+tor-hsservice = "0.45"
+tor-cell = "0.45"
+# HsId's Display is redacted by default, which is correct for logs and useless
+# for printing an address you need to paste into the other terminal.
+safelog = "0.9"
+# Arti reports what it is doing through `tracing` and says nothing without a
+# subscriber. Set RUST_LOG=info (or tor_hsservice=debug) to see it.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
+futures = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[profile.release]
+opt-level = 2

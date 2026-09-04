@@ -1,0 +1,17 @@
+[package]
+name = "void-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Void client engine: transport abstraction, send scheduler, contacts, sessions."
+
+[dependencies]
+void-crypto = { path = "../void-crypto" }
+void-proto = { path = "../void-proto" }
+void-store = { path = "../void-store" }
+void-relay = { path = "../void-relay" }
+
+[lib]
+name = "void_client"
+path = "src/lib.rs"

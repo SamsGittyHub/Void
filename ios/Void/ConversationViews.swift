@@ -1,0 +1,478 @@
+//  ConversationViews.swift
+//
+//  The conversation list, the conversation itself, and verification.
+//
+//  Two requirements drive almost every decision here:
+//
+//  - FR-UI-03: "Security state is shown as plain-language conversation status
+//    (verified / unverified / key changed), not as jargon or iconography the
+//    user must learn."
+//  - FR-DISC-05: a changed identity key **blocks** messaging until the user
+//    acknowledges it. Blocks, not warns. The composer is replaced, not disabled
+//    with a tooltip.
+
+import SwiftUI
+
+// MARK: - Models the UI renders
+
+struct ConversationSummary: Identifiable {
+    let id: Data          // the contact fingerprint
+    var name: String
+    var trust: TrustState
+    var lastMessage: String
+    var unread: Int
+}
+
+struct MessageItem: Identifiable {
+    let id: UInt64
+    var text: String
+    var isOutgoing: Bool
+    var delivery: DeliveryState
+    var timestamp: Date
+}
+
+// MARK: - Conversation list
+
+struct ConversationListView: View {
+    @Binding var conversations: [ConversationSummary]
+    @Binding var messagesByFingerprint: [Data: [MessageItem]]
+    var isOffline: Bool
+    var myWords: String = ""
+    var onNewContact: () -> Void
+    var onSend: (Data, String) -> Void = { _, _ in }
+    var onVerificationResult: (Data, Bool) -> Void = { _, _ in }
+
+    private var emptyStateDescription: String {
+        "Void has no directory and no way to look people up. You start a conversation by "
+            + "scanning someone's code in person, or by sending them a one-time link through "
+            + "another app."
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if isOffline {
+                    // NFR-REL-04 and FR-TRANS-05: the user is told plainly that
+                    // nothing is being sent, and told *why that is deliberate*.
+                    // A generic "no connection" banner would invite them to
+                    // look for a workaround; there isn't one, by design.
+                    Section {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Not connected").font(.subheadline.bold())
+                                Text(
+                                    "Messages are saved on this phone and will send when Void "
+                                        + "can reach the network. Nothing is sent any other way."
+                                )
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "wifi.slash").foregroundStyle(.orange)
+                        }
+                    }
+                }
+
+                ForEach($conversations) { $conversation in
+                    NavigationLink(value: conversation.id) {
+                        ConversationRow(conversation: conversation)
+                    }
+                }
+            }
+            .navigationTitle("Void")
+            .navigationDestination(for: Data.self) { id in
+                if let index = conversations.firstIndex(where: { $0.id == id }) {
+                    ConversationView(
+                        conversation: $conversations[index],
+                        messages: Binding(
+                            get: { messagesByFingerprint[id] ?? [] },
+                            set: { messagesByFingerprint[id] = $0 }
+                        ),
+                        onSend: { text in onSend(id, text) },
+                        myWords: myWords,
+                        onVerificationResult: { matched in onVerificationResult(id, matched) }
+                    )
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: onNewContact) {
+                        Label("Add contact", systemImage: "qrcode")
+                    }
+                }
+            }
+            .overlay {
+                // ContentUnavailableView is iOS 17+; NFR-COMP-01 sets the
+                // floor at iOS 16, so this needs a plain fallback rather
+                // than raising the deployment target for one empty state.
+                if conversations.isEmpty {
+                    if #available(iOS 17.0, *) {
+                        ContentUnavailableView {
+                            Label("No conversations", systemImage: "qrcode.viewfinder")
+                        } description: {
+                            Text(emptyStateDescription)
+                        } actions: {
+                            Button("Add a contact", action: onNewContact)
+                                .buttonStyle(.borderedProminent)
+                        }
+                    } else {
+                        VStack(spacing: 12) {
+                            Image(systemName: "qrcode.viewfinder")
+                                .font(.system(size: 40))
+                                .foregroundStyle(.secondary)
+                            Text("No conversations").font(.headline)
+                            Text(emptyStateDescription)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.horizontal, 32)
+                            Button("Add a contact", action: onNewContact)
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ConversationRow: View {
+    let conversation: ConversationSummary
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(conversation.name.isEmpty ? "Unnamed contact" : conversation.name)
+                        .font(.headline)
+                    trustBadge
+                }
+                Text(conversation.lastMessage)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if conversation.unread > 0 {
+                Text("\(conversation.unread)")
+                    .font(.caption.bold())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.accentColor))
+                    .foregroundStyle(.white)
+            }
+        }
+        .padding(.vertical, 4)
+        // NFR-COMP-04: the security state must be conveyed non-visually. A
+        // VoiceOver user hears "Not verified yet" as part of the row, not as a
+        // decorative image they have to hunt for.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(conversation.name). \(conversation.trust.statusLine). \(conversation.lastMessage)"
+        )
+    }
+
+    /// FR-UI-03: words, not icons the user must learn. The symbol is decorative
+    /// and is hidden from accessibility; the text carries the meaning.
+    @ViewBuilder private var trustBadge: some View {
+        switch conversation.trust {
+        case .verified:
+            Text("Verified")
+                .font(.caption2.bold())
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(Color.green.opacity(0.18)))
+                .foregroundStyle(.green)
+        case .unverified:
+            Text("Not verified")
+                .font(.caption2)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                .foregroundStyle(.secondary)
+        case .keyChanged:
+            Text("Code changed")
+                .font(.caption2.bold())
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(Color.orange.opacity(0.22)))
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
+// MARK: - A conversation
+
+struct ConversationView: View {
+    @Binding var conversation: ConversationSummary
+    @Binding var messages: [MessageItem]
+    /// Called with the drafted text when the user taps send. The engine
+    /// queues it — see `VoidCore.send` — it does not transmit immediately
+    /// (FR-MSG-06), so this view's optimistic local append and the eventual
+    /// delivery-state update it receives back are two different moments.
+    var onSend: (String) -> Void = { _ in }
+    /// My own security code, for the verification sheet. The engine only
+    /// exposes this via an instance call (`VoidCore.fingerprintWords`), so
+    /// unlike the contact's code below it cannot be computed inline here.
+    var myWords = ""
+    var onVerificationResult: (Bool) -> Void = { _ in }
+    @State private var draft = ""
+    @State private var showingVerification = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if conversation.trust != .verified {
+                trustBanner
+            }
+
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(messages) { message in
+                        MessageBubble(message: message)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 16)
+            }
+
+            Divider()
+
+            // FR-DISC-05: a changed key blocks messaging. The composer is
+            // *replaced*, not disabled — a greyed-out text field invites the
+            // user to look for a way around it, and there must not be one.
+            if conversation.trust.canSend {
+                composer
+            } else {
+                blockedComposer
+            }
+        }
+        .navigationTitle(conversation.name.isEmpty ? "Unnamed contact" : conversation.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button("Verify") { showingVerification = true }
+            }
+        }
+        .sheet(isPresented: $showingVerification) {
+            NavigationStack {
+                VerificationView(
+                    contactName: conversation.name,
+                    trust: $conversation.trust,
+                    myCode: myWords,
+                    theirCode: VoidCore.fingerprintWords(for: conversation.id),
+                    onResult: onVerificationResult
+                )
+            }
+        }
+    }
+
+    private var trustBanner: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(conversation.trust.statusLine).font(.subheadline.bold())
+            Text(conversation.trust.guidance)
+                .font(.footnote)
+                .fixedSize(horizontal: false, vertical: true)
+            if conversation.trust == .keyChanged {
+                HStack {
+                    Button("Check their code") { showingVerification = true }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    // Acknowledging drops to "not verified", never straight to
+                    // "verified" — dismissing a banner is not the same as
+                    // comparing codes with a person.
+                    Button("I've checked, continue") {
+                        conversation.trust = .unverified
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .padding(.top, 4)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            conversation.trust == .keyChanged
+                ? Color.orange.opacity(0.15) : Color.secondary.opacity(0.10)
+        )
+        .accessibilityElement(children: .combine)
+    }
+
+    private var composer: some View {
+        HStack(spacing: 8) {
+            TextField("Message", text: $draft, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...5)
+            Button {
+                let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return }
+                messages.append(
+                    MessageItem(
+                        id: UInt64(messages.count + 1),
+                        text: text,
+                        isOutgoing: true,
+                        // Queued, not sent: the engine holds it until the next
+                        // scheduled slot so that send timing does not reveal
+                        // typing timing (FR-MSG-06).
+                        delivery: .queued,
+                        timestamp: Date()
+                    )
+                )
+                onSend(text)
+                draft = ""
+            } label: {
+                Image(systemName: "arrow.up.circle.fill").font(.title2)
+            }
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(12)
+    }
+
+    private var blockedComposer: some View {
+        VStack(spacing: 8) {
+            Label("Messaging is paused", systemImage: "hand.raised.fill")
+                .font(.subheadline.bold())
+                .foregroundStyle(.orange)
+            Text(
+                "Void will not send to this contact until you have checked their new security "
+                    + "code through another channel."
+            )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(16)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct MessageBubble: View {
+    let message: MessageItem
+
+    var body: some View {
+        HStack {
+            if message.isOutgoing { Spacer(minLength: 48) }
+            VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 3) {
+                Text(message.text)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(
+                                message.isOutgoing
+                                    ? Color.accentColor.opacity(0.20)
+                                    : Color.secondary.opacity(0.14)
+                            )
+                    )
+                if message.isOutgoing && !message.delivery.label.isEmpty {
+                    Text(message.delivery.label)
+                        .font(.caption2)
+                        .foregroundStyle(
+                            message.delivery == .failed ? Color.orange : Color.secondary
+                        )
+                }
+            }
+            if !message.isOutgoing { Spacer(minLength: 48) }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            (message.isOutgoing ? "You said: " : "They said: ")
+                + message.text
+                + (message.delivery.label.isEmpty ? "" : ". \(message.delivery.label)")
+        )
+    }
+}
+
+// MARK: - Verification (FR-DISC-04)
+
+struct VerificationView: View {
+    let contactName: String
+    @Binding var trust: TrustState
+    /// Both codes, rendered from the real fingerprints by the caller —
+    /// `VoidCore.fingerprintWords` for mine, `VoidCore.fingerprintWords(for:)`
+    /// for theirs. Defaulted only so this view still compiles in a preview.
+    var myCode = "tinas-dofil-lusab-babad\ngutih-tugad-kabad-lusab"
+    var theirCode = "lusab-babad-gutih-tugad\nkabad-lusab-tinas-dofil"
+    /// Called once the user confirms a match or mismatch, so the caller can
+    /// tell the engine (`VoidCore.markVerified` / `acknowledgeKeyChange`) —
+    /// this view only knows what the user said, not how to record it.
+    var onResult: (Bool) -> Void = { _ in }
+
+    @State private var typedCode = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        Form {
+            Section {
+                Text(
+                    "Compare these codes with \(contactName.isEmpty ? "them" : contactName) in "
+                        + "person, or on a call where you recognise their voice. Do not compare "
+                        + "them inside Void — if someone is intercepting this conversation, they "
+                        + "would be showing you their own codes."
+                )
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+            } header: {
+                Text("How to do this")
+            }
+
+            Section("Their code") {
+                Text(theirCode)
+                    .font(.body.monospaced())
+                    .textSelection(.enabled)
+                    .accessibilityLabel(spelledOut(theirCode))
+            }
+
+            Section("Your code") {
+                Text(myCode)
+                    .font(.body.monospaced())
+                    .textSelection(.enabled)
+                    .accessibilityLabel(spelledOut(myCode))
+            }
+
+            Section {
+                Button {
+                    trust = .verified
+                    onResult(true)
+                    dismiss()
+                } label: {
+                    Label("The codes match", systemImage: "checkmark.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button(role: .destructive) {
+                    trust = .keyChanged
+                    onResult(false)
+                    dismiss()
+                } label: {
+                    Label("They don't match", systemImage: "exclamationmark.triangle")
+                        .frame(maxWidth: .infinity)
+                }
+            } footer: {
+                Text(
+                    "If the codes don't match, stop using this conversation and reach the person "
+                        + "another way. Void will pause messaging."
+                )
+            }
+        }
+        .navigationTitle("Compare codes")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Not now") { dismiss() }
+            }
+        }
+    }
+
+    /// NFR-COMP-04: a VoiceOver user comparing codes needs them spelled, not
+    /// read as invented words. "lusab" pronounced by a screen reader is not
+    /// something two people can reliably match.
+    private func spelledOut(_ code: String) -> String {
+        code
+            .replacingOccurrences(of: "\n", with: ", ")
+            .split(separator: "-")
+            .map { $0.map(String.init).joined(separator: " ") }
+            .joined(separator: ", then ")
+    }
+}

@@ -1,0 +1,89 @@
+name: Void
+options:
+  bundleIdPrefix: app.void
+  deploymentTarget:
+    iOS: "16.0" # NFR-COMP-01
+
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    SWIFT_OBJC_BRIDGING_HEADER: Void/VoidFFI-Bridging-Header.h
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Simulator builds never need a provisioning profile or a device team —
+    # "Sign to Run Locally" is enough, and forcing it here (rather than
+    # leaving Xcode to pick automatically) is what keeps a Simulator build
+    # working even when the signed-in Apple ID's team can't provision new
+    # entitlements right now (an unagreed Program License Agreement update
+    # blocks that account-side, independent of anything in this project —
+    # see the App Store Connect / developer.apple.com prompt). Device builds
+    # still go through normal automatic signing and do need that resolved.
+    "CODE_SIGN_IDENTITY[sdk=iphonesimulator*]": "-"
+    "CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]": YES
+    "CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]": YES
+    DEVELOPMENT_TEAM: 377HB985YB
+
+targets:
+  Void:
+    type: application
+    platform: iOS
+    sources:
+      - path: Void
+        excludes:
+          - "Info.plist"
+          - "Void.entitlements"
+          - "VoidFFI-Bridging-Header.h"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.void.Void
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Referenced directly, not through xcodegen's `info:`/`entitlements:`
+        # blocks — those *generate* a file at the given path from a
+        # `properties:` map, clobbering the hand-written one that is already
+        # there. `INFOPLIST_FILE` / `CODE_SIGN_ENTITLEMENTS` just point at
+        # the real files and leave them alone.
+        INFOPLIST_FILE: Void/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Void/Void.entitlements
+    dependencies:
+      - framework: VoidFFI.xcframework
+        embed: true
+      # void-tor's Arti bootstrap uses rusqlite for Tor's own consensus/state
+      # storage (arti-client, not void-store) and links against the
+      # system's SQLite rather than vendoring one.
+      - sdk: libsqlite3.tbd
+      # DataScannerViewController (QRScanner.swift) is Objective-C-based and
+      # doesn't reliably auto-link from just `import VisionKit`.
+      - sdk: VisionKit.framework
+
+  # A minimal target that only checks the app target still compiles cleanly.
+  # `xcodebuild test` needs at least one testable target to be meaningful in
+  # CI even before real unit tests exist here — the Rust core's own test
+  # suite (`cargo test --workspace`) is what actually exercises behaviour;
+  # this exists so `.github/workflows/ci.yml` has something to point
+  # `xcodebuild test` at without lying about coverage it doesn't have.
+  VoidTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: VoidTests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: Void
+
+  # Drives the real Simulator UI (XCUIApplication) for checks ImageRenderer
+  # can't do off-screen, like TabView(.page)-based carousels — see
+  # QRCodeUITests.swift.
+  VoidUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: VoidUITests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: Void

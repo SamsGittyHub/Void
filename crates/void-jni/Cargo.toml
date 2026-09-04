@@ -1,0 +1,16 @@
+[package]
+name = "void-jni"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "JNI bindings the Android client calls, built on void-ffi's C ABI."
+
+[dependencies]
+void-ffi = { path = "../void-ffi" }
+jni = "0.21"
+
+[lib]
+name = "void_jni"
+path = "src/lib.rs"
+crate-type = ["cdylib"]

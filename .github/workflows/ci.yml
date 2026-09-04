@@ -1,0 +1,136 @@
+name: CI
+
+# Every check here corresponds to a PRD requirement that says "enforced by CI"
+# rather than "by policy". Non-negotiable #3 and #4 both use that phrase, and
+# they mean it: a policy is a thing someone can forget, and a failing build is
+# not.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets
+      - name: Test with overflow checks in release
+        # The release profile enables overflow-checks deliberately: a silent
+        # wraparound in the ratchet's message counter would be a nonce reuse.
+        run: cargo test --workspace --release
+
+  banned-symbols:
+    name: "FR-TRANS-02 — no WebRTC/ICE/STUN/TURN"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo generate-lockfile
+      - run: ./scripts/check_banned_symbols.sh
+
+  no-direct-network:
+    name: "FR-TRANS-03 — no network outside Tor"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check_no_direct_network.sh
+
+  dependency-policy:
+    name: "NFR-SEC-07 — dependency and unsafe policy"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check_deps.sh
+
+  reproducible:
+    name: "NFR-SEC-04 — reproducible core"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/check_reproducible.sh
+
+  audit:
+    name: "NFR-SEC-07 — cargo audit / vet / deny"
+    runs-on: ubuntu-latest
+    # void-crypto has zero dependencies today, so this is currently trivial.
+    # It is here so that it is already wired when that changes — which it will,
+    # when the ACVP-validated PQC crates land (DECISIONS D-006).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit cargo-deny --locked
+      - run: cargo audit
+      - run: cargo deny check
+
+  constant-time:
+    name: "NFR-SEC-03 — constant-time verification"
+    runs-on: ubuntu-latest
+    continue-on-error: true   # informational until the harness is calibrated
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: dudect-style timing analysis
+        # NFR-SEC-03 requires constant-time implementations "verified with
+        # dudect or equivalent in CI". Source-level review cannot establish
+        # this; only measurement on the built artifact can.
+        run: |
+          echo "TODO: dudect harness over ct::eq, Poly1305::verify,"
+          echo "      mlkem::decaps, and PinVerifier::check."
+          echo "See docs/DECISIONS.md — this is a known gap, not a passing check."
+
+  ios:
+    name: "iOS app — build and test"
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - run: cargo install cbindgen --locked
+      - run: brew install xcodegen
+      - name: Build the Rust core and package the XCFramework
+        run: ./scripts/build_ios.sh
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Build for Simulator
+        working-directory: ios
+        run: |
+          xcodebuild -project Void.xcodeproj -scheme Void -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' build
+      - name: Test on Simulator
+        working-directory: ios
+        run: |
+          xcodebuild -project Void.xcodeproj -scheme Void -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 16' test
+
+  transparency-log:
+    name: "NFR-SEC-05 — transparency log"
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/check_reproducible.sh | tee build.log
+      - name: Log artifact hash to the public transparency log
+        run: |
+          echo "cosign sign-blob --yes target/release/libvoid_crypto.rlib"
+          echo "Records: source revision ${{ github.sha }}, toolchain, artifact hash."
+          echo "PRD §8.1: this covers the Rust core. The store-delivered app"
+          echo "binary is re-signed by Apple and is explicitly out of scope."

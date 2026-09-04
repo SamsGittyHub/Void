@@ -1,0 +1,31 @@
+# cargo-deny configuration (NFR-SEC-07).
+#
+# void-crypto has an empty dependency table today, which makes most of this
+# vacuous. It is written now so the policy is already in force when the
+# ACVP-validated PQC crates arrive (DECISIONS D-006) rather than being drafted
+# under time pressure at that point.
+
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# FR-TRANS-02 / non-negotiable #4, at the dependency-graph level.
+deny = [
+    { name = "webrtc" },
+    { name = "str0m" },
+    { name = "stun" },
+    { name = "turn" },
+    { name = "libnice" },
+]
+
+[licenses]
+# NFR-SEC-06 publishes Void under an OSI-approved licence; dependencies must be
+# compatible with AGPL-3.0-or-later.
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0", "AGPL-3.0"]
+confidence-threshold = 0.93
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

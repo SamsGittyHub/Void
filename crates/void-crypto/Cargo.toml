@@ -1,0 +1,23 @@
+[package]
+name = "void-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Void cryptographic primitives: hybrid post-quantum KEM, signatures, AEAD, KDF."
+
+# NFR-SEC-07: every dependency here is pinned, vendored, and reviewed on
+# update. `scripts/check_deps.sh` allows exactly these two crates and no
+# others — see its comment for why these two, and `docs/DECISIONS.md#d-006`
+# for the migration this closes.
+[dependencies]
+ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "hazmat"] }
+ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc"] }
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+name = "void_crypto"
+path = "src/lib.rs"

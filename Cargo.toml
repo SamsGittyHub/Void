@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/void-crypto",
+    "crates/void-proto",
+    "crates/void-store",
+    "crates/void-client",
+    "crates/void-relay",
+    "crates/void-cli",
+    "crates/void-ffi",
+    "crates/void-jni",
+    "crates/void-tor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/void-messenger/void"
+
+# NFR-SEC-04: reproducible builds. These settings are part of the documented
+# toolchain; changing them changes the artifact hash.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false
+overflow-checks = true
+
+[profile.test]
+overflow-checks = true

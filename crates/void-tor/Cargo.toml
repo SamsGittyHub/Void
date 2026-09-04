@@ -1,0 +1,54 @@
+[package]
+name = "void-tor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bootstraps Arti and hands void-client's TorTransport a live circuit. Kept separate from void-client (D-009) so the async runtime never enters the trusted core's dependency graph."
+
+[dependencies]
+void-client = { path = "../void-client" }
+void-proto = { path = "../void-proto" }
+void-crypto = { path = "../void-crypto" }
+# rustls, not native-tls: native-tls uses the platform's own TLS (Secure
+# Transport on Apple platforms, fine there) except on Android, where it
+# falls back to openssl-sys — which needs a cross-compiled OpenSSL for
+# aarch64-linux-android that this build environment has no way to produce.
+# rustls is pure Rust on every target this workspace builds for, so one
+# feature choice works for both void-ffi's (iOS) and void-jni's (Android)
+# consumers instead of needing a platform-conditional Cargo feature.
+# `onion-service-service` is what lets this crate *host* a service, not just
+# reach one. Calls need it: the caller publishes an ephemeral service and the
+# callee dials it, so media never touches the relay (D-024).
+arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "onion-service-client", "onion-service-service"] }
+tor-rtcompat = { version = "0.45", features = ["tokio"] }
+tor-hsservice = "0.45"
+tor-cell = "0.45"
+safelog = "0.9"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"] }
+# rustls 0.23 needs a process-wide `CryptoProvider` installed before anything
+# touches TLS. It can auto-select one "from crate features" only when
+# exactly one backend is unambiguous across the whole dependency graph —
+# fragile in a workspace this size, and it silently failed on Android
+# specifically (`get_default_or_install_from_crate_features` panicked with
+# no provider found, aborting the process — see TorHandle::bootstrap).
+# Depending on rustls directly, just to call the explicit install function
+# once, replaces that autodetection with an unambiguous choice.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# arti-client's tor-persist pulls in rusqlite transitively for Tor's own
+# state database. Bundling rather than linking a system libsqlite3 fixes two
+# problems: Android's NDK does not expose a stable, linkable libsqlite3 the
+# way iOS links the OS's libsqlite3.tbd (there is nothing to `-lsqlite3`
+# against), and NFR-SEC-04's reproducible-build goal is better served by one
+# pinned SQLite than whatever version happens to be on the build host. This
+# is a feature-forcing dependency — void-tor's own code never calls rusqlite
+# directly — so Cargo's feature unification is what makes it take effect.
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+
+[dev-dependencies]
+void-relay = { path = "../void-relay" }
+
+[lib]
+name = "void_tor"
+path = "src/lib.rs"

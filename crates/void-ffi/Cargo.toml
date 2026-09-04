@@ -1,0 +1,24 @@
+[package]
+name = "void-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "C ABI / UniFFI-shaped bindings for the Void core."
+
+[dependencies]
+void-crypto = { path = "../void-crypto" }
+void-proto = { path = "../void-proto" }
+void-store = { path = "../void-store" }
+void-client = { path = "../void-client" }
+void-tor = { path = "../void-tor" }
+
+[dev-dependencies]
+void-relay = { path = "../void-relay" }
+
+[lib]
+name = "void_ffi"
+path = "src/lib.rs"
+# staticlib for iOS (linked into the app binary), cdylib for Android (loaded
+# via System.loadLibrary), rlib so the workspace tests can exercise it.
+crate-type = ["staticlib", "cdylib", "rlib"]
