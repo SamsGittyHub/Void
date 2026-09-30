@@ -22,30 +22,6 @@
 
 import SwiftUI
 
-/// One call, as the UI needs to see it.
-///
-/// The media secret lives here because it arrives inside a ratchet-encrypted
-/// offer and there is nowhere else to get it from. It is never rendered, never
-/// logged, and never leaves this process.
-struct CallSession: Equatable {
-    let fingerprint: Data
-    var callId: Data
-    var mediaSecret: Data = Data()
-    var address: String
-    var port: UInt16
-    var phase: CallPhase
-}
-
-/// Where a call is in its life.
-enum CallPhase: Equatable {
-    case publishing        // our onion service is going up
-    case ringing           // offer sent, waiting for them
-    case incoming          // they are calling us
-    case connecting        // answered; media connection opening
-    case active            // audio is flowing
-    case ended(String)     // with a plain-language reason
-}
-
 // MARK: - The active call screen
 
 struct CallView: View {
@@ -125,15 +101,15 @@ struct CallView: View {
         case .publishing:
             return "Setting up a private connection…"
         case .ringing:
-            return "Ringing. This can take a few seconds to reach them."
+            // Honest about the wait: the offer travels through their mailbox,
+            // and that takes up to a minute (D-028).
+            return "Ringing. It can take up to a minute to reach them."
         case .incoming:
             return "Incoming"
         case .connecting:
             return "Connecting…"
         case .active:
             return "Connected over Tor"
-        case .ended(let reason):
-            return reason
         }
     }
 }

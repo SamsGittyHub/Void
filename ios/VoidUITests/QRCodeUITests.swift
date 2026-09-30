@@ -1,39 +1,36 @@
 //  QRCodeUITests.swift
 //
-//  `QRCodeRenderTests` (the unit test) proved the wrong thing: ImageRenderer
-//  can't flatten `TabView(.page)` off-screen (see the "Invalid Configuration
-//  ... UIKitPagingView" warning it logs), so its PNG for the multi-frame case
-//  was a system placeholder, not a QR code — a false pass, since the assertion
-//  only checked `png.count > 0`. This drives the real on-screen app through
-//  Simulator and captures what `XCUIScreen` actually shows, which does not
-//  go through ImageRenderer at all.
+//  Drives the real app in the Simulator: open "Add a contact", make an
+//  invitation, and check that its one QR code is on screen. The screenshot is
+//  attached so a person can see what was shown; `QRCodeRenderTests` is what
+//  checks that the code reads back as the link.
 
 import XCTest
 
 final class QRCodeUITests: XCTestCase {
-    func testGeneratingAnInviteShowsAScannableQRCode() {
+    func testCreatingAnInvitationShowsItsCode() {
         let app = XCUIApplication()
         app.launchArguments += ["-uiTestsSkipOnboarding"]
         app.launch()
 
+        // Launch unlocks the key and opens the database before anything shows.
         let addContact = app.buttons["Add contact"]
-        XCTAssertTrue(addContact.waitForExistence(timeout: 5))
+        XCTAssertTrue(addContact.waitForExistence(timeout: 20))
         addContact.tap()
 
-        let generate = app.buttons["Generate an invite"]
-        XCTAssertTrue(generate.waitForExistence(timeout: 5))
-        generate.tap()
+        let create = app.buttons["createInviteButton"]
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        create.tap()
 
-        // Real invite generation (identity + prekey bundle) runs synchronously
-        // on tap; give the carousel a beat to lay out before capturing.
-        Thread.sleep(forTimeInterval: 1.5)
+        // Made offline if need be: the invitation waits in the outbox, and the
+        // code is shown straight away.
+        let code = app.descendants(matching: .any)["inviteQRCode"]
+        XCTAssertTrue(code.waitForExistence(timeout: 10))
 
         let screenshot = XCUIScreen.main.screenshot()
         let attachment = XCTAttachment(screenshot: screenshot)
         attachment.lifetime = .keepAlways
-        attachment.name = "invite-qr-carousel"
+        attachment.name = "invite-qr-code"
         add(attachment)
-
-        try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: "/tmp/void_qr_live_screenshot.png"))
     }
 }

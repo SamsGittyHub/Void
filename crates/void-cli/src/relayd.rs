@@ -25,11 +25,17 @@
 //!
 //! ## What an operator can and cannot see
 //!
-//! Cannot: message contents, who sent anything, which queues belong to one
-//! person, any client's IP address. Can: that a fixed-size blob was deposited
-//! into an opaque queue id, and that one was later collected. That is the
-//! complete list, and `void_relay::store` is written so that adding to it
-//! requires an obvious code change.
+//! Cannot: message contents, who sent anything, any client's IP address, or
+//! — from the queue ids themselves — which queues belong to one person. Can:
+//! that a fixed-size blob was deposited into an opaque queue id, and that one
+//! was later collected. `void_relay::store` is written so that adding to that
+//! list requires an obvious code change.
+//!
+//! One thing this daemon deliberately does not record, but an operator who
+//! modified it could: which queues one connection collects, in one burst.
+//! That groups a client's queues together, and pairing the connection that
+//! deposits into a queue with the one that collects from it is a contact edge.
+//! See "Retrieval shape" under *Open* in docs/DECISIONS.md.
 //!
 //! The metrics this daemon prints are aggregate counts only. There is
 //! deliberately no per-queue reporting: an operator who could watch one queue's
@@ -67,7 +73,7 @@ fn usage() -> ! {
 void-relayd — Void mailbox relay
 
 Usage:
-  void-relayd [--listen ADDR] [--ttl-days N] [--rate N] [--open]
+  void-relayd [--listen ADDR] [--ttl-days N] [--rate N]
 
 Options:
   --listen ADDR   Loopback address to bind (default 127.0.0.1:9443).
@@ -76,7 +82,8 @@ Options:
   --rate N        Deposits allowed per queue per hour (default 600).
 
 The relay stores sealed blobs against opaque queue ids. It cannot read them,
-cannot tell who deposited them, and cannot link two queues to one person.
+cannot tell who deposited them, and keeps no record linking one client's
+queues (docs/DECISIONS.md, \"Retrieval shape\", says what a modified relay could).
 "
     );
     std::process::exit(2);

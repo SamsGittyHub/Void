@@ -8,11 +8,20 @@ name: CI
 on:
   push:
     branches: [main]
+    # A release tag runs everything, plus transparency-log below. Without this
+    # line no tag push would start the workflow at all, and that job's `if`
+    # could never hold.
+    tags: ["v*"]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+
+# Nothing here writes to the repository. transparency-log adds the one extra
+# permission it needs, for itself only.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -81,18 +90,76 @@ jobs:
   constant-time:
     name: "NFR-SEC-03 — constant-time verification"
     runs-on: ubuntu-latest
-    continue-on-error: true   # informational until the harness is calibrated
+    # Informational: a shared runner's timing noise can hide a small leak, and
+    # a pass says nothing about a phone's CPU. The harness catches regressions
+    # as gross as an early-exit comparison; see its header for the limits.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: dudect-style timing analysis
         # NFR-SEC-03 requires constant-time implementations "verified with
         # dudect or equivalent in CI". Source-level review cannot establish
-        # this; only measurement on the built artifact can.
+        # this; only measurement on the built artifact can. Covers ct::eq,
+        # the AEAD tag check, and ML-KEM decapsulation; PinVerifier::check
+        # runs Argon2 and would need hours for a meaningful sample.
+        run: cargo run --release -p void-crypto --example ct_timing
+
+  miri:
+    name: "void-ffi — handle lifetimes under Miri"
+    runs-on: ubuntu-latest
+    # The apps free call handles while other threads still use them; the
+    # handles are reference-counted so that is safe. Miri checks the unsafe
+    # code that makes it so for undefined behaviour, which a passing ordinary
+    # test cannot rule out.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with Miri
+        run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - name: Run the handle tests under Miri
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
         run: |
-          echo "TODO: dudect harness over ct::eq, Poly1305::verify,"
-          echo "      mlkem::decaps, and PinVerifier::check."
-          echo "See docs/DECISIONS.md — this is a known gap, not a passing check."
+          cargo +nightly miri test -p void-ffi --lib -- \
+            call_handles_survive_being_freed_mid_call_and_refuse_null \
+            a_call_handle_freed_while_many_threads_use_it_lives_until_the_last_one_is_done
+
+  app-bindings:
+    name: "D-029 — the apps' wrappers against the real core"
+    runs-on: ubuntu-latest
+    # Runs the Swift and Kotlin that call the core against it, on Linux: a
+    # wrong argument order, FFI signature or result-class constructor compiles
+    # cleanly and fails only at runtime on a phone. The scripts' headers say
+    # what this covers and what only the ios and android jobs can.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      # The runner image ships a Swift toolchain; no third-party action needed.
+      - run: swiftc --version
+      - run: cargo install cbindgen --locked
+      - run: ./scripts/check_ios_bindings.sh
+      - run: ./scripts/check_android_bindings.sh
+
+  android:
+    name: "Android app — build and lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Cross-compile the Rust core for Android
+        # The runner image ships the Android SDK and NDK, so nothing is
+        # downloaded with sdkmanager. build_android.sh adds the Rust targets.
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./scripts/build_android.sh
+      - name: Build and lint the app
+        working-directory: android
+        run: ./gradlew --no-daemon assembleDebug lintDebug
 
   ios:
     name: "iOS app — build and test"
@@ -124,13 +191,46 @@ jobs:
     name: "NFR-SEC-05 — transparency log"
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    permissions:
+      contents: read
+      # Keyless signing: GitHub's OIDC token for this workflow run is the
+      # signing identity, so there is no long-lived key to steal or lose.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: ./scripts/check_reproducible.sh | tee build.log
-      - name: Log artifact hash to the public transparency log
+      - uses: sigstore/cosign-installer@v3
+      - name: Build the core twice and record its hashes
+        # `shell: bash` adds pipefail, which the default shell lacks: without
+        # it a failed build piped through tee would still pass this step.
+        shell: bash
         run: |
-          echo "cosign sign-blob --yes target/release/libvoid_crypto.rlib"
-          echo "Records: source revision ${{ github.sha }}, toolchain, artifact hash."
-          echo "PRD §8.1: this covers the Rust core. The store-delivered app"
-          echo "binary is re-signed by Apple and is explicitly out of scope."
+          ./scripts/check_reproducible.sh | tee build.log
+          {
+            echo "revision: ${{ github.sha }}"
+            echo "tag: ${{ github.ref_name }}"
+            echo "toolchain: $(rustc --version)"
+            grep '^Core artifact hash' build.log
+          } > core-hashes.txt
+          cat core-hashes.txt
+      - name: Sign the hashes into the public transparency log
+        # PUBLIC AND PERMANENT: this writes an entry to Sigstore's Rekor log
+        # naming this repository, workflow, tag and revision. That is the
+        # point of NFR-SEC-05 — anyone can check a build against it — and why
+        # it runs only for a pushed v* tag. PRD §8.1: this covers the Rust
+        # core. The store-delivered app binary is re-signed by Apple and is
+        # explicitly out of scope.
+        #
+        # To check a release: run ./scripts/check_reproducible.sh at the tag,
+        # compare its hashes with core-hashes.txt, then
+        #   cosign verify-blob core-hashes.txt --bundle core-hashes.sigstore.json \
+        #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/ci.yml@refs/tags/<tag>"
+        run: cosign sign-blob --yes --bundle core-hashes.sigstore.json core-hashes.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-hashes
+          path: |
+            core-hashes.txt
+            core-hashes.sigstore.json

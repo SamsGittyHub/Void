@@ -120,5 +120,7 @@ impl From<void_crypto::CryptoError> for ProtoError {
 /// Result alias for this crate.
 pub type Result<T> = core::result::Result<T, ProtoError>;
 
-/// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// The protocol version this build speaks — the `v` in
+/// [`handshake::PROTOCOL_ID`], which is the value that actually keeps
+/// incompatible clients from talking.
+pub const PROTOCOL_VERSION: u16 = 3;

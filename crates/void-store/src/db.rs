@@ -71,6 +71,13 @@ pub enum Kind {
     Identity = 6,
     /// An outbound message awaiting delivery (NFR-REL-04).
     Outbox = 7,
+    /// An invitation waiting to be accepted: its intro queue and the prekey
+    /// secrets its bundle was signed over. Expires with the invitation.
+    Invite = 8,
+    /// A fragment collected from the relay whose message has not finished
+    /// arriving. The relay deleted it when it handed it over, so this is the
+    /// only copy; it expires when the relay would have expired the rest.
+    Inbox = 9,
 }
 
 impl Kind {
@@ -87,6 +94,8 @@ impl Kind {
             5 => Kind::Queue,
             6 => Kind::Identity,
             7 => Kind::Outbox,
+            8 => Kind::Invite,
+            9 => Kind::Inbox,
             _ => return Err(StoreError::Corrupt),
         })
     }
@@ -94,7 +103,10 @@ impl Kind {
     /// Does the retention policy expire records of this kind?
     #[must_use]
     pub fn is_expirable(self) -> bool {
-        matches!(self, Kind::Message | Kind::Outbox)
+        matches!(
+            self,
+            Kind::Message | Kind::Outbox | Kind::Invite | Kind::Inbox
+        )
     }
 }
 
@@ -836,12 +848,16 @@ mod tests {
             Kind::Queue,
             Kind::Identity,
             Kind::Outbox,
+            Kind::Invite,
+            Kind::Inbox,
         ] {
             assert_eq!(Kind::from_byte(k.to_byte()).unwrap(), k);
         }
         assert!(Kind::from_byte(0).is_err());
         assert!(Kind::from_byte(99).is_err());
         assert!(Kind::Message.is_expirable());
+        assert!(Kind::Invite.is_expirable());
+        assert!(Kind::Inbox.is_expirable());
         assert!(!Kind::Identity.is_expirable());
     }
 

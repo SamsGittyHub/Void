@@ -1,62 +1,37 @@
 //  QRCodeRenderTests.swift
 //
-//  Renders the real invite QR carousel off-screen against a real, full-size
-//  invite link (the same shape `AppState.createInvite` produces) and writes
-//  it to disk — a way to actually look at what the multi-part QR carousel
-//  produces without needing full UI automation.
+//  An invitation is one QR code (D-027). This renders a real short link made
+//  by the real core and reads it back with CoreImage's own detector — the round
+//  trip a person's camera makes, without needing a camera. It replaces a test
+//  of the thirteen-frame carousel, which only checked that a PNG was non-empty
+//  and so passed on a placeholder image.
 
-import SwiftUI
+import CoreImage
+import UIKit
 import XCTest
 
 @testable import Void
 
 final class QRCodeRenderTests: XCTestCase {
-    /// A stand-in for a real `void://c/...` link, sized like the real thing
-    /// (~14,600 characters — see QRCode.swift's module docs for why).
-    private var sampleLink: String {
-        "void://c/" + String(repeating: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", count: 440) + "#"
-            + String(repeating: "A", count: 52)
-    }
+    func testAnInvitationFromTheCoreRendersAsOneCodeThatReadsBack() throws {
+        let core = try VoidCore()
+        let (link, _) = try core.createInvite(
+            relay: RelayConfig.address,
+            myLabel: "Sam",
+            contactLabel: "",
+            now: UInt64(Date().timeIntervalSince1970),
+            ttlSeconds: 3600
+        )
+        XCTAssertTrue(link.hasPrefix("void://i/"))
+        XCTAssertLessThanOrEqual(link.count, 150, "one small code, easy to scan at arm's length")
 
-    @MainActor
-    func testCarouselRendersMultipleFramesForARealSizedLink() {
-        let chunks = QRChunker.chunks(for: sampleLink)
-        XCTAssertGreaterThan(chunks.count, 1, "a real invite link must need more than one frame")
-        for chunk in chunks {
-            XCTAssertLessThanOrEqual(chunk.count, QRChunker.chunkSize + 20)
-        }
-
-        let view = InviteQRCodeCarousel(link: sampleLink)
-            .frame(width: 400, height: 400)
-            .background(Color.white)
-        let renderer = ImageRenderer(content: view)
-        renderer.scale = 2.0
-
-        guard let uiImage = renderer.uiImage, let png = uiImage.pngData() else {
-            XCTFail("carousel failed to render")
-            return
-        }
-        XCTAssertGreaterThan(png.count, 0)
-
-        let outPath = "/tmp/void_qr_carousel_render.png"
-        try? png.write(to: URL(fileURLWithPath: outPath))
-        print("Wrote carousel render to \(outPath)")
-    }
-
-    @MainActor
-    func testSingleFrameForAShortPayload() {
-        let short = "void://c/SHORT#KEY"
-        let chunks = QRChunker.chunks(for: short)
-        XCTAssertEqual(chunks.count, 1, "a short payload must not be split")
-
-        let view = InviteQRCodeCarousel(link: short)
-            .frame(width: 300, height: 300)
-            .background(Color.white)
-        let renderer = ImageRenderer(content: view)
-        guard let uiImage = renderer.uiImage, let png = uiImage.pngData() else {
-            XCTFail("single-frame carousel failed to render")
-            return
-        }
-        try? png.write(to: URL(fileURLWithPath: "/tmp/void_qr_single_render.png"))
+        let image = try XCTUnwrap(QRCodeImage.render(link))
+        let ciImage = try XCTUnwrap(CIImage(image: image))
+        let detector = try XCTUnwrap(
+            CIDetector(
+                ofType: CIDetectorTypeQRCode, context: nil,
+                options: [CIDetectorAccuracy: CIDetectorAccuracyHigh]))
+        let decoded = detector.features(in: ciImage).compactMap { ($0 as? CIQRCodeFeature)?.messageString }
+        XCTAssertEqual(decoded, [link], "the code must read back as exactly the link")
     }
 }

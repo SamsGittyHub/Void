@@ -71,6 +71,9 @@ fn duress_destroy_wipes_memory_and_leaves_the_database_unopenable() {
         "the handshake must be queued before duress hits"
     );
 
+    alice.set_invite_name("Alice");
+    let identity_before = alice.fingerprint();
+
     // Under duress the platform has already destroyed the hardware vault key
     // by this point (a pure platform call — see void-ffi's duress module
     // docs). This is the core's half.
@@ -84,6 +87,15 @@ fn duress_destroy_wipes_memory_and_leaves_the_database_unopenable() {
     );
     assert_eq!(alice.outbox_len(), 0, "the outbox must be emptied");
     assert!(alice.contacts().is_empty());
+    assert_ne!(
+        alice.fingerprint(),
+        identity_before,
+        "the identity's keys must not survive in memory"
+    );
+    assert!(
+        alice.settings().invite_name.is_empty(),
+        "nor the name the user went by"
+    );
 
     // And the database is unopenable, full stop — whether that surfaces as
     // `VaultDestroyed` (the key is gone) or `Io` (the file `duress_destroy`

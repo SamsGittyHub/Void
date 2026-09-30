@@ -14,6 +14,12 @@
 //  rather than being retyped here, because a copy in Swift and another in Kotlin
 //  is two chances for someone to soften "this cannot be undone" into "this
 //  cannot easily be undone". `VoidText` below is the only way the UI gets them.
+//
+//  ## Threads
+//
+//  Every engine call can block: the engine holds its lock for a whole tick,
+//  and a tick can wait on the network. So nothing here may be called from the
+//  main thread. `CoreQueue` is how the app calls in.
 
 import Foundation
 
@@ -24,17 +30,20 @@ import Foundation
 /// Every buffer the core hands us must go back to `void_free_bytes`. Doing that
 /// in `deinit` rather than at each call site means there is no path where an
 /// early return leaks.
-private final class CoreBuffer {
+final class CoreBuffer {
     private var bytes: VoidBytes
 
     init(_ bytes: VoidBytes) {
         self.bytes = bytes
     }
 
+    var array: [UInt8] {
+        guard let data = bytes.data, bytes.len > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: data, count: Int(bytes.len)))
+    }
+
     var string: String {
-        guard bytes.data != nil, bytes.len > 0 else { return "" }
-        let data = Data(bytes: bytes.data, count: Int(bytes.len))
-        return String(data: data, encoding: .utf8) ?? ""
+        String(decoding: array, as: UTF8.self)
     }
 
     deinit {
@@ -42,23 +51,85 @@ private final class CoreBuffer {
     }
 }
 
+/// Reads the fixed-layout encodings `void-ffi` documents on each function.
+///
+/// Every read is bounds-checked and returns `nil` past the end, so a short or
+/// malformed buffer stops parsing instead of trapping. This is the most
+/// attacker-adjacent parsing on this side of the boundary: dropping the tail
+/// is always safe, and a crash is not.
+struct ByteReader {
+    private let bytes: [UInt8]
+    private var position = 0
+
+    init(_ bytes: [UInt8]) {
+        self.bytes = bytes
+    }
+
+    var isAtEnd: Bool { position >= bytes.count }
+
+    mutating func u8() -> UInt8? {
+        guard position < bytes.count else { return nil }
+        defer { position += 1 }
+        return bytes[position]
+    }
+
+    // Folded rather than indexed: a slice keeps its parent's indices, so
+    // `raw[0]` would read the wrong byte, or trap, anywhere past the start.
+    mutating func u16() -> UInt16? {
+        guard let raw = take(2) else { return nil }
+        return raw.reversed().reduce(0) { $0 << 8 | UInt16($1) }
+    }
+
+    mutating func u32() -> UInt32? {
+        guard let raw = take(4) else { return nil }
+        return raw.reversed().reduce(0) { $0 << 8 | UInt32($1) }
+    }
+
+    mutating func u64() -> UInt64? {
+        guard let raw = take(8) else { return nil }
+        return raw.reversed().reduce(0) { $0 << 8 | UInt64($1) }
+    }
+
+    mutating func data(_ count: Int) -> Data? {
+        take(count).map { Data($0) }
+    }
+
+    mutating func string(_ count: Int) -> String? {
+        take(count).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    private mutating func take(_ count: Int) -> ArraySlice<UInt8>? {
+        guard count >= 0, count <= bytes.count - position else { return nil }
+        defer { position += count }
+        return bytes[position..<position + count]
+    }
+}
+
 // MARK: - Errors
 
-enum VoidError: Error, LocalizedError {
+enum VoidError: Error, LocalizedError, Equatable {
     case badArgument
     case failed
     case offline
     case keyChanged
     case locked
     case internalError
+    case expired
+    case alreadyConnected
+    case ownInvite
+    case wrongRelay
 
     init(_ status: VoidStatus) {
-        switch status {
-        case VoidStatus(rawValue: 1): self = .badArgument
-        case VoidStatus(rawValue: 3): self = .offline
-        case VoidStatus(rawValue: 4): self = .keyChanged
-        case VoidStatus(rawValue: 5): self = .locked
-        case VoidStatus(rawValue: 6): self = .internalError
+        switch status.rawValue {
+        case 1: self = .badArgument
+        case 3: self = .offline
+        case 4: self = .keyChanged
+        case 5: self = .locked
+        case 6: self = .internalError
+        case 7: self = .expired
+        case 8: self = .alreadyConnected
+        case 9: self = .ownInvite
+        case 10: self = .wrongRelay
         default: self = .failed
         }
     }
@@ -75,10 +146,26 @@ enum VoidError: Error, LocalizedError {
                 + "with them through another channel."
         case .locked:
             return "Void is locked."
+        case .expired:
+            return "This invitation has expired. Ask them for a new one."
+        case .alreadyConnected:
+            return "You're already connected with this person."
+        case .ownInvite:
+            return "That's your own invitation. Send it to the person you want to talk to."
+        case .wrongRelay:
+            return "This invitation uses a different Void server from this app, so it can't be "
+                + "opened here."
         case .badArgument, .failed, .internalError:
             return "Something went wrong. Nothing was sent."
         }
     }
+}
+
+private let statusOk = VoidStatus(rawValue: 0)
+
+/// Throw unless `status` is `Ok`.
+private func check(_ status: VoidStatus) throws {
+    guard status == statusOk else { throw VoidError(status) }
 }
 
 // MARK: - Security-critical text
@@ -119,69 +206,103 @@ enum VaultBacking {
     var isHardwareBacked: Bool { self != .software }
 }
 
-// MARK: - The core handle
+// MARK: - Tor
 
-/// The engine.
+/// A bootstrapped Arti client. Frees it exactly once.
 ///
-/// `@unchecked Sendable` because the Rust side guards its state with a mutex;
-/// the pointer itself is immutable after `init`.
-final class VoidCore: @unchecked Sendable {
-    // Internal rather than private: `VoidCall.swift` extends this type with
-    // the call surface and needs the same handle. Still not public — nothing
-    // outside this module ever sees a raw pointer.
+/// An engine attached through `VoidCore.attachTor` keeps a reference to this,
+/// so the Tor client always outlives the transport built from it — the order
+/// `void_tor_free`'s contract requires.
+final class TorClient: @unchecked Sendable {
     let handle: OpaquePointer
 
-    /// The bootstrapped Tor handle, once `bootstrapTor` has succeeded.
-    ///
-    /// Calls need this for their own reason beyond the relay: the media path
-    /// publishes and dials onion services directly (D-024), so a call is
-    /// impossible without it even if the relay were somehow reachable.
-    private(set) var torHandle: OpaquePointer?
-
-    init() throws {
-        var raw: OpaquePointer?
-        let status = void_engine_new(&raw)
-        guard status == VoidStatus(rawValue: 0), let raw else {
-            throw VoidError(status)
-        }
-        self.handle = raw
-    }
-
-    deinit {
-        // Order matters: the engine may hold a transport built from the Tor
-        // handle, so it goes first.
-        void_engine_free(handle)
-        if let torHandle {
-            void_tor_free(torHandle)
-        }
-    }
-
-    // MARK: Tor
-
-    /// Bootstrap Arti. Blocks; call from a background thread.
+    /// Bootstrap Arti. **Blocks**, commonly for tens of seconds; never call it
+    /// on the main thread.
     ///
     /// FR-TRANS-05: failure here is not partial success. Either this returns
     /// and the app has a way to reach the network, or it throws and every send
     /// stays queued — there is no third state and no fallback path.
-    func bootstrapTor(stateDirectory: URL, cacheDirectory: URL) throws {
+    init(stateDirectory: URL, cacheDirectory: URL) throws {
         var out: OpaquePointer?
         let status = stateDirectory.path.withCString { state in
             cacheDirectory.path.withCString { cache in
                 void_tor_bootstrap(state, cache, &out)
             }
         }
-        guard status == VoidStatus(rawValue: 0), let out else { throw VoidError(status) }
-        torHandle = out
+        try check(status)
+        guard let out else { throw VoidError.offline }
+        handle = out
     }
 
-    /// Point the engine at a relay over Tor. `onionAddress` is the relay's
-    /// pinned identity (FR-TRANS-04) and is used for nothing else.
-    func attachTor(relayOnionAddress: String, port: UInt16) throws {
-        guard let torHandle else { throw VoidError.offline }
-        let status = relayOnionAddress.withCString { addr in
-            void_engine_attach_tor(handle, torHandle, addr, port)
+    deinit {
+        void_tor_free(handle)
+    }
+}
+
+// MARK: - The core handle
+
+/// The engine.
+///
+/// `@unchecked Sendable` because the Rust side guards its state with a mutex;
+/// the one mutable property here is guarded by `lock`.
+final class VoidCore: @unchecked Sendable {
+    // Internal rather than private: `VoidCall.swift` extends this type with
+    // the call surface and needs the same handle. Still not public — nothing
+    // outside this module ever sees a raw pointer.
+    let handle: OpaquePointer
+
+    private let lock = NSLock()
+    private var attachedTor: TorClient?
+
+    /// An engine with a fresh identity, held in memory only. For tests: the app
+    /// opens its persistent one with `init(dataDirectory:kek:backing:nowMs:)`.
+    init() throws {
+        var raw: OpaquePointer?
+        try check(void_engine_new(&raw))
+        guard let raw else { throw VoidError.failed }
+        handle = raw
+    }
+
+    /// Open this device's engine: restore it if it has run here before,
+    /// otherwise create it with a freshly generated identity (D-026).
+    ///
+    /// `kek` is the key-encryption key `KeyVault` released for this launch. It
+    /// is overwritten with zeros before this returns, and the core zeroizes
+    /// every copy it made. Throws `.locked` if the key does not open the
+    /// existing database; nothing is replaced in that case.
+    init(dataDirectory: URL, kek: inout [UInt8], backing: VaultBacking, nowMs: UInt64) throws {
+        defer {
+            for i in kek.indices { kek[i] = 0 }
         }
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
+        guard kek.count == 32 else { throw VoidError.badArgument }
+        var raw: OpaquePointer?
+        let status = dataDirectory.path.withCString { dir in
+            kek.withUnsafeBufferPointer { key in
+                void_engine_open(dir, key.baseAddress, backing.raw, nowMs, &raw)
+            }
+        }
+        try check(status)
+        guard let raw else { throw VoidError.failed }
+        handle = raw
+    }
+
+    deinit {
+        // The engine's transport may be built from the Tor client, so the
+        // engine goes first; `attachedTor` is released after this body.
+        void_engine_free(handle)
+    }
+
+    /// Open a circuit to the relay and make it this engine's transport.
+    /// `onionAddress` is the relay's pinned identity (FR-TRANS-04) and is used
+    /// for nothing else. Blocks on the network.
+    func attachTor(_ tor: TorClient, onionAddress: String, port: UInt16) throws {
+        let status = onionAddress.withCString { addr in
+            void_engine_attach_tor(handle, tor.handle, addr, port)
+        }
+        try check(status)
+        lock.lock()
+        attachedTor = tor
+        lock.unlock()
     }
 
     /// The protocol this build speaks, for the about screen.
@@ -228,7 +349,7 @@ final class VoidCore: @unchecked Sendable {
 
     /// Render an arbitrary contact's fingerprint as proquint words — the
     /// engine's own is `fingerprintWords`; this is for someone else's, kept
-    /// as raw bytes since `startConversation`/`acceptConversation`/`contacts`.
+    /// as raw bytes from `contacts` and the contact events.
     static func fingerprintWords(for fingerprint: Data) -> String {
         fingerprint.withUnsafeBytes { buf -> String in
             CoreBuffer(
@@ -237,85 +358,148 @@ final class VoidCore: @unchecked Sendable {
         }
     }
 
-    // MARK: Establishing a conversation (FR-DISC-01, FR-DISC-02)
+    // MARK: Invitations (FR-DISC-01, FR-DISC-02)
 
-    /// Publish an invite (a `void://c/...` link, also the QR payload) and
-    /// return it alongside the queue handle needed to detect acceptance.
-    func createInvite(relayHint: String, label: String, now: UInt64, ttlSeconds: UInt64) throws -> (
-        link: String, queue: IntroQueue
-    ) {
-        let hintBytes = Array(relayHint.utf8)
-        let labelBytes = Array(label.utf8)
-        var linkBytes = VoidBytes()
-        var queuePtr: OpaquePointer?
-        let status = hintBytes.withUnsafeBufferPointer { hint in
-            labelBytes.withUnsafeBufferPointer { lbl in
-                void_engine_create_invite(
-                    handle,
-                    hint.baseAddress, UInt(hint.count),
-                    lbl.baseAddress, UInt(lbl.count),
-                    now, ttlSeconds,
-                    &linkBytes, &queuePtr
-                )
-            }
-        }
-        guard status == VoidStatus(rawValue: 0), let queuePtr else { throw VoidError(status) }
-        return (CoreBuffer(linkBytes).string, IntroQueue(queuePtr))
-    }
-
-    /// Poll a queue from `createInvite` for a delivered handshake. Returns
-    /// `nil` until someone has scanned the invite — that is normal, not an
-    /// error, and this is safe to call on a repeating timer.
-    func pollIntroQueue(_ queue: IntroQueue) throws -> Data? {
-        var out = VoidBytes()
-        let status = void_engine_poll_intro_queue(handle, queue.handle, &out)
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
-        guard out.data != nil, out.len > 0 else { return nil }
-        defer { void_free_bytes(out) }
-        return Data(bytes: out.data, count: Int(out.len))
-    }
-
-    /// Accept a conversation from bytes `pollIntroQueue` returned.
-    func acceptConversation(queue: IntroQueue, initial: Data, now: UInt64) throws -> (
-        fingerprint: Data, firstMessage: String
-    ) {
-        var fingerprint = Data(count: 32)
-        var firstMessage = VoidBytes()
-        let status = initial.withUnsafeBytes { buf -> VoidStatus in
-            fingerprint.withUnsafeMutableBytes { fp -> VoidStatus in
-                void_engine_accept_conversation(
-                    handle, queue.handle,
-                    buf.bindMemory(to: UInt8.self).baseAddress, UInt(buf.count),
-                    now,
-                    fp.bindMemory(to: UInt8.self).baseAddress,
-                    &firstMessage
-                )
-            }
-        }
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
-        return (fingerprint, CoreBuffer(firstMessage).string)
-    }
-
-    /// Start a conversation from a scanned or pasted invite link (the
-    /// initiator side).
-    func startConversation(link: String, localName: String, firstMessage: String, now: UInt64)
-        throws -> Data
-    {
-        var fingerprint = Data(count: 32)
-        let status = link.withCString { linkC in
-            localName.withCString { nameC in
-                firstMessage.withCString { msgC in
-                    fingerprint.withUnsafeMutableBytes { fp in
-                        void_engine_start_conversation(
-                            handle, linkC, nameC, msgC, now,
-                            fp.bindMemory(to: UInt8.self).baseAddress
-                        )
-                    }
+    /// Make an invitation and return its short `void://i/` link — one QR code —
+    /// and the id that names it in `takeContactEvents`.
+    ///
+    /// The engine parks the invitation on `relay` through its outbox and
+    /// watches for its acceptance on its own schedule; there is nothing to poll.
+    /// `myLabel` travels inside the encrypted invitation and is shown to
+    /// whoever opens it. `contactLabel` never leaves this device: it becomes
+    /// the name of whoever accepts. Any number can be outstanding.
+    func createInvite(
+        relay: String, myLabel: String, contactLabel: String, now: UInt64, ttlSeconds: UInt64
+    ) throws -> (link: String, id: Data) {
+        let relayBytes = Array(relay.utf8)
+        let mine = Array(myLabel.utf8)
+        let theirs = Array(contactLabel.utf8)
+        var link = VoidBytes()
+        var id = [UInt8](repeating: 0, count: 16)
+        let status = relayBytes.withUnsafeBufferPointer { r in
+            mine.withUnsafeBufferPointer { m in
+                theirs.withUnsafeBufferPointer { t in
+                    void_engine_create_invite(
+                        handle,
+                        r.baseAddress, UInt(r.count),
+                        m.baseAddress, UInt(m.count),
+                        t.baseAddress, UInt(t.count),
+                        now, ttlSeconds,
+                        &link, &id
+                    )
                 }
             }
         }
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
-        return fingerprint
+        let linkBuffer = CoreBuffer(link)
+        try check(status)
+        return (linkBuffer.string, Data(id))
+    }
+
+    /// Withdraw an invitation. A handshake sent against it is never answered.
+    @discardableResult
+    func cancelInvite(_ id: Data) -> Bool {
+        id.withUnsafeBytes { void_engine_cancel_invite(handle, $0.bindMemory(to: UInt8.self).baseAddress) }
+            == statusOk
+    }
+
+    /// How many of an outstanding invitation's records still have to reach the
+    /// relay before whoever opens it can collect it; `nil` once it has been
+    /// accepted, has expired, or was cancelled.
+    func inviteUploadRemaining(_ id: Data) -> Int? {
+        let remaining = id.withUnsafeBytes {
+            void_engine_invite_status(handle, $0.bindMemory(to: UInt8.self).baseAddress)
+        }
+        return remaining < 0 ? nil : Int(remaining)
+    }
+
+    /// Open an invitation someone gave the user — scanned or pasted — and start
+    /// collecting it. Returns the id its `inviteReady` or `inviteFailed` event
+    /// will carry. Nothing about the contact list changes yet.
+    func openInvite(link: String, now: UInt64) throws -> Data {
+        var id = [UInt8](repeating: 0, count: 16)
+        let status = link.withCString { void_engine_open_invite(handle, $0, now, &id) }
+        try check(status)
+        return Data(id)
+    }
+
+    /// Connect using an invitation reported ready. `localName` may be empty to
+    /// keep the name the invitation carried; `firstMessage` may be empty to
+    /// connect without saying anything yet. Returns the new contact's
+    /// fingerprint.
+    func confirmInvite(fetchId: Data, localName: String, firstMessage: String, now: UInt64) throws
+        -> Data
+    {
+        var fingerprint = [UInt8](repeating: 0, count: 32)
+        let status = fetchId.withUnsafeBytes { id in
+            localName.withCString { name in
+                firstMessage.withCString { message in
+                    void_engine_confirm_invite(
+                        handle, id.bindMemory(to: UInt8.self).baseAddress, name, message, now,
+                        &fingerprint
+                    )
+                }
+            }
+        }
+        try check(status)
+        return Data(fingerprint)
+    }
+
+    /// Stop waiting for an invitation the user opened.
+    func cancelFetch(_ id: Data) {
+        _ = id.withUnsafeBytes { void_engine_cancel_fetch(handle, $0.bindMemory(to: UInt8.self).baseAddress) }
+    }
+
+    /// Everything that happened to contacts and invitations since the last
+    /// drain. Layout is documented on `void_engine_take_contact_events`.
+    func takeContactEvents() -> [ContactEvent] {
+        var reader = ByteReader(CoreBuffer(void_engine_take_contact_events(handle)).array)
+        var events: [ContactEvent] = []
+        while !reader.isAtEnd {
+            guard let kind = reader.u8(),
+                let id = reader.data(16),
+                let fingerprint = reader.data(32),
+                let nameLength = reader.u16(),
+                let name = reader.string(Int(nameLength)),
+                let messageLength = reader.u32(),
+                let message = reader.string(Int(messageLength))
+            else { break }
+            switch kind {
+            case 1:
+                events.append(
+                    .added(inviteId: id, fingerprint: fingerprint, name: name, firstMessage: message)
+                )
+            case 2: events.append(.inviteExpired(inviteId: id))
+            case 3: events.append(.inviteReady(fetchId: id, fingerprint: fingerprint, inviterName: name))
+            case 4: events.append(.inviteFailed(fetchId: id, reason: .expired))
+            case 5: events.append(.inviteFailed(fetchId: id, reason: .invalid))
+            case 6: events.append(.inviteFailed(fetchId: id, reason: .timedOut))
+            default: return events
+            }
+        }
+        return events
+    }
+
+    /// The name the user puts on invitations they make. Stored in the
+    /// encrypted database, not in `UserDefaults`.
+    var inviteName: String {
+        CoreBuffer(void_engine_invite_name(handle)).string
+    }
+
+    func setInviteName(_ name: String) throws {
+        try check(name.withCString { void_engine_set_invite_name(handle, $0) })
+    }
+
+    // MARK: Settings
+
+    /// Whether the user has been through the "what Void does and does not
+    /// protect" screen on this device (FR-UI-05). Persisted, so onboarding is
+    /// not repeated at every launch.
+    var protectionAcknowledged: Bool {
+        void_engine_protection_acknowledged(handle)
+    }
+
+    func acknowledgeProtection() throws {
+        try check(void_engine_acknowledge_protection(handle))
     }
 
     // MARK: Sending and receiving
@@ -332,18 +516,23 @@ final class VoidCore: @unchecked Sendable {
                 )
             }
         }
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
+        try check(status)
         return messageId
     }
 
     /// What one `tick` did, and any messages it collected.
-    enum TickResult {
+    enum TickResult: Equatable {
         case waiting
         case sentPadding
         case deposited
         case refused
-        case retrieved([(fingerprint: Data, text: String)])
+        case retrieved([ReceivedMessage])
         case offline
+    }
+
+    struct ReceivedMessage: Equatable {
+        let fingerprint: Data
+        let text: String
     }
 
     /// Advance the scheduler by one tick (FR-MSG-06). Call on a repeating
@@ -353,41 +542,58 @@ final class VoidCore: @unchecked Sendable {
         var outcome = VoidTickOutcome(rawValue: 0)
         var messages = VoidBytes()
         let status = void_engine_tick(handle, nowMs, &outcome, &messages)
-        guard status == VoidStatus(rawValue: 0) else { return .offline }
-        switch outcome {
-        case VoidTickOutcome(rawValue: 0): return .waiting
-        case VoidTickOutcome(rawValue: 1): return .sentPadding
-        case VoidTickOutcome(rawValue: 2): return .deposited
-        case VoidTickOutcome(rawValue: 3): return .refused
-        case VoidTickOutcome(rawValue: 5): return .offline
-        case VoidTickOutcome(rawValue: 4):
-            defer { void_free_bytes(messages) }
-            guard let data = messages.data else { return .retrieved([]) }
-            var out: [(Data, String)] = []
-            var pos = 0
-            let buf = UnsafeBufferPointer(start: data, count: Int(messages.len))
-            while pos + 36 <= buf.count {
-                let fp = Data(bytes: buf.baseAddress! + pos, count: 32)
-                pos += 32
-                let lenParts: (UInt32, UInt32, UInt32, UInt32) = (
-                    UInt32(buf[pos]), UInt32(buf[pos + 1]), UInt32(buf[pos + 2]), UInt32(buf[pos + 3])
-                )
-                let len = Int(lenParts.0 | (lenParts.1 << 8) | (lenParts.2 << 16) | (lenParts.3 << 24))
-                pos += 4
-                guard pos + len <= buf.count else { break }
-                let textBytes = Array(buf[pos..<pos + len])
-                pos += len
-                let text = String(decoding: textBytes, as: UTF8.self)
-                out.append((fp, text))
+        let buffer = CoreBuffer(messages)
+        guard status == statusOk else { return .offline }
+        switch outcome.rawValue {
+        case 0: return .waiting
+        case 1: return .sentPadding
+        case 2: return .deposited
+        case 3: return .refused
+        case 4:
+            var reader = ByteReader(buffer.array)
+            var out: [ReceivedMessage] = []
+            while !reader.isAtEnd {
+                guard let fingerprint = reader.data(32),
+                    let length = reader.u32(),
+                    let text = reader.string(Int(length))
+                else { break }
+                out.append(ReceivedMessage(fingerprint: fingerprint, text: text))
             }
             return .retrieved(out)
         default: return .offline
         }
     }
 
+    /// The stored history with one contact, oldest first — what a conversation
+    /// shows after a restart. Layout is documented on `void_engine_messages`.
+    func messages(with fingerprint: Data) -> [StoredMessage] {
+        let bytes = fingerprint.withUnsafeBytes {
+            void_engine_messages(handle, $0.bindMemory(to: UInt8.self).baseAddress)
+        }
+        var reader = ByteReader(CoreBuffer(bytes).array)
+        var out: [StoredMessage] = []
+        while !reader.isAtEnd {
+            guard let direction = reader.u8(),
+                let delivery = reader.u8(),
+                let timestamp = reader.u64(),
+                let length = reader.u32(),
+                let text = reader.string(Int(length))
+            else { break }
+            out.append(
+                StoredMessage(
+                    isOutgoing: direction == 1,
+                    delivery: DeliveryState(code: delivery),
+                    timestamp: Date(timeIntervalSince1970: TimeInterval(timestamp)),
+                    text: text
+                )
+            )
+        }
+        return out
+    }
+
     // MARK: Contacts
 
-    struct ContactSummary {
+    struct ContactSummary: Equatable {
         let fingerprint: Data
         let trust: TrustState
         let name: String
@@ -395,67 +601,107 @@ final class VoidCore: @unchecked Sendable {
 
     /// The contact list, for the conversation list screen.
     var contacts: [ContactSummary] {
-        let bytes = void_engine_contacts(handle)
-        guard let data = bytes.data else { return [] }
-        defer { void_free_bytes(bytes) }
+        var reader = ByteReader(CoreBuffer(void_engine_contacts(handle)).array)
         var out: [ContactSummary] = []
-        var pos = 0
-        let buf = UnsafeBufferPointer(start: data, count: Int(bytes.len))
-        while pos + 35 <= buf.count {
-            let fp = Data(bytes: buf.baseAddress! + pos, count: 32)
-            pos += 32
-            let trust: TrustState =
-                switch buf[pos] {
+        while !reader.isAtEnd {
+            guard let fingerprint = reader.data(32),
+                let trust = reader.u8(),
+                let nameLength = reader.u16(),
+                let name = reader.string(Int(nameLength))
+            else { break }
+            let state: TrustState =
+                switch trust {
                 case 1: .verified
                 case 2: .keyChanged
                 default: .unverified
                 }
-            pos += 1
-            let nameLen = Int(buf[pos]) | (Int(buf[pos + 1]) << 8)
-            pos += 2
-            guard pos + nameLen <= buf.count else { break }
-            let name = String(decoding: Array(buf[pos..<pos + nameLen]), as: UTF8.self)
-            pos += nameLen
-            out.append(ContactSummary(fingerprint: fp, trust: trust, name: name))
+            out.append(ContactSummary(fingerprint: fingerprint, trust: state, name: name))
         }
         return out
     }
 
     func markVerified(_ fingerprint: Data) throws {
-        let status = fingerprint.withUnsafeBytes {
-            void_engine_mark_verified(handle, $0.bindMemory(to: UInt8.self).baseAddress)
-        }
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
+        try check(
+            fingerprint.withUnsafeBytes {
+                void_engine_mark_verified(handle, $0.bindMemory(to: UInt8.self).baseAddress)
+            })
     }
 
     func acknowledgeKeyChange(_ fingerprint: Data) throws {
-        let status = fingerprint.withUnsafeBytes {
-            void_engine_acknowledge_key_change(handle, $0.bindMemory(to: UInt8.self).baseAddress)
-        }
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
+        try check(
+            fingerprint.withUnsafeBytes {
+                void_engine_acknowledge_key_change(handle, $0.bindMemory(to: UInt8.self).baseAddress)
+            })
     }
 
     func revokeContact(_ fingerprint: Data) throws {
-        let status = fingerprint.withUnsafeBytes {
-            void_engine_revoke_contact(handle, $0.bindMemory(to: UInt8.self).baseAddress)
-        }
-        guard status == VoidStatus(rawValue: 0) else { throw VoidError(status) }
+        try check(
+            fingerprint.withUnsafeBytes {
+                void_engine_revoke_contact(handle, $0.bindMemory(to: UInt8.self).baseAddress)
+            })
+    }
+
+    /// Change the name this device shows for a contact. Never transmitted.
+    func renameContact(_ fingerprint: Data, to name: String) throws {
+        try check(
+            fingerprint.withUnsafeBytes { fp in
+                name.withCString { void_engine_rename_contact(handle, fp.bindMemory(to: UInt8.self).baseAddress, $0) }
+            })
+    }
+
+    // MARK: Duress
+
+    /// The RAM and store half of duress destruction (FR-STOR-02). The hardware
+    /// half — deleting the key the database is wrapped under — is
+    /// `KeyVault.destroy`, and must happen first (D-017).
+    func duressDestroy() throws {
+        try check(void_engine_duress_destroy(handle))
     }
 }
 
-/// A handle to an introduction queue, from `VoidCore.createInvite`. Frees the
-/// underlying secret on deinit — hold one of these per outstanding invite,
-/// not the raw pointer.
-final class IntroQueue {
-    fileprivate let handle: OpaquePointer
+// MARK: - Contact events
 
-    fileprivate init(_ handle: OpaquePointer) {
-        self.handle = handle
-    }
+/// Something that happened to a contact or an invitation.
+enum ContactEvent: Equatable {
+    /// Someone accepted one of our invitations. They are a contact now.
+    case added(inviteId: Data, fingerprint: Data, name: String, firstMessage: String)
+    /// One of our invitations expired unaccepted and was forgotten.
+    case inviteExpired(inviteId: Data)
+    /// An invitation the user opened has arrived and verified. Show who it is
+    /// from, then connect with `confirmInvite`.
+    case inviteReady(fetchId: Data, fingerprint: Data, inviterName: String)
+    /// An invitation the user opened could not be used.
+    case inviteFailed(fetchId: Data, reason: InviteFailure)
+}
 
-    deinit {
-        void_queue_secret_free(handle)
+/// Why an invitation the user opened could not be used.
+enum InviteFailure: Equatable {
+    case expired
+    case invalid
+    case timedOut
+
+    /// FR-UI-03: plain language, and a next step.
+    var explanation: String {
+        switch self {
+        case .expired:
+            return "This invitation has expired. Ask them for a new one."
+        case .invalid:
+            return "This invitation couldn't be read. Ask them to send it again."
+        case .timedOut:
+            return "Their invitation never arrived. They may be offline, or someone else already "
+                + "used it. Ask them for a new one."
+        }
     }
+}
+
+// MARK: - Stored messages
+
+/// One message from the stored history.
+struct StoredMessage: Equatable {
+    let isOutgoing: Bool
+    let delivery: DeliveryState
+    let timestamp: Date
+    let text: String
 }
 
 // MARK: - Trust state
@@ -504,6 +750,17 @@ enum DeliveryState {
     case collected
     case failed
     case received
+
+    /// The byte `void_engine_messages` encodes.
+    init(code: UInt8) {
+        switch code {
+        case 0: self = .queued
+        case 1: self = .deposited
+        case 2: self = .collected
+        case 3: self = .failed
+        default: self = .received
+        }
+    }
 
     /// FR-UI-03: plain language. "Waiting to send" and not a clock icon the
     /// user has to learn, and never "sent" for something that is only queued.

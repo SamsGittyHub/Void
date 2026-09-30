@@ -370,6 +370,10 @@ pub struct Settings {
     pub protection_screen_acknowledged: bool,
     /// Whether the device-loss warning has been acknowledged (FR-REC-01).
     pub device_loss_acknowledged: bool,
+    /// The name this user puts on invitations they make, shown to whoever
+    /// opens one so they know who it is from. Empty by default: nothing
+    /// identifying leaves the device unless the user chooses to type it.
+    pub invite_name: String,
 }
 
 impl Default for Settings {
@@ -382,6 +386,7 @@ impl Default for Settings {
             destroy_after_failed_attempts: 0,
             protection_screen_acknowledged: false,
             device_loss_acknowledged: false,
+            invite_name: String::new(),
         }
     }
 }
@@ -439,7 +444,8 @@ impl Settings {
             .u8(u8::from(self.duress_pin_configured))
             .u8(self.destroy_after_failed_attempts)
             .u8(u8::from(self.protection_screen_acknowledged))
-            .u8(u8::from(self.device_loss_acknowledged));
+            .u8(u8::from(self.device_loss_acknowledged))
+            .bytes16(self.invite_name.as_bytes());
         w.finish()
     }
 
@@ -455,6 +461,9 @@ impl Settings {
         let destroy_after_failed_attempts = r.u8().map_err(|_| StoreError::Corrupt)?;
         let protection_screen_acknowledged = r.u8().map_err(|_| StoreError::Corrupt)? != 0;
         let device_loss_acknowledged = r.u8().map_err(|_| StoreError::Corrupt)? != 0;
+        let invite_name = core::str::from_utf8(r.bytes16().map_err(|_| StoreError::Corrupt)?)
+            .map_err(|_| StoreError::Corrupt)?
+            .to_string();
         r.finish().map_err(|_| StoreError::Corrupt)?;
         Ok(Settings {
             retention,
@@ -464,6 +473,7 @@ impl Settings {
             destroy_after_failed_attempts,
             protection_screen_acknowledged,
             device_loss_acknowledged,
+            invite_name,
         })
     }
 }
@@ -568,6 +578,8 @@ mod tests {
         assert_eq!(s.retention, crate::retention::RetentionPolicy::ThirtyDays);
         // FR-STOR-03: destroy-after-failed-attempts defaults to disabled.
         assert_eq!(s.destroy_after_failed_attempts, 0);
+        // Nothing identifying goes on an invitation unless the user types it.
+        assert!(s.invite_name.is_empty());
     }
 
     #[test]
@@ -576,6 +588,7 @@ mod tests {
             push_enabled: true,
             notification_detail: NotificationDetail::Preview,
             destroy_after_failed_attempts: 10,
+            invite_name: "Ada Łukasiewicz".to_string(),
             ..Settings::default()
         };
         let enc = s.encode();

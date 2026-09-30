@@ -46,8 +46,8 @@ So ML-DSA-87 signatures appear in exactly two places: the prekey bundle, and the
 initiator's transcript signature. Both are once per conversation.
 
 **Cost.** A hybrid signature is 4,693 bytes encoded. A prekey bundle is
-therefore ~12 KB, which is at the upper end of what a QR code can carry — see
-D-011.
+therefore about 9 KB — far more than one QR code carries, which is why an
+invitation is a short link with the bundle parked on the relay (D-027).
 
 **Reversal.** Dropping to ML-DSA-65 saves 1.3 KB per signature. The parameter
 lives in `void-crypto/src/mldsa.rs`.
@@ -579,6 +579,11 @@ been written, as its own crate rather than a module inside `void-ffi`. What
 remains true is everything about the *build*: no NDK, no cross-compilation, no
 emulator, nothing in `android/` run even once.
 
+**Closed by D-029.** `scripts/build_android.sh` has run, cross-compiling
+`void-jni` for arm64-v8a and x86_64, and the app has run end to end on two
+emulators over the live Tor network. CI's `android` job cross-compiles, builds
+and lints it on every push. No physical device has run it.
+
 ---
 
 ## D-023 — The JNI shim is its own crate, and it is unverified on Android
@@ -611,6 +616,12 @@ claim non-negotiable #10 exists to distrust.
 launches on an emulator against a real cross-compiled core, as `ios/` already
 does under D-019. Until the third one happens, this row stays honest by saying
 so.
+
+**Closed by D-029.** All three have happened: the cross-compile succeeded with
+NDK r30, the script ran, and the app ran end to end on two emulators against
+the core it produced. Every symbol has also been called from a desktop JVM, by
+`scripts/check_android_bindings.sh` in CI's `app-bindings` job, so a mismatched
+`external fun` now fails a build rather than a phone.
 
 ## D-021 — The receive path stages its state changes and commits after the tag
 
@@ -702,7 +713,7 @@ one of them also loses every message after it.
 
 ---
 
-## D-024 — Calls are push-to-talk over paired onion services, and are labelled as such
+## D-024 — Calls run over paired onion services, and say what they cost
 
 **New scope.** Voice appears nowhere in PRD v2.0. This entry is the whole
 argument.
@@ -849,6 +860,472 @@ D-023). Treat "calls work" as unproven until someone has held a conversation.
 
 ---
 
+## D-025 — Invitations belong to the engine, and only a verified handshake consumes one
+
+**Found, not planned.** Adding a contact failed in practice for four
+independent reasons. The tests exercised none of them, because each flushed the
+whole handshake to the relay before the inviter looked once.
+
+1. The apps polled the intro queue every 2 s through `poll_intro_queue`, which
+   built a new, empty `Reassembler` on every call. The relay deletes each
+   record as it hands it over, and a handshake is about thirteen records
+   uploaded one per 5 s slot, so nearly every poll landed mid-upload and threw
+   away what it had collected. The contact never appeared.
+2. `accept_conversation` removed the invitation's prekey secrets *before*
+   decoding or verifying anything. The intro queue's deposit key is in every
+   copy of the link, so one junk deposit from anyone holding it destroyed the
+   invitation for the person it was meant for — D-021's mistake, one layer up.
+3. The apps held a single pending invitation; making a second freed the first.
+4. The Android app passed milliseconds where the boundary expects seconds. Its
+   invitations expired 3.6 s after creation for another Android phone, every
+   iOS invitation read as expired on Android, and Android's never expired on
+   iOS.
+
+**Decided.**
+
+- The engine owns invitations (`Engine::create_invite`, `cancel_invite`,
+  `take_contact_events`). It polls every outstanding intro queue inside the
+  retrieval slot, after the session queues, and keeps each invitation's
+  reassembler between polls. There is no platform timer — and so no
+  off-grid retrieval, which the old 2 s timer was (D-014).
+- `accept_conversation` verifies everything first — decoding, the transcript
+  signature, decryption of the first message, that it is text — and consumes
+  the invitation only after all of it passes.
+- Any number of invitations can be outstanding. Each is forgotten
+  `INVITE_ACCEPT_GRACE_SECONDS` (24 hours) after its link expires, because a
+  handshake started in time can still be uploading and the initial message
+  carries no timestamp to judge it by.
+- Every `now` crossing the FFI is in seconds, and one later than the year 3000
+  is refused as `BadArgument`. A millisecond value lands far past that, so the
+  Android mistake now fails loudly instead of silently.
+- Message ids are random, not a counter. A counter restarted at 1 whenever the
+  outbox was empty at launch, so a stalled partial in the peer's reassembler
+  could absorb a new message's fragments; and on an intro queue it was
+  predictable, so a stranger holding the link could aim junk fragments at a
+  handshake still arriving.
+- Starting a conversation with an identity already in the contacts is refused
+  (`AlreadyConnected`). Replacing the session on one side only leaves the two
+  ends on different queues and every later message silently vanishes — and
+  users retry exactly when adding a contact seems not to have worked. An
+  accepted re-handshake from a known identity keeps that contact's
+  verification and name, since its fingerprint is the same.
+
+**Cost.** Intro queues are collected in the same retrieval burst as session
+queues, so the burst grows by two frames per outstanding invitation. It already
+grows with the number of contacts; see "Retrieval shape" under *Open* below.
+
+**Enforced by.** `an_invite_polled_while_it_is_still_arriving_completes`,
+`a_stranger_depositing_junk_cannot_spend_an_invite`,
+`two_outstanding_invites_both_complete`, `an_expired_invite_is_forgotten`,
+`rescanning_a_known_contact_is_refused_not_a_silent_session_swap`,
+`a_new_handshake_from_a_known_identity_keeps_trust_and_name`,
+`a_cancelled_invite_is_never_answered`, and `scanning_your_own_invite_is_refused`
+in `void-client/tests/end_to_end.rs`; `a_millisecond_timestamp_is_rejected_not_misread`
+and `a_full_conversation_works_end_to_end_across_the_ffi_boundary` in `void-ffi`.
+The first was checked against the old behaviour: with a per-poll reassembler it
+fails.
+
+---
+
+## D-026 — Persistence reaches the apps, behind a key the platform holds
+
+**Found, not planned.** The README said the engine persists. That was true in
+Rust and nowhere else: no FFI function called `Engine::new_persisted` or
+`Engine::restore`, and `void_engine_new` generated a fresh identity at every
+launch — so every launch lost every contact, and every contact then saw a
+stranger. On Android, rotating the screen did the same.
+
+**Decided.**
+
+- `void_engine_open(data_dir, kek, backing, now_ms)` restores this device's
+  engine, or creates it on first launch. A key that does not open the existing
+  database — wrong, or destroyed by a duress PIN — is `Locked`, and it never
+  falls back to creating a new database in its place: that would silently
+  replace the user's identity.
+- **The key.** The platform generates a random 32-byte key-encryption key once,
+  keeps it wrapped by its hardware keystore — the Secure Enclave on iOS, behind
+  user presence per FR-ID-02; the Android Keystore, in StrongBox where the device
+  has one — and passes it in at launch. `PlatformVault` wraps the database key
+  under it with exactly `SoftwareVault`'s construction and reports the backing
+  the platform stated (NFR-COMP-02). Every copy the core makes is zeroized
+  before `void_engine_open` returns. Duress destruction is unchanged (D-017):
+  the platform deletes its hardware key, which makes the database permanently
+  undecryptable, then calls `void_engine_duress_destroy`.
+- **Invitations persist** (`Kind::Invite`), written before the link exists, so
+  there is no moment when someone could accept an invitation this device would
+  not remember after a restart.
+- **Fragments persist** (`Kind::Inbox`). The relay deletes each record as it
+  hands it over, so a fragment of a message still arriving existed only in RAM,
+  and a restart between two retrievals lost every multi-record message in
+  flight — including a handshake, which is thirteen records long and so almost
+  always spans several retrievals. Stored fragments are re-fed on restore and
+  deleted once their message completes.
+- **Outbox records carry the id of the message they deliver**, so a message
+  queued before a restart moves to "Sent" after one.
+- **`void_engine_messages`** gives the apps the stored history to show after a
+  restart.
+- **The app libraries unwind on panic.** They are built with a `mobile` profile
+  (`panic = "unwind"`) instead of `release` (`panic = "abort"`). Under
+  `release`, every `catch_unwind` in `void-ffi` and `void-jni` compiled to
+  nothing and any panic in the core killed the app. `check_reproducible.sh` now
+  checks the mobile artifacts too, since those are what ship.
+
+**Why not a `KeyVault` across the FFI.** D-017 already rejected bridging a vault
+through C callbacks, for good reason: it makes the boundary two-directional.
+Passing the key in once keeps it one-directional.
+
+**What it costs.** The key-encryption key is in application memory for the
+duration of `void_engine_open`, as the database key already is for as long as
+the database is open. `vault.rs`'s module docs already make the only claim this
+supports — *not extractable from a locked device*, never *never in memory*.
+Android does not yet gate the key behind user presence; iOS does. The
+difference is stated here rather than hidden.
+
+**Enforced by.** `a_pending_invite_survives_a_restart`,
+`a_handshake_half_received_before_a_restart_still_completes` (checked against
+the old behaviour: without stored fragments it fails),
+`a_message_queued_before_a_restart_is_marked_sent_after_it` in
+`void-client/tests/persistence.rs`; `an_engine_opened_twice_with_the_same_key_keeps_its_identity`
+and `a_wrong_key_reports_locked_and_replaces_nothing` in `void-ffi`;
+`a_platform_vault_reports_the_backing_it_was_given` in `void-store`.
+
+---
+
+## D-027 — Invitations are short links, with the invitation parked on the relay
+
+**Relates to:** FR-DISC-01; replaces the multi-QR workaround in `QRCode.swift`
+
+A full invitation carries the signed prekey bundle — an ML-DSA-87 identity key
+and signature and an ML-KEM-1024 prekey, about 9 KB — so its link was about
+14,600 characters and took thirteen QR codes to show. The apps split it into
+`VOID1/i/n/` frames for the user to swipe through, and the scanners
+reassembled them by frame count; every invitation had the same count, so frames
+from two invitations mixed silently.
+
+**Decided.** The apps hand out a short link, `void://i/<relay>#<secret>`, about
+130 characters: one small QR code, and short enough to paste anywhere. From the
+32-byte secret both sides derive the key the full invitation is encrypted under
+and a queue on the relay (PROTOCOL.md §5.6). The inviter parks the encrypted
+invitation in that queue through its ordinary outbox; whoever opens the link
+collects it, opens it exactly as a full link, and sees who it is from before
+choosing to connect (`Engine::open_invite`, then `Engine::confirm_invite`).
+Full `void://c/` links still open.
+
+- The name on an invitation comes from an encrypted setting (`invite_name`,
+  empty by default) and is shown to whoever opens it. The inviter also names
+  the invitation for its recipient, locally; whoever accepts takes that name.
+  Contacts can be renamed. A first message is optional.
+- Opening a short link expedites the next retrieval: the next emission slot
+  collects instead of waiting out the jitter. It is still a slot — nothing
+  leaves the grid (D-014) — and the jitter hides the link between a deposit and
+  its collection, which does not exist here: the deposit was someone else's,
+  made earlier, and the collection follows the user's own tap.
+- An invitation that never arrives — its maker offline, or it was already
+  collected — is reported after `INVITE_FETCH_TIMEOUT_SECONDS` rather than
+  waited on forever. One opened on a different relay from this client's is
+  refused at once (`WrongRelay`).
+- The engine refuses to collect its own parked invitation: the relay deletes as
+  it hands over, so collecting it would destroy it for the person it was made
+  for.
+
+**What it costs.**
+
+- Opening a short link needs the relay reachable, where a full link opened
+  offline. The handshake that follows needed the relay anyway.
+- The inviter's outbox carries about ten extra records per invitation, at one
+  per slot — so an invitation shown the moment it is made is collectable
+  about fifty seconds later, and the person scanning it waits for that.
+  `Engine::invite_upload_remaining` lets the app say so.
+- The relay sees one more queue per invitation receive about ten records and
+  later be emptied — the same shape an intro queue already has.
+- An opened invitation is held in memory only while it is collected and
+  confirmed. A restart in that minute costs a new invitation, because the relay
+  has already handed the parked copy over.
+
+**Reversal.** The full-link path is intact; making `create_invite` return
+`invite::create(...).to_link()` again is one change.
+
+**Enforced by.** `a_short_invite_link_fits_one_qr_code`,
+`a_short_invite_opens_the_invitation_it_parked`,
+`a_short_invite_derives_independent_key_and_queue`,
+`malformed_short_links_are_rejected`, and
+`a_multibyte_label_truncates_without_panicking` in `void-proto`;
+`an_invite_polled_while_it_is_still_arriving_completes` (which opens the link
+before the inviter has finished parking it), `scanning_your_own_invite_is_refused`,
+`an_invite_on_another_relay_is_refused_clearly`, and
+`a_cancelled_invite_is_never_answered` in `void-client`;
+`an_expedited_retrieval_still_lands_on_the_grid` in the scheduler.
+
+---
+
+## D-028 — A call connects when its media arrives, and neither end rings forever
+
+**Relates to:** D-024. **Found, not planned.** No call had been placed between
+two devices (D-024, *What is not done*), and reading the path end to end showed
+it could not have worked:
+
+1. `void_call_media_send` and `_recv` each took `&mut` to the same struct with
+   no lock, and both apps call them from two threads at once — a data race.
+   Hanging up freed the handle while the receiving thread could still be inside
+   `recv` (Android waited 500 ms for a receive that blocks for two seconds; iOS
+   freed it from the main thread).
+2. A receive that timed out partway through a frame threw away the bytes it had
+   read, and every later frame was misaligned and failed to authenticate: any
+   pause of two seconds made the rest of the call silent. A closed connection
+   looked the same as silence, so a dropped call spun at full CPU still showing
+   "Connected".
+3. The caller only started accepting on its service once the relayed answer
+   arrived — a second mailbox delay, about half a minute, during which the
+   callee's audio was already queuing in a stream nobody read. That audio was
+   then played, adding a delay the call never recovered from.
+4. An offer carried no timestamp, so one that waited in the mailbox rang hours
+   later. Nothing timed out: the caller rang forever. An offer arriving during
+   another call was ignored by the apps while the engine kept it, refusing that
+   contact's calls until restart.
+
+**Decided.**
+
+- **Separate halves.** The media stream splits into a sealer and an opener
+  (`void_proto::call`), and the Tor stream into a reader and a writer
+  (`void_tor::call`), each behind its own lock. The FFI handles are reference
+  counted, so a free racing a call in flight leaves that call a live object.
+  `void_call_media_close` wakes a blocked receive within about a tenth of a
+  second; the platforms close, join their audio threads, then free.
+- **Frames stay whole.** The reader keeps a partial frame across timeouts; the
+  writer finishes a partial frame before the next, and drops new frames while
+  the circuit is backed up rather than queue audio that is only delay.
+- **Receive says what happened:** audio, authenticated silence, nothing, or
+  closed. The apps end the call on closed, or after ten seconds of nothing.
+- **The first authenticated frame is the answer.** The caller accepts on its
+  service from the moment the offer is queued, and the callee's first frame —
+  which only the holder of the offer's media secret can produce — marks the call
+  connected (`mark_call_connected`). The relayed answer still goes out, and is
+  ignored if the media got there first. The service accepts streams only for
+  `CALL_PORT`, as its comment always claimed.
+- **Timing.** An offer carries `sent_at`; one older than
+  `OFFER_MAX_AGE_SECONDS` on arrival is a missed call and does not ring. The
+  callee rings for `RING_TIMEOUT_SECONDS` and then tells the caller; the caller
+  gives up on its own after `CALLER_TIMEOUT_SECONDS`. An offer arriving during
+  any call is declined with the new `EndReason::Busy` and shown as missed.
+- **Signals jump the queue.** Call signals go ahead of queued message fragments
+  in the outbox and are never written to disk — one record per slot as before,
+  but a ring no longer waits behind a long message or a parked invitation.
+- **`PROTOCOL_ID` is `v3`**: the offer gained a field, and a v2 client would
+  misread it. `void_protocol_id` is checked against the core's constant at
+  compile time, and `PROTOCOL.md`'s header and `PROTOCOL_VERSION` now agree
+  with it.
+
+**The offer's age allowance is two minutes, not one.** It was first set to a
+minute, from the reasoning that an offer takes one slot to leave and then
+the callee's jittered retrieval. But an offer is four records whenever its
+ratchet chain carries an ML-KEM step (D-005), and the caller's own retrievals
+take some of its slots. Simulated, offers arrived after 15–60 seconds with a
+tail beyond, and about one call in 300 was reported missed without ringing —
+which showed up as two intermittently failing tests. Two minutes covers the
+delay with room for the clocks of two phones to disagree. The cost is a caller
+who waits up to three minutes when the callee's phone is off; when it is on,
+the callee's own timeout reaches the caller sooner.
+
+**What it costs.** A caller's service is reachable for the whole ring rather
+than only after an answer, so the window in which it can be probed is longer.
+Anyone who can reach it still has to produce a frame under the media secret,
+which travels only in the ratchet-encrypted offer. A clock more than two
+minutes behind the other phone's makes every call from it arrive as missed;
+nothing detects that yet.
+
+**What is still not done.** Everything D-024 says under *What is not done* is
+still true: no call has been placed between two devices, and the platform
+audio code cannot be exercised here.
+
+**Enforced by.** `a_stale_offer_is_missed_not_ringing`,
+`an_unanswered_call_times_out_as_missed_at_both_ends`,
+`a_callee_that_stops_ringing_tells_the_caller`,
+`an_offer_during_a_call_is_declined_busy`,
+`call_signals_go_ahead_of_queued_messages`, and
+`media_that_connects_first_is_the_answer` in `void-client/tests/end_to_end.rs`;
+`media_survives_a_stall_mid_frame`,
+`a_backed_up_writer_drops_new_frames_but_never_splits_one`,
+`a_cancelled_receive_returns_promptly`, and
+`the_service_waits_exactly_as_long_as_the_caller_does` in `void-tor`;
+`the_split_halves_talk_to_the_other_end_independently` in `void-proto`;
+`call_handles_survive_being_freed_mid_call_and_refuse_null` and
+`call_events_encode_to_their_documented_layout` in `void-ffi`.
+
+---
+
+## D-029 — The apps run the engine on one thread, and can place a call
+
+**Relates to:** D-025 to D-028, which changed the core's surface; the apps had
+not followed. **Found, not planned,** while moving them onto it:
+
+1. Neither app could place or answer a call. Both had the call screen, the
+   incoming-call screen, and the disclosure, but nothing presented them, and no
+   conversation had a call button.
+2. "I've checked, continue", on a contact whose code changed, changed only the
+   screen. The engine still blocked sending, so every send after it failed.
+3. An Android release build would have broken every JNI call that returns an
+   object. `void-jni` constructs `NativeTickResult` and its siblings by class
+   name, which R8 cannot see, so it would rename or strip them — and every tick
+   would read as offline.
+4. From Android 12, `allowBackup="false"` no longer covers device-to-device
+   transfer.
+5. Android silences the microphone of an app in the background, so a call
+   would have gone mute the moment the screen locked.
+6. On Android the back button left the app from any screen, and the key
+   storage screen was unreachable.
+
+**Decided.**
+
+- **One engine thread.** Every engine call runs on one serial queue: iOS's
+  `CoreQueue` (a dispatch queue, not an actor, because the calls block and an
+  actor would park a thread of Swift's small cooperative pool), and on Android
+  a single-thread dispatcher. A tick holds the engine's lock while it waits on
+  the network, up to two minutes over a stalled circuit; the interface never
+  waits on it. Tor bootstrap and the relay attach run on their own threads,
+  since neither holds the lock while it waits.
+- **Launch opens the persistent engine** (D-026) with the key `KeyVault`
+  releases. iOS: a P-256 key generated in the Secure Enclave, usable only after
+  Face ID, Touch ID or the passcode, with the KEK sealed to it by ECIES in
+  Application Support (excluded from backup, complete file protection); where
+  no such key can be made — the Simulator, or no passcode set — a
+  `ThisDeviceOnly` Keychain item, reported as Software. Android: a Keystore
+  AES-GCM key in StrongBox, else the TEE, with the backing read back from
+  `KeyInfo` rather than assumed, and the KEK sealed under it in
+  `noBackupFilesDir`. A key that does not open the database is reported, and
+  nothing is replaced.
+- **The engine is the source of truth.** Contacts, names, trust, history, and
+  delivery state are read back from it after each tick that changed something.
+  A sent message shows "Waiting to send" until the scheduler has deposited it.
+- **Tor at launch, and back after a drop.** Bootstrap, then attach the relay;
+  when a tick reports offline, attach again, waiting from five seconds up to
+  five minutes between tries.
+- **Adding a contact, both ways round.** Show my code: one QR code, share and
+  copy, and how long until it can be collected (from
+  `invite_upload_remaining`), then "Sam joined". Scan or paste: "Getting their
+  invitation…", then "Connect with Alex?" with the name it carried, editable,
+  and an optional first message. Several invitations can be outstanding.
+- **Calls are reachable.** A call button, the incoming-call screen, and the
+  disclosure before connecting in either direction, with the microphone asked
+  for at that moment and never at launch. The caller accepts from the moment
+  the offer is queued and takes the first authenticated frame as the answer
+  (D-028). A call ends when its connection closes or ten seconds pass with
+  nothing authenticated. Hanging up while the offer is still being queued
+  withdraws it; before, the hang-up reached the engine first, found no call,
+  and the offer went out anyway. iOS declares background audio; Android runs a
+  foreground service of type microphone while a call's audio runs, whose
+  notification says a call is in progress and not with whom.
+- **Audio, as planned.** iOS: voice processing for echo cancellation, 16 kHz
+  mono cut into exact 20 ms frames, a paced sender thread instead of network
+  sends from the audio tap, the player connected in the decoder's format, Opus
+  packet descriptions set, playback capped at about 400 ms, interruptions
+  handled. Android: the encoder's setup buffers are no longer sent as audio,
+  every ready packet is drained, the decoder is given the Opus identification
+  header and delays it never had, capture feeds a bounded queue that a paced
+  sender drains, playback never blocks and is capped at about 400 ms, echo
+  cancellation and communication mode are on, and teardown is close, join,
+  release, free — in that order.
+- **R8 keeps the JNI result classes**, and `dataExtractionRules` excludes
+  everything from cloud backup and device transfer. The database and the
+  sealed key are in `noBackupFilesDir` regardless.
+
+**How this was checked, and what was not.** No Mac and no Android device were
+available.
+
+- *Swift.* The files that call the core — `VoidCore.swift`, `VoidCall.swift`,
+  `CoreQueue.swift` — were type-checked on Linux with Swift 6.4 against the
+  header cbindgen generates from the current source, then compiled and run
+  against the real core: in-memory and persisted engines, invitations, error
+  mapping, the milliseconds guard, the right key and a wrong one. That found a
+  crash before it shipped: the byte reader indexed an array slice from zero,
+  and would have trapped on every contact list. `AppState.swift` and
+  `CallAudio.swift` were type-checked against minimal stand-ins for Combine
+  and AVFoundation. The SwiftUI views and `KeyVault.swift` were only
+  syntax-checked. Nothing has been built with Xcode.
+- *Kotlin.* The app compiles against SDK 34 and assembles
+  (`./gradlew assembleDebug`), and lint reports no errors — it found one, a
+  missing microphone permission check, now fixed. `VoidCore.kt` and
+  `Engine.kt` were run on a desktop JVM against the real core through
+  `void-jni` built for Linux, so D-023's "never run in a JVM" no longer holds
+  for the shim itself.
+- *Android, running.* `scripts/build_android.sh` cross-compiled `void-jni`
+  for arm64-v8a and x86_64 with NDK r30 — the first time it was built for
+  Android at all — and the app ran on two emulated phones (API 34, x86_64),
+  with a local `void-relayd` published as an onion service by C-tor, over the
+  live Tor network. Every item on the plan's device list passed except the QR
+  camera (the emulators have none; the link was pasted instead): launch and
+  onboarding; the Keystore key and persistent engine, surviving a restart and
+  a rotation; Arti bootstrapping inside the app; an invitation made offline;
+  adding a contact both ways round, the invitation carrying its maker's name;
+  messages both ways, "Waiting to send" becoming "Sent", history surviving a
+  restart; a call placed, rung in eight seconds, answered, connected in six,
+  muted, and hung up from either end; the call held for over a minute with the
+  callee's screen locked; killing the callee ended the call on the caller at
+  once; airplane mode, with backoff, reconnection, and a message held by the
+  relay delivered after it. The audio was a silent virtual device, so the media
+  path is proven and what a voice sounds like is not.
+- *What running found, fixed:* an attach that hung for over six minutes
+  inside Arti's onion-service connect, keeping the phone offline with no retry
+  (both `void-tor` connects now give up after `CONNECT_TIMEOUT`, and the app's
+  backoff retries); Android's Opus decoder always producing 48 kHz, played into
+  a 16 kHz track (playback now follows the decoder's output format); a hang-up
+  shown to the other end as "The connection dropped" (a closed connection now
+  reads "Call ended", and "dropped" means ten seconds of nothing on an open
+  one); and the key-storage screen promising "your passphrase" on a phone
+  with software-only key storage, where the app never asks for one (the core's
+  description is now true of every software case).
+- *Seen once: a stalled circuit.* One call ended itself after about 40
+  seconds. Its logs show both phones' decoders receiving their last frame at
+  the same moment, and both phones' ten-second stall timers ending the call
+  ten seconds later, a tenth of a second apart. The circuit carrying the call
+  stalled in both directions; neither app hung up. The logs do not say why.
+  The callee's screen had locked seven seconds earlier, but the next call held
+  for over a minute with it locked, and a circuit on the live network can
+  stall with no help. Nothing reconnects a call whose circuit stalls: it ends,
+  and the user calls again.
+- The iOS app has not run, and no build of either app has run on physical
+  hardware. D-024's rule — treat calls as unproven until someone has held a
+  conversation — stands for iOS, and for real audio on both.
+
+**Enforced by.** `QRCodeRenderTests` (a real short link from the core renders
+as a code that CoreImage's detector reads back as the same link),
+`InvitationBoundaryTests`, and `QRCodeUITests`, in CI's macOS job; the
+bindings checks in CI's `app-bindings` job (`scripts/check_ios_bindings.sh`,
+`scripts/check_android_bindings.sh`); and the Android build, lint, and
+cross-compile in CI's `android` job.
+
+---
+
+## D-030 — A deposit the relay refuses waits its turn, and duress leaves no identity behind
+
+Two items the review that produced D-025 to D-028 deferred.
+
+**A refused deposit held up every contact.** The outbox sends one record per
+slot, always the one at its head, and a refused record stayed at the head. A
+refusal carries no reason — one would be an oracle — and its causes (one
+queue's deposit rate, its capacity) pass, so the record is kept. But every slot
+went to retrying it, and every other contact's messages waited behind one
+queue's limit. Now a refused record moves to the back of its class (a call
+signal behind the other signals, a message fragment behind everything) and is
+retried in turn. Retrying costs nothing a relay or observer can see: the slot
+carries a frame either way. Nothing is ever given up on.
+
+**Duress left the identity in memory.** `Engine::duress_destroy` cleared
+sessions, invitations and calls, and destroyed the store, but the identity's
+secret keys stayed in the process until the platform freed the engine. Now it
+replaces them with a stand-in derived from fixed zero seeds, which belongs to
+nobody — dropping the real keys, which wipe themselves — resets the settings
+(the name the user went by) and the relay address, and drops the store once it
+is destroyed, so nothing writes to it afterwards. D-017's split is unchanged:
+the platform still destroys its hardware key first.
+
+**Enforced by.** `a_queue_the_relay_keeps_refusing_does_not_hold_up_other_contacts`
+(checked against the old behaviour: the other contact never received) in
+`void-client/tests/end_to_end.rs`; `duress_destroy_wipes_memory_and_leaves_the_database_unopenable`,
+which now also requires the identity and the name to be gone, in
+`void-client/tests/duress.rs`.
+
+---
+
 ## Open, and deliberately so
 
 **PRD §13.3 — who runs the relays.** Not resolved. The code supports any
@@ -869,3 +1346,19 @@ is correct and the honest move is to contribute to Briar.
 **PRD §13.6 — build versus contribute to SimpleX.** Unanswered here, because
 it is not a question code can answer. The PRD is right that it deserves a
 written answer before this goes further.
+
+**Retrieval shape, and what a hostile relay can link.** Found while fixing
+D-025, not resolved by it. A client carries every deposit and every retrieval
+over one Tor stream, and a retrieval slot collects *all* of its queues in one
+burst: two frames per session queue, two per intro queue, and two more per
+record collected. So a relay that chose to log could group every queue one
+client retrieves as belonging to one pseudonymous circuit, and could pair the
+circuit that deposits into a queue with the circuit that collects from it —
+which is a contact edge. That is weaker than "a relay cannot link two of your
+queues", which holds for the queue identifiers themselves
+(`the_relay_cannot_link_two_queues_of_one_user`) but not for how they are
+collected. The burst's length also tells a network observer roughly how many
+contacts a client has. The usual remedies — a stream per queue through Arti's
+isolation tokens, spreading retrievals across slots, or separate relays for
+sending and receiving — each cost latency or bandwidth, and choosing between
+them is a threat-model decision this entry records rather than makes.

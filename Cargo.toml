@@ -31,5 +31,16 @@ debug = false
 incremental = false
 overflow-checks = true
 
+# The libraries the apps link — void-ffi (iOS) and void-jni (Android) — are
+# built with this profile, not `release`. Every function they export wraps its
+# body in `catch_unwind`, so that a panic in the core becomes an error code the
+# app can show instead of a crash. That only works if panics unwind: under
+# `release`'s `panic = "abort"` those guards compiled to nothing and any core
+# panic killed the app. Otherwise identical to `release`, and held to the same
+# reproducibility check (scripts/check_reproducible.sh).
+[profile.mobile]
+inherits = "release"
+panic = "unwind"
+
 [profile.test]
 overflow-checks = true

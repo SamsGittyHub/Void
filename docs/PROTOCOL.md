@@ -1,8 +1,10 @@
-# Void Protocol Specification v1
+# Void Protocol Specification v3
 
 **Status:** Draft, for review before implementation freeze (PRD §11 Phase 1
 deliverable)
-**Protocol identifier:** `void/v1/pqxdh/x25519+mlkem1024/ed25519+mldsa87`
+**Protocol identifier:** `void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87` —
+`v2` added message content framing (§13a); `v3` added call offer timestamps and
+the busy signal (§13b).
 
 This document specifies the bytes on the wire. It is written so that an
 independent implementation could be built from it, and so that a reviewer can
@@ -59,6 +61,7 @@ void/v1/identity/fingerprint    void/v1/store/database
 void/v1/store/row               void/v1/export/archive
 void/v1/queue/address           void/v1/queue/auth
 void/v1/push/wake-id            void/v1/invite/link
+void/v1/invite/drop
 ```
 
 ### 2.2 Hybrid combination
@@ -252,7 +255,57 @@ Deposited into the bundle's published queue. Every subsequent message goes to
 the derived steady-state queue.
 
 The responder verifies the transcript signature **before** using the derived key
-for anything.
+for anything — and consumes the bundle's prekey secrets only after the whole
+initial message has verified and decrypted. The published queue's deposit key
+is in every copy of the invitation, so anything arriving there is a candidate,
+not a handshake (D-025).
+
+### 5.6 Invitations
+
+A bundle reaches the initiator inside an invitation (FR-DISC-01, FR-DISC-02):
+
+```
+InviteBody = bytes32(PrekeyBundle) || u64(expires_at) || bytes16(label)
+invitation = raw(nonce : 24) || XChaCha20-Poly1305(key, nonce, aad = "void://c/", InviteBody)
+```
+
+`label` is at most 64 bytes, truncated on a UTF-8 character boundary. It is shown
+to the initiator and is not an identity. Opening an invitation checks, in order:
+decryption, decoding, the bundle's signature, and `expires_at`.
+
+**Full link** — the invitation itself, about 14,600 characters:
+
+```
+void://c/<base32(invitation)>#<base32(key : 32)>
+```
+
+**Short link** — what the clients hand out, about 130 characters and one QR code:
+
+```
+void://i/<relay>#<base32(secret : 32)>
+
+key        = HKDF(ikm = secret, salt = "", info = "void/v1/invite/link",  32)
+drop_queue = QueueSecret(HKDF(ikm = secret, salt = "", info = "void/v1/invite/drop", 32), 0)
+```
+
+`relay` is the inviter's relay address, restricted to `[a-z0-9.:-]` and at most
+255 characters. The inviter fragments `invitation` into records (§7), seals them
+to `drop_queue` (§8), and deposits them through its ordinary constant-rate
+outbox. The initiator derives the same `drop_queue` — including its retrieval
+key, so holding the link is what authorises collecting — collects and
+reassembles the records, and opens the result under `key` exactly as a full
+link would be opened.
+
+In both forms every secret is after `#`: a server, a log, or a `Referer` header
+that sees the rest learns nothing it can decrypt. The relay holds only the
+ciphertext a full link would have carried, and it deletes each record as it
+hands it over, so a short invitation is collected once.
+
+*Tests:* `invite::tests::a_short_invite_link_fits_one_qr_code`,
+`invite::tests::a_short_invite_opens_the_invitation_it_parked`,
+`invite::tests::a_multibyte_label_truncates_without_panicking`, and
+`an_invite_polled_while_it_is_still_arriving_completes` in
+`void-client/tests/end_to_end.rs`.
 
 ---
 
@@ -599,10 +652,42 @@ Two channels with opposite requirements, carried differently.
 
 ```
 CallSignal = u8(1) || raw(call_id : 16) || bytes16(onion_address)
-           || u16(port) || raw(media_secret : 32)      -- Offer
+           || u16(port) || raw(media_secret : 32)
+           || u64(sent_at)                              -- Offer
            = u8(2) || raw(call_id : 16) || u8(accepted) -- Answer
            = u8(3) || raw(call_id : 16) || u8(reason)   -- End
+
+reason     = 1 hung up | 2 declined | 3 missed | 4 failed | 5 busy
 ```
+
+`sent_at` is Unix seconds by the caller's clock, inside the ciphertext. A
+signal naming a `call_id` other than the call in progress with that contact is
+ignored, so a late `End` from a finished call cannot tear down the next one.
+
+**Timing.** Offers wait in the mailbox like any message, so the receiver judges
+each one on arrival:
+
+- An offer more than `OFFER_MAX_AGE_SECONDS` (120) old by the receiver's clock
+  is reported as a missed call and never rings. The allowance is wide because
+  an offer can be four records long (a ratchet step with ML-KEM material,
+  D-005) and so take over a minute to arrive, and because the age is measured
+  across two clocks.
+- An offer that arrives during any other call is answered with `End(busy)`
+  and reported as missed.
+- The callee rings for `RING_TIMEOUT_SECONDS` (60) from arrival, then sends
+  `End(missed)`. The caller gives up after `CALLER_TIMEOUT_SECONDS` (180, the
+  two added) if nothing has come back, and sends `End(missed)` too — a backstop
+  for a callee who went offline mid-ring.
+- Call signals go ahead of queued message fragments in the outbox and are never
+  written to disk. They still leave one record per emission slot: priority
+  changes which record fills a slot, never when a slot happens.
+
+**Connecting.** The caller starts accepting on its service as soon as the offer
+is queued. The callee dials when the user answers, and also sends `Answer`;
+whichever reaches the caller first ends the ring, and in practice that is the
+callee's first authenticated media frame, which only the holder of
+`media_secret` can produce. So connecting costs one mailbox delay, not two. The
+service accepts streams only for `CALL_PORT` and refuses any other.
 
 **Media** is a direct connection over paired ephemeral onion services and never
 touches the relay. The caller publishes; the callee dials. That direction is
@@ -636,8 +721,15 @@ opened is refused. Voice tolerates loss but not reordering into the past: a
 late frame played anyway is a syllable out of order, and a replayed one is a
 repeated syllable.
 
-*Tests:* `call::tests::*` in `void-proto`, and the four call tests in
-`void-client/tests/end_to_end.rs`.
+**Frames stay whole.** Frames carry no framing of their own, so a reader or
+writer that abandoned one halfway would misalign every later frame, and each
+would fail to authenticate for the rest of the call. A receive that times out
+mid-frame keeps what it has and resumes; a send finishes a partly written frame
+before starting the next, and drops new frames rather than queue behind a
+stalled circuit, since late audio is only delay.
+
+*Tests:* `call::tests::*` in `void-proto` and `void-tor`, and the call tests
+in `void-client/tests/end_to_end.rs` (see D-028).
 
 **Measured cost.** `experiments/onion-call/RESULTS.md`: 0% loss over 4,500
 packets, round-trip p50 376–528 ms, p95 635–1112 ms, mouth-to-ear 470–870 ms.

@@ -27,9 +27,11 @@
 //!
 //! Anyone who knows a queue id may deposit. That is what lets a sender be
 //! anonymous to the relay — requiring sender authentication would create
-//! exactly the account the design exists to avoid. Retrieval requires a MAC
-//! over a relay-issued challenge, because otherwise anyone who learned a queue
-//! id could drain it.
+//! exactly the account the design exists to avoid. Retrieval requires a
+//! signature over a relay-issued challenge, by the key the queue id is the hash
+//! of (D-011), because otherwise anyone who learned a queue id could drain it —
+//! and a signature, unlike a MAC, leaves the relay holding no key to check it
+//! with.
 
 use std::collections::{HashMap, VecDeque};
 

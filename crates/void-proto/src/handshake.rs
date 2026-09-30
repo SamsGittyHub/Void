@@ -62,7 +62,11 @@ use crate::{ProtoError, Result};
 /// decrypt successfully and then misinterpret every message it received. A
 /// handshake that fails is the correct outcome there, so the identifier moved
 /// with the framing.
-pub const PROTOCOL_ID: &[u8] = b"void/v2/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
+///
+/// Bumped to `v3` when call offers gained the time they were sent and calls
+/// gained a busy signal (`crate::call`). A v2 client would fail to decode a v3
+/// offer and silently never ring — the same reasoning again.
+pub const PROTOCOL_ID: &[u8] = b"void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
 
 /// Domain separator for the prekey signature.
 const PREKEY_SIG_CONTEXT: &[u8] = b"void/v1/prekey-bundle";
@@ -87,6 +91,82 @@ pub struct PrekeySecrets {
 impl Drop for PrekeySecrets {
     fn drop(&mut self) {
         self.kem_decaps.zeroize();
+    }
+}
+
+/// Version byte of [`PrekeySecrets::serialize`]'s layout.
+const PREKEY_SECRETS_VERSION: u8 = 1;
+
+impl PrekeySecrets {
+    /// Serialize for storage, so an invitation outlives the process that made
+    /// it.
+    ///
+    /// This is raw secret key material with no encryption of its own — the
+    /// same contract as `Ratchet::serialize` (`docs/PROTOCOL.md` §6.6): the
+    /// caller writes it only inside an already-encrypted-at-rest record, and
+    /// zeroizes the returned buffer after.
+    ///
+    /// ```text
+    /// PrekeySecrets = u8(version)                          // = 1
+    ///              || raw(signed_secret : 32)
+    ///              || u8(has_one_time) || raw(one_time_secret : 32)   // zeroed if absent
+    ///              || bytes16(kem_encaps : 1568)
+    ///              || bytes16(kem_decaps : 64)
+    /// ```
+    ///
+    /// The X25519 public halves are re-derived on load rather than stored, so
+    /// a corrupted record cannot pair one key's secret with another's public.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(PREKEY_SECRETS_VERSION).raw(&self.signed.secret);
+        match &self.one_time {
+            Some(k) => {
+                w.u8(1).raw(&k.secret);
+            }
+            None => {
+                w.u8(0).raw(&[0u8; 32]);
+            }
+        }
+        w.bytes16(&self.kem_encaps).bytes16(&self.kem_decaps);
+        w.finish()
+    }
+
+    /// Restore from [`serialize`](Self::serialize)'s output. A wrong version or
+    /// a wrong key length is malformed, never partially parsed.
+    pub fn deserialize(bytes: &[u8]) -> Result<PrekeySecrets> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != PREKEY_SECRETS_VERSION {
+            return Err(ProtoError::Malformed);
+        }
+        let signed = x25519::KeyPair::from_secret(r.array::<32>()?);
+        let has_one_time = r.u8()?;
+        let mut one_time_secret = r.array::<32>()?;
+        let one_time = match has_one_time {
+            0 => None,
+            1 => Some(x25519::KeyPair::from_secret(one_time_secret)),
+            _ => {
+                one_time_secret.zeroize();
+                return Err(ProtoError::Malformed);
+            }
+        };
+        one_time_secret.zeroize();
+        let kem_encaps = r.bytes16()?.to_vec();
+        // Owned by the struct from here on, so its Drop zeroizes the
+        // decapsulation key on every early return below.
+        let secrets = PrekeySecrets {
+            signed,
+            one_time,
+            kem_encaps,
+            kem_decaps: r.bytes16()?.to_vec(),
+        };
+        r.finish()?;
+        if secrets.kem_encaps.len() != mlkem::ENCAPS_KEY_LEN
+            || secrets.kem_decaps.len() != mlkem::DECAPS_KEY_LEN
+        {
+            return Err(ProtoError::Malformed);
+        }
+        Ok(secrets)
     }
 }
 
@@ -799,6 +879,43 @@ mod tests {
         let (s1, _) = respond(&b, &secrets, &initial).unwrap();
         let (s2, _) = respond(&b, &secrets, &initial).unwrap();
         assert_eq!(s1.send_queue.queue_id(), s2.send_queue.queue_id());
+    }
+
+    #[test]
+    fn restored_prekey_secrets_still_complete_the_handshake() {
+        // An invitation must outlive the process that made it: the person it
+        // was sent to may accept it hours later, after the app was killed.
+        let (a, b) = (alice(), bob());
+        for with_one_time in [true, false] {
+            let (bundle, secrets) =
+                PrekeyBundle::create(&b, &queue(20), b"r", with_one_time).unwrap();
+            let bytes = secrets.serialize();
+            let restored = PrekeySecrets::deserialize(&bytes).unwrap();
+            assert_eq!(restored.serialize(), bytes, "the round trip is exact");
+            assert_eq!(restored.signed.public, secrets.signed.public);
+
+            let (initial, _, _) = initiate(&a, &bundle, b"after a restart").unwrap();
+            let (_, first) = respond(&b, &restored, &initial).unwrap();
+            assert_eq!(first, b"after a restart");
+        }
+    }
+
+    #[test]
+    fn malformed_prekey_secrets_are_refused() {
+        let (_, secrets) = PrekeyBundle::create(&bob(), &queue(21), b"r", true).unwrap();
+        let bytes = secrets.serialize();
+        for n in [0usize, 1, 33, bytes.len() - 1] {
+            assert!(PrekeySecrets::deserialize(&bytes[..n]).is_err(), "len {n}");
+        }
+        let mut wrong_version = bytes.clone();
+        wrong_version[0] = 2;
+        assert!(PrekeySecrets::deserialize(&wrong_version).is_err());
+        let mut bad_flag = bytes.clone();
+        bad_flag[33] = 7;
+        assert!(PrekeySecrets::deserialize(&bad_flag).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(PrekeySecrets::deserialize(&trailing).is_err());
     }
 
     #[test]

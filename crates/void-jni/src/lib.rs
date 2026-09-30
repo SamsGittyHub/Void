@@ -30,13 +30,13 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
+use jni::objects::{JByteArray, JClass, JIntArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
 use void_ffi::{
-    VoidBytes, VoidEngine, VoidPinOutcome, VoidPinVerifier, VoidQueueSecret, VoidStatus,
-    VoidTickOutcome, VoidTorHandle, VoidVaultBacking,
+    VoidBytes, VoidEngine, VoidPinOutcome, VoidPinVerifier, VoidStatus, VoidTickOutcome,
+    VoidTorHandle, VoidVaultBacking,
 };
 
 // --- small conversion helpers ------------------------------------------------
@@ -125,6 +125,90 @@ pub extern "system" fn Java_app_void_VoidCore_engineNew(_env: JNIEnv, _class: JC
             out as jlong
         } else {
             0
+        }
+    })
+}
+
+/// Opens this device's engine — restoring it, or creating it on first launch.
+/// Returns the handle, or 0 on failure; `outStatus[0]` receives the
+/// `VoidStatus` so Kotlin can tell `LOCKED` (wrong or destroyed key) from any
+/// other failure. See `void_ffi::void_engine_open`.
+///
+/// The KEK is copied out of the JVM array and zeroized on this side after the
+/// call; the Kotlin caller zeroizes its own array too (`ByteArray.fill(0)`).
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_engineOpen(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    kek: JByteArray,
+    backing: jint,
+    now_ms: jlong,
+    out_status: JIntArray,
+) -> jlong {
+    let env = &mut env;
+    guard(0, || {
+        let dir = read_string(env, &data_dir);
+        let mut key = read_bytes(env, &kek);
+        let status = if key.len() != 32 {
+            (VoidStatus::BadArgument, 0)
+        } else if let Ok(dir_c) = std::ffi::CString::new(dir) {
+            let backing = match backing {
+                0 => VoidVaultBacking::SecureEnclave,
+                1 => VoidVaultBacking::StrongBox,
+                2 => VoidVaultBacking::Tee,
+                _ => VoidVaultBacking::Software,
+            };
+            let mut out: *mut VoidEngine = std::ptr::null_mut();
+            let status = unsafe {
+                void_ffi::void_engine_open(
+                    dir_c.as_ptr(),
+                    key.as_ptr(),
+                    backing,
+                    now_ms as u64,
+                    &mut out,
+                )
+            };
+            (
+                status,
+                if status == VoidStatus::Ok {
+                    out as jlong
+                } else {
+                    0
+                },
+            )
+        } else {
+            (VoidStatus::BadArgument, 0)
+        };
+        for b in key.iter_mut() {
+            *b = 0;
+        }
+        std::hint::black_box(&key);
+        let _ = env.set_int_array_region(&out_status, 0, &[status.0 as jint]);
+        status.1
+    })
+}
+
+/// The stored history with one contact. Layout is documented on
+/// `void_ffi::void_engine_messages`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_messages(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+    fingerprint: JByteArray,
+) -> jbyteArray {
+    let env = &mut env;
+    guard(std::ptr::null_mut(), || {
+        let fp = read_bytes(env, &fingerprint);
+        if engine_handle == 0 || fp.len() != 32 {
+            return unsafe { bytes_to_jbytearray(env, empty_bytes()) };
+        }
+        unsafe {
+            bytes_to_jbytearray(
+                env,
+                void_ffi::void_engine_messages(engine_handle as *const VoidEngine, fp.as_ptr()),
+            )
         }
     })
 }
@@ -436,175 +520,402 @@ pub extern "system" fn Java_app_void_VoidCore_engineAttachTor(
 
 // --- conversations -------------------------------------------------------
 
-/// `app.void.NativeInviteResult(link: String, queueHandle: Long)`.
+/// `app.void.NativeInviteResult(link: String, inviteId: ByteArray)`.
+///
+/// `now` and `ttlSeconds` are in seconds. A millisecond value is refused by
+/// void-ffi rather than misread — see `void_ffi`'s `MAX_PLAUSIBLE_UNIX_SECONDS`.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_app_void_VoidCore_createInvite<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass<'a>,
     engine_handle: jlong,
     relay_hint: JByteArray<'a>,
-    label: JString<'a>,
+    my_label: JString<'a>,
+    contact_label: JString<'a>,
     now: jlong,
     ttl_seconds: jlong,
 ) -> JObject<'a> {
     let env = &mut env;
     guard(JObject::null(), || {
         let hint = read_bytes(env, &relay_hint);
-        let label = read_string(env, &label);
+        let my_label = read_string(env, &my_label);
+        let contact_label = read_string(env, &contact_label);
         unsafe {
             let mut out_link = empty_bytes();
-            let mut out_queue: *mut VoidQueueSecret = std::ptr::null_mut();
+            let mut out_id = [0u8; 16];
             let status = void_ffi::void_engine_create_invite(
                 engine_handle as *mut VoidEngine,
                 hint.as_ptr(),
                 hint.len(),
-                label.as_ptr(),
-                label.len(),
+                my_label.as_ptr(),
+                my_label.len(),
+                contact_label.as_ptr(),
+                contact_label.len(),
                 now as u64,
                 ttl_seconds as u64,
                 &mut out_link,
-                &mut out_queue,
+                out_id.as_mut_ptr(),
             );
             if status != VoidStatus::Ok {
                 return JObject::null();
             }
             let link_jstring = bytes_to_jstring(env, out_link);
             let link_jobject = JObject::from_raw(link_jstring);
+            let id_raw = env
+                .byte_array_from_slice(&out_id)
+                .map(|a| a.into_raw())
+                .unwrap_or(std::ptr::null_mut());
+            let id_jobject = JObject::from_raw(id_raw);
             find_and_new_object(
                 env,
                 "app/void/NativeInviteResult",
-                "(Ljava/lang/String;J)V",
-                &[
-                    JValue::Object(&link_jobject),
-                    JValue::Long(out_queue as jlong),
-                ],
+                "(Ljava/lang/String;[B)V",
+                &[JValue::Object(&link_jobject), JValue::Object(&id_jobject)],
             )
         }
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_void_VoidCore_queueSecretFree(
-    _env: JNIEnv,
+pub extern "system" fn Java_app_void_VoidCore_cancelInvite(
+    mut env: JNIEnv,
     _class: JClass,
-    handle: jlong,
-) {
-    guard((), || unsafe {
-        void_ffi::void_queue_secret_free(handle as *mut VoidQueueSecret);
+    engine_handle: jlong,
+    invite_id: JByteArray,
+) -> jboolean {
+    let env = &mut env;
+    guard(JNI_FALSE, || {
+        let id = read_bytes(env, &invite_id);
+        if engine_handle == 0 || id.len() != 16 {
+            return JNI_FALSE;
+        }
+        unsafe {
+            if void_ffi::void_engine_cancel_invite(engine_handle as *mut VoidEngine, id.as_ptr())
+                == VoidStatus::Ok
+            {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            }
+        }
     })
 }
 
-/// `app.void.NativePollResult(status: Int, data: ByteArray)`.
+/// Drains contact events. Layout is documented on
+/// `void_ffi::void_engine_take_contact_events`; Kotlin parses it in
+/// `ContactEvent.parseAll`.
 #[no_mangle]
-pub extern "system" fn Java_app_void_VoidCore_pollIntroQueue<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass<'a>,
+pub extern "system" fn Java_app_void_VoidCore_takeContactEvents(
+    mut env: JNIEnv,
+    _class: JClass,
     engine_handle: jlong,
-    queue_handle: jlong,
-) -> JObject<'a> {
+) -> jbyteArray {
     let env = &mut env;
-    guard(JObject::null(), || unsafe {
-        let mut out = empty_bytes();
-        let status = void_ffi::void_engine_poll_intro_queue(
-            engine_handle as *mut VoidEngine,
-            queue_handle as *const VoidQueueSecret,
-            &mut out,
-        );
-        let data_raw = bytes_to_jbytearray(env, out);
-        let data_jobject = JObject::from_raw(data_raw);
-        find_and_new_object(
+    guard(std::ptr::null_mut(), || unsafe {
+        if engine_handle == 0 {
+            return bytes_to_jbytearray(env, empty_bytes());
+        }
+        bytes_to_jbytearray(
             env,
-            "app/void/NativePollResult",
-            "(I[B)V",
-            &[JValue::Int(status as jint), JValue::Object(&data_jobject)],
+            void_ffi::void_engine_take_contact_events(engine_handle as *mut VoidEngine),
         )
     })
 }
 
-/// `app.void.NativeAcceptResult(fingerprint: ByteArray, firstMessage: String)`.
+/// `app.void.NativeOpenResult(status: Int, fetchId: ByteArray)`.
+///
+/// `fetchId` is empty unless `status` is `VoidStatus::Ok`. See
+/// `void_ffi::void_engine_open_invite`.
 #[no_mangle]
-pub extern "system" fn Java_app_void_VoidCore_acceptConversation<'a>(
+pub extern "system" fn Java_app_void_VoidCore_openInvite<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass<'a>,
     engine_handle: jlong,
-    queue_handle: jlong,
-    initial: JByteArray<'a>,
+    link: JString<'a>,
     now: jlong,
 ) -> JObject<'a> {
     let env = &mut env;
     guard(JObject::null(), || {
-        let initial_bytes = read_bytes(env, &initial);
-        unsafe {
-            let mut out_fp = [0u8; 32];
-            let mut out_first_message = empty_bytes();
-            let status = void_ffi::void_engine_accept_conversation(
+        let link = read_string(env, &link);
+        let Ok(link_c) = std::ffi::CString::new(link) else {
+            return status_with_bytes(
+                env,
+                "app/void/NativeOpenResult",
+                VoidStatus::BadArgument,
+                &[],
+            );
+        };
+        let mut out_id = [0u8; 16];
+        let status = unsafe {
+            void_ffi::void_engine_open_invite(
                 engine_handle as *mut VoidEngine,
-                queue_handle as *const VoidQueueSecret,
-                initial_bytes.as_ptr(),
-                initial_bytes.len(),
+                link_c.as_ptr(),
+                now as u64,
+                out_id.as_mut_ptr(),
+            )
+        };
+        let id: &[u8] = if status == VoidStatus::Ok {
+            &out_id
+        } else {
+            &[]
+        };
+        status_with_bytes(env, "app/void/NativeOpenResult", status, id)
+    })
+}
+
+/// `app.void.NativeStartResult(status: Int, fingerprint: ByteArray)`.
+///
+/// The status is passed through rather than collapsed to null, so Kotlin can
+/// say the invitation expired, or that they are already connected, instead of
+/// "something went wrong". See `void_ffi::void_engine_confirm_invite`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_confirmInvite<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    engine_handle: jlong,
+    fetch_id: JByteArray<'a>,
+    local_name: JString<'a>,
+    first_message: JString<'a>,
+    now: jlong,
+) -> JObject<'a> {
+    let env = &mut env;
+    guard(JObject::null(), || {
+        let id = read_bytes(env, &fetch_id);
+        let local_name = read_string(env, &local_name);
+        let first_message = read_string(env, &first_message);
+        let (Ok(name_c), Ok(msg_c)) = (
+            std::ffi::CString::new(local_name),
+            std::ffi::CString::new(first_message),
+        ) else {
+            return status_with_bytes(
+                env,
+                "app/void/NativeStartResult",
+                VoidStatus::BadArgument,
+                &[],
+            );
+        };
+        if id.len() != 16 {
+            return status_with_bytes(
+                env,
+                "app/void/NativeStartResult",
+                VoidStatus::BadArgument,
+                &[],
+            );
+        }
+        let mut out_fp = [0u8; 32];
+        let status = unsafe {
+            void_ffi::void_engine_confirm_invite(
+                engine_handle as *mut VoidEngine,
+                id.as_ptr(),
+                name_c.as_ptr(),
+                msg_c.as_ptr(),
                 now as u64,
                 out_fp.as_mut_ptr(),
-                &mut out_first_message,
-            );
-            if status != VoidStatus::Ok {
-                return JObject::null();
-            }
-            let fp_raw = env
-                .byte_array_from_slice(&out_fp)
-                .map(|a| a.into_raw())
-                .unwrap_or(std::ptr::null_mut());
-            let fp_jobject = JObject::from_raw(fp_raw);
-            let msg_raw = bytes_to_jstring(env, out_first_message);
-            let msg_jobject = JObject::from_raw(msg_raw);
-            find_and_new_object(
-                env,
-                "app/void/NativeAcceptResult",
-                "([BLjava/lang/String;)V",
-                &[JValue::Object(&fp_jobject), JValue::Object(&msg_jobject)],
             )
+        };
+        let fingerprint: &[u8] = if status == VoidStatus::Ok {
+            &out_fp
+        } else {
+            &[]
+        };
+        status_with_bytes(env, "app/void/NativeStartResult", status, fingerprint)
+    })
+}
+
+/// Builds one of the `(status: Int, bytes: ByteArray)` result classes.
+fn status_with_bytes<'a>(
+    env: &mut JNIEnv<'a>,
+    class: &str,
+    status: VoidStatus,
+    bytes: &[u8],
+) -> JObject<'a> {
+    let raw = env
+        .byte_array_from_slice(bytes)
+        .map(|a| a.into_raw())
+        .unwrap_or(std::ptr::null_mut());
+    // Safety: `raw` is either null or a local reference just created above.
+    let array = unsafe { JObject::from_raw(raw) };
+    find_and_new_object(
+        env,
+        class,
+        "(I[B)V",
+        &[JValue::Int(status as jint), JValue::Object(&array)],
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_cancelFetch(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+    fetch_id: JByteArray,
+) -> jboolean {
+    let env = &mut env;
+    guard(JNI_FALSE, || {
+        let id = read_bytes(env, &fetch_id);
+        if engine_handle == 0 || id.len() != 16 {
+            return JNI_FALSE;
+        }
+        let status = unsafe {
+            void_ffi::void_engine_cancel_fetch(engine_handle as *mut VoidEngine, id.as_ptr())
+        };
+        if status == VoidStatus::Ok {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
+/// Records still to upload for one of our invitations, or -1 once it is no
+/// longer outstanding. See `void_ffi::void_engine_invite_status`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_inviteStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+    invite_id: JByteArray,
+) -> jint {
+    let env = &mut env;
+    guard(-1, || {
+        let id = read_bytes(env, &invite_id);
+        if engine_handle == 0 || id.len() != 16 {
+            return -1;
+        }
+        unsafe {
+            void_ffi::void_engine_invite_status(engine_handle as *const VoidEngine, id.as_ptr())
         }
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_app_void_VoidCore_startConversation(
+pub extern "system" fn Java_app_void_VoidCore_inviteLink(
     mut env: JNIEnv,
     _class: JClass,
     engine_handle: jlong,
-    link: JString,
-    local_name: JString,
-    first_message: JString,
-    now: jlong,
-) -> jbyteArray {
+    invite_id: JByteArray,
+) -> jstring {
     let env = &mut env;
     guard(std::ptr::null_mut(), || {
-        let link = read_string(env, &link);
-        let local_name = read_string(env, &local_name);
-        let first_message = read_string(env, &first_message);
-        let (Ok(link_c), Ok(name_c), Ok(msg_c)) = (
-            std::ffi::CString::new(link),
-            std::ffi::CString::new(local_name),
-            std::ffi::CString::new(first_message),
-        ) else {
-            return std::ptr::null_mut();
-        };
-        let mut out_fp = [0u8; 32];
-        unsafe {
-            let status = void_ffi::void_engine_start_conversation(
-                engine_handle as *mut VoidEngine,
-                link_c.as_ptr(),
-                name_c.as_ptr(),
-                msg_c.as_ptr(),
-                now as u64,
-                out_fp.as_mut_ptr(),
-            );
-            if status != VoidStatus::Ok {
-                return std::ptr::null_mut();
-            }
+        let id = read_bytes(env, &invite_id);
+        if engine_handle == 0 || id.len() != 16 {
+            return new_jstring(env, "");
         }
-        env.byte_array_from_slice(&out_fp)
-            .map(|a| a.into_raw())
-            .unwrap_or(std::ptr::null_mut())
+        unsafe {
+            let bytes =
+                void_ffi::void_engine_invite_link(engine_handle as *const VoidEngine, id.as_ptr());
+            bytes_to_jstring(env, bytes)
+        }
+    })
+}
+
+/// Returns the `VoidStatus` ordinal.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_renameContact(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+    fingerprint: JByteArray,
+    name: JString,
+) -> jint {
+    let env = &mut env;
+    guard(VoidStatus::Internal as jint, || {
+        let fp = read_bytes(env, &fingerprint);
+        let name = read_string(env, &name);
+        if engine_handle == 0 || fp.len() != 32 {
+            return VoidStatus::BadArgument as jint;
+        }
+        let Ok(name_c) = std::ffi::CString::new(name) else {
+            return VoidStatus::BadArgument as jint;
+        };
+        unsafe {
+            void_ffi::void_engine_rename_contact(
+                engine_handle as *mut VoidEngine,
+                fp.as_ptr(),
+                name_c.as_ptr(),
+            ) as jint
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_inviteName(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+) -> jstring {
+    let env = &mut env;
+    guard(std::ptr::null_mut(), || unsafe {
+        if engine_handle == 0 {
+            return new_jstring(env, "");
+        }
+        bytes_to_jstring(
+            env,
+            void_ffi::void_engine_invite_name(engine_handle as *const VoidEngine),
+        )
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_setInviteName(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+    name: JString,
+) -> jboolean {
+    let env = &mut env;
+    guard(JNI_FALSE, || {
+        let name = read_string(env, &name);
+        let Ok(name_c) = std::ffi::CString::new(name) else {
+            return JNI_FALSE;
+        };
+        if engine_handle == 0 {
+            return JNI_FALSE;
+        }
+        let status = unsafe {
+            void_ffi::void_engine_set_invite_name(engine_handle as *mut VoidEngine, name_c.as_ptr())
+        };
+        if status == VoidStatus::Ok {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_protectionAcknowledged(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+) -> jboolean {
+    guard(JNI_FALSE, || unsafe {
+        if engine_handle != 0
+            && void_ffi::void_engine_protection_acknowledged(engine_handle as *const VoidEngine)
+        {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_acknowledgeProtection(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+) -> jboolean {
+    guard(JNI_FALSE, || unsafe {
+        if engine_handle != 0
+            && void_ffi::void_engine_acknowledge_protection(engine_handle as *mut VoidEngine)
+                == VoidStatus::Ok
+        {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     })
 }
 
@@ -844,7 +1155,9 @@ pub extern "system" fn Java_app_void_VoidCore_callHostAddress(
     })
 }
 
-/// Blocks for up to ninety seconds. Kotlin must call this off the main thread.
+/// Blocks until the callee connects, the answer window closes, or
+/// `callHostCancel`. Kotlin must call this off the main thread, straight after
+/// placing the call.
 #[no_mangle]
 pub extern "system" fn Java_app_void_VoidCore_callHostAccept(
     mut env: JNIEnv,
@@ -873,6 +1186,21 @@ pub extern "system" fn Java_app_void_VoidCore_callHostAccept(
             } else {
                 0
             }
+        }
+    })
+}
+
+/// Wakes a blocked `callHostAccept` (it returns 0). The caller hung up while it
+/// rang.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callHostCancel(
+    _env: JNIEnv,
+    _class: JClass,
+    host: jlong,
+) {
+    guard((), || unsafe {
+        if host != 0 {
+            void_ffi::void_call_host_cancel(host as *const void_ffi::VoidCallHost);
         }
     })
 }
@@ -965,9 +1293,10 @@ pub extern "system" fn Java_app_void_VoidCore_callMediaSend(
     })
 }
 
-/// Receives one audio frame. An empty array means "play nothing" — a silence
-/// frame, a replay, or a frame that failed to authenticate all look the same
-/// here on purpose, because the correct response to all three is identical.
+/// Receives one frame, waiting up to two seconds. The first byte is the
+/// `VoidMediaRecv` status — 0 audio, 1 authenticated silence, 2 nothing, 3
+/// closed — and the rest is the audio, present only for 0. One array rather
+/// than a result object, because this runs fifty times a second.
 #[no_mangle]
 pub extern "system" fn Java_app_void_VoidCore_callMediaRecv(
     mut env: JNIEnv,
@@ -976,13 +1305,41 @@ pub extern "system" fn Java_app_void_VoidCore_callMediaRecv(
 ) -> jbyteArray {
     let env = &mut env;
     guard(std::ptr::null_mut(), || unsafe {
+        let closed = void_ffi::VoidMediaRecv::Closed as u8;
         if media == 0 {
-            return bytes_to_jbytearray(env, empty_bytes());
+            return env
+                .byte_array_from_slice(&[closed])
+                .map(|a| a.into_raw())
+                .unwrap_or(std::ptr::null_mut());
         }
-        bytes_to_jbytearray(
-            env,
-            void_ffi::void_call_media_recv(media as *mut void_ffi::VoidCallMedia),
-        )
+        let mut audio = empty_bytes();
+        let status =
+            void_ffi::void_call_media_recv(media as *mut void_ffi::VoidCallMedia, &mut audio);
+        let mut framed = Vec::with_capacity(1 + audio.len);
+        framed.push(status as u8);
+        if !audio.data.is_null() && audio.len > 0 {
+            framed.extend_from_slice(std::slice::from_raw_parts(audio.data, audio.len));
+        }
+        void_ffi::void_free_bytes(audio);
+        env.byte_array_from_slice(&framed)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Closes a call's media: a blocked `callMediaRecv` returns closed within
+/// about a tenth of a second. Hang up with this, join the audio threads, then
+/// `callMediaFree`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callMediaClose(
+    _env: JNIEnv,
+    _class: JClass,
+    media: jlong,
+) {
+    guard((), || unsafe {
+        if media != 0 {
+            void_ffi::void_call_media_close(media as *const void_ffi::VoidCallMedia);
+        }
     })
 }
 
@@ -1015,8 +1372,9 @@ pub extern "system" fn Java_app_void_VoidCore_callPayloadLen(_env: JNIEnv, _clas
 }
 
 /// Places a call. Writes the 16-byte call id and 32-byte media secret into the
-/// caller-supplied arrays and returns true on success.
+/// caller-supplied arrays and returns true on success. `now` is in seconds.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_app_void_VoidCore_enginePlaceCall(
     mut env: JNIEnv,
     _class: JClass,
@@ -1024,6 +1382,7 @@ pub extern "system" fn Java_app_void_VoidCore_enginePlaceCall(
     fingerprint: JByteArray,
     onion_address: JString,
     port: jint,
+    now: jlong,
     out_call_id: JByteArray,
     out_media_secret: JByteArray,
 ) -> jboolean {
@@ -1045,6 +1404,7 @@ pub extern "system" fn Java_app_void_VoidCore_enginePlaceCall(
                 fp.as_ptr(),
                 addr_c.as_ptr(),
                 port as u16,
+                now as u64,
                 call_id.as_mut_ptr(),
                 secret.as_mut_ptr(),
             ) == VoidStatus::Ok
@@ -1131,10 +1491,38 @@ pub extern "system" fn Java_app_void_VoidCore_engineEndCall(
             1 => void_ffi::VoidCallEndReason::HungUp,
             2 => void_ffi::VoidCallEndReason::Declined,
             3 => void_ffi::VoidCallEndReason::Missed,
+            5 => void_ffi::VoidCallEndReason::Busy,
             _ => void_ffi::VoidCallEndReason::Failed,
         };
         unsafe {
             if void_ffi::void_engine_end_call(engine as *mut VoidEngine, fp.as_ptr(), reason)
+                == VoidStatus::Ok
+            {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            }
+        }
+    })
+}
+
+/// The caller has seen the callee's first authenticated media frame: the call
+/// is answered. See `void_ffi::void_engine_mark_call_connected`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_engineMarkCallConnected(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine: jlong,
+    fingerprint: JByteArray,
+) -> jboolean {
+    let env = &mut env;
+    guard(JNI_FALSE, || {
+        let fp = read_bytes(env, &fingerprint);
+        if engine == 0 || fp.len() != 32 {
+            return JNI_FALSE;
+        }
+        unsafe {
+            if void_ffi::void_engine_mark_call_connected(engine as *mut VoidEngine, fp.as_ptr())
                 == VoidStatus::Ok
             {
                 JNI_TRUE

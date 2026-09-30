@@ -65,6 +65,16 @@ pub mod call;
 /// dead rather than hung forever.
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long opening a circuit to the relay may take before it is abandoned.
+///
+/// Arti's attempt to reach an onion service has no deadline of its own that a
+/// user would call reasonable: one was seen, on an emulator, still waiting after
+/// six minutes. `void_engine_attach_tor` blocks for as long as this does, and
+/// the app will not start a second attach while one is in flight — so without
+/// a limit, one stalled attempt kept a phone offline until it restarted. Now it
+/// fails, and the app's backoff tries again.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Everything that can go wrong bootstrapping or using Tor.
 ///
 /// Deliberately coarse in the same spirit as [`void_client::ClientError`]: the
@@ -151,7 +161,10 @@ impl TorHandle {
         let target = onion_address.to_string();
         let data_stream = self
             .runtime
-            .block_on(async move { client.connect((target.as_str(), port)).await })
+            .block_on(async move {
+                tokio::time::timeout(CONNECT_TIMEOUT, client.connect((target.as_str(), port))).await
+            })
+            .map_err(|_| TorError::Connect(String::from("timed out opening a circuit")))?
             .map_err(|e| TorError::Connect(e.to_string()))?;
 
         let bridged = BlockingCircuit {

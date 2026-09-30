@@ -53,7 +53,6 @@ import androidx.compose.ui.unit.dp
 data class PendingCall(
     val fingerprint: ByteArray,
     val isAnswering: Boolean,
-    val keyDir: java.io.File?,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -67,34 +66,44 @@ data class PendingCall(
 
 /** Where a call is in its life. */
 enum class CallPhase {
+    /** Our onion service is going up. */
     PUBLISHING,
+
+    /** The offer is on its way; waiting for them. */
     RINGING,
+
+    /** They are calling us. */
     INCOMING,
+
+    /** Answered; waiting for the first authenticated audio. */
     CONNECTING,
+
+    /** Audio is flowing. */
     ACTIVE,
 }
 
+/** Which end of a call this device is. */
+enum class CallRole { CALLER, CALLEE }
+
 /**
- * One call, as the UI needs it.
- *
- * The credentials hold the media secret, which arrived inside a
- * ratchet-encrypted offer. It is never rendered and never logged.
+ * One call, as the UI needs it. The media secret is deliberately not here: it
+ * goes straight from the engine to the media connection and is never part of
+ * what a screen can render.
  */
 data class CallSession(
     val fingerprint: ByteArray,
-    val address: String,
-    val port: Int,
+    val callId: ByteArray,
+    val role: CallRole,
     val phase: CallPhase,
-    val credentials: Engine.CallCredentials? = null,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is CallSession) return false
-        return fingerprint.contentEquals(other.fingerprint) && phase == other.phase &&
-            address == other.address && port == other.port
+        return fingerprint.contentEquals(other.fingerprint) && callId.contentEquals(other.callId) &&
+            role == other.role && phase == other.phase
     }
 
-    override fun hashCode(): Int = fingerprint.contentHashCode() * 31 + phase.ordinal
+    override fun hashCode(): Int = (fingerprint.contentHashCode() * 31 + callId.contentHashCode()) * 31 + phase.ordinal
 }
 
 @Composable
@@ -221,7 +230,9 @@ fun IncomingCallScreen(
 
 private fun statusLine(phase: CallPhase): String = when (phase) {
     CallPhase.PUBLISHING -> "Setting up a private connection…"
-    CallPhase.RINGING -> "Ringing. This can take a few seconds to reach them."
+    // Honest about the wait: the offer travels through their mailbox, and that
+    // takes up to a minute (D-028).
+    CallPhase.RINGING -> "Ringing. It can take up to a minute to reach them."
     CallPhase.INCOMING -> "Incoming"
     CallPhase.CONNECTING -> "Connecting…"
     CallPhase.ACTIVE -> "Connected over Tor"

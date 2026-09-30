@@ -33,13 +33,18 @@
 //! fragment is not sent to a server, is not written to most access logs, and is
 //! not included in a `Referer` header. If the link is pasted somewhere it
 //! should not have been, the part that leaks is the part that is useless alone.
+//!
+//! That link is about 14,600 characters, because it carries the whole signed
+//! bundle. [`ShortInvite`] is the form the apps hand out: about 130 characters
+//! and one QR code, with the same encrypted body parked on the relay instead.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use void_crypto::{aead, rand, Zeroize};
+use void_crypto::{aead, kdf, rand, Zeroize};
 
 use crate::handshake::PrekeyBundle;
+use crate::queue::QueueSecret;
 use crate::wire::{Reader, Writer};
 use crate::{ProtoError, Result};
 
@@ -75,14 +80,29 @@ pub struct InviteBody {
 /// a phishing message.
 pub const MAX_LABEL_LEN: usize = 64;
 
+/// The longest prefix of `label` that fits [`MAX_LABEL_LEN`] bytes and ends on
+/// a character boundary.
+///
+/// Slicing at byte 64 unconditionally panicked whenever that byte fell inside
+/// a multi-byte character — a name in most of the world's scripts — and the
+/// app libraries used to abort on panic, so creating an invitation with such a
+/// name crashed the app.
+#[must_use]
+pub fn truncate_label(label: &str) -> &str {
+    if label.len() <= MAX_LABEL_LEN {
+        return label;
+    }
+    let mut end = MAX_LABEL_LEN;
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    &label[..end]
+}
+
 impl InviteBody {
     fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        let label = if self.label.len() > MAX_LABEL_LEN {
-            &self.label[..MAX_LABEL_LEN]
-        } else {
-            &self.label[..]
-        };
+        let label = truncate_label(&self.label);
         w.bytes32(&self.bundle.encode())
             .u64(self.expires_at)
             .bytes16(label.as_bytes());
@@ -109,15 +129,27 @@ impl InviteBody {
     }
 }
 
-/// Create an invitation.
+/// Create an invitation under a fresh random key.
 pub fn create(bundle: &PrekeyBundle, now: u64, ttl_seconds: u64, label: &str) -> Result<Invite> {
+    let key = rand::bytes32().map_err(|_| ProtoError::Crypto)?;
+    create_with_key(bundle, now, ttl_seconds, label, key)
+}
+
+/// Create an invitation encrypted under `key` — for a short invitation, the
+/// key its link's secret derives ([`ShortInvite::link_key`]).
+pub fn create_with_key(
+    bundle: &PrekeyBundle,
+    now: u64,
+    ttl_seconds: u64,
+    label: &str,
+    key: [u8; 32],
+) -> Result<Invite> {
     let body = InviteBody {
         bundle: bundle.clone(),
         expires_at: now.saturating_add(ttl_seconds),
         label: label.to_string(),
     };
     let plaintext = body.encode();
-    let key = rand::bytes32().map_err(|_| ProtoError::Crypto)?;
     let nonce = rand::bytes24().map_err(|_| ProtoError::Crypto)?;
 
     let mut ciphertext = Vec::with_capacity(aead::XNONCE_LEN + plaintext.len() + aead::TAG_LEN);
@@ -254,6 +286,151 @@ impl Drop for Invite {
     }
 }
 
+// --- Short invitations ---------------------------------------------------------
+
+/// URL scheme prefix for short invitation links.
+pub const SHORT_LINK_PREFIX: &str = "void://i/";
+
+/// Longest relay address a short link carries.
+pub const MAX_RELAY_LEN: usize = 255;
+
+/// A short invitation: where the full invitation is parked, and the one secret
+/// that finds it and opens it.
+///
+/// ## Why this exists
+///
+/// A full invitation carries the whole signed prekey bundle — an ML-DSA-87
+/// identity key and signature and an ML-KEM-1024 prekey, about 9 KB — so its
+/// link is about 14,600 characters and it takes thirteen QR codes to show. A
+/// short invitation carries a 32-byte secret instead. From it both sides
+/// derive the key the full invitation is encrypted under
+/// ([`kdf::LABEL_INVITE`]) and a queue on the relay
+/// ([`kdf::LABEL_INVITE_DROP`]). The inviter parks the encrypted invitation in
+/// that queue; whoever opens the link collects it and opens it exactly as they
+/// would a full one. The link is about 130 characters: one small QR code, and
+/// short enough to paste anywhere.
+///
+/// ```text
+///   void://i/<relay>#<base32(secret)>
+/// ```
+///
+/// ## What the relay learns
+///
+/// Nothing it can read. It holds the same ciphertext a full link carries, and
+/// the key comes from the part of the link after `#`, which never reaches a
+/// server. Anyone holding the link can collect that ciphertext, and the relay
+/// deletes it as it hands it over, so a short invitation is fetched once —
+/// which is no new exposure, since anyone holding a full link could already
+/// use it. What the relay does see is a queue receiving about ten records and
+/// later being emptied: the same shape an intro queue already has.
+pub struct ShortInvite {
+    /// The relay the invitation is parked on, as the inviter's app addresses it.
+    pub relay: String,
+    /// The link's secret. Travels in the URL fragment.
+    pub secret: [u8; 32],
+}
+
+impl Drop for ShortInvite {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl core::fmt::Debug for ShortInvite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShortInvite")
+            .field("relay", &self.relay)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Whether `relay` is an address a short link may carry: lowercase letters,
+/// digits, `.`, `:`, and `-` — enough for an onion address and a port, and
+/// nothing that changes how the link parses.
+fn valid_relay(relay: &str) -> bool {
+    !relay.is_empty()
+        && relay.len() <= MAX_RELAY_LEN
+        && relay.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b':' | b'-')
+        })
+}
+
+impl ShortInvite {
+    /// A fresh short invitation parked on `relay`.
+    pub fn generate(relay: &str) -> Result<ShortInvite> {
+        if !valid_relay(relay) {
+            return Err(ProtoError::Malformed);
+        }
+        Ok(ShortInvite {
+            relay: relay.to_string(),
+            secret: rand::bytes32().map_err(|_| ProtoError::Crypto)?,
+        })
+    }
+
+    /// The key the full invitation is encrypted under.
+    #[must_use]
+    pub fn link_key(&self) -> [u8; 32] {
+        kdf::derive32(&self.secret, &[], kdf::LABEL_INVITE)
+    }
+
+    /// The relay queue the full invitation is parked in.
+    ///
+    /// Both sides derive it; neither sends it. The inviter deposits into it and
+    /// whoever holds the link collects from it — the retrieval key derives from
+    /// the same secret, so holding the link is what authorises collecting.
+    #[must_use]
+    pub fn drop_queue(&self) -> QueueSecret {
+        QueueSecret::from_parts(kdf::derive32(&self.secret, &[], kdf::LABEL_INVITE_DROP), 0)
+    }
+
+    /// Open the full invitation this link parked, once collected.
+    ///
+    /// Checks exactly what [`open`] checks — decryption, decoding, the bundle's
+    /// signature, and expiry — because it is [`open`].
+    pub fn open_parked(&self, ciphertext: &[u8], now: u64) -> Result<InviteBody> {
+        let invite = Invite {
+            ciphertext: ciphertext.to_vec(),
+            key: self.link_key(),
+        };
+        open(&invite, now)
+    }
+
+    /// Render as a link, secret in the fragment.
+    #[must_use]
+    pub fn to_link(&self) -> String {
+        alloc::format!(
+            "{}{}#{}",
+            SHORT_LINK_PREFIX,
+            self.relay,
+            base32_encode(&self.secret)
+        )
+    }
+
+    /// Parse a short link. The relay part is case-folded, since a QR reader or
+    /// a keyboard may have uppercased it.
+    pub fn from_link(link: &str) -> Result<ShortInvite> {
+        let rest = link
+            .trim()
+            .strip_prefix(SHORT_LINK_PREFIX)
+            .ok_or(ProtoError::Malformed)?;
+        let (relay, secret_part) = rest.split_once('#').ok_or(ProtoError::Malformed)?;
+        let relay = relay.to_ascii_lowercase();
+        if !valid_relay(&relay) {
+            return Err(ProtoError::Malformed);
+        }
+        let mut secret_bytes = base32_decode(secret_part).ok_or(ProtoError::Malformed)?;
+        if secret_bytes.len() != 32 {
+            secret_bytes.zeroize();
+            return Err(ProtoError::Malformed);
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&secret_bytes);
+        secret_bytes.zeroize();
+        Ok(ShortInvite { relay, secret })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +544,126 @@ mod tests {
         let body = open(&inv, 1).unwrap();
         assert_eq!(body.label.len(), MAX_LABEL_LEN);
     }
-}
 
+    #[test]
+    fn a_multibyte_label_truncates_without_panicking() {
+        // Twenty-two three-byte characters: byte 64 falls inside the last one,
+        // which is exactly where slicing at a fixed byte offset panicked.
+        let name = "日".repeat(22);
+        assert_eq!(name.len(), 66);
+        let inv = create(&bundle(), 0, 3600, &name).unwrap();
+        let body = open(&inv, 1).unwrap();
+        assert_eq!(body.label, "日".repeat(21));
+        assert_eq!(truncate_label("Ada"), "Ada");
+    }
+
+    fn onion_relay() -> &'static str {
+        "hxxfawyq3xymghgqkalw4ut6emtt5nhaimquyrvi7ngyeecrri4qy5qd.onion:9443"
+    }
+
+    #[test]
+    fn a_short_invite_link_fits_one_qr_code() {
+        // The full link, for scale: about 14,600 characters and thirteen QR
+        // codes. The short one must fit one small, easily scanned code.
+        let full = create(&bundle(), 0, 3600, "Alice").unwrap().to_link();
+        assert!(full.len() > 10_000, "{}", full.len());
+
+        let short = ShortInvite::generate(onion_relay()).unwrap().to_link();
+        assert!(short.len() <= 150, "{} chars: {short}", short.len());
+        assert!(short.starts_with(SHORT_LINK_PREFIX));
+    }
+
+    #[test]
+    fn a_short_link_roundtrips_and_keeps_its_secret_in_the_fragment() {
+        let short = ShortInvite::generate(onion_relay()).unwrap();
+        let link = short.to_link();
+        let (before, after) = link.split_once('#').unwrap();
+        assert!(!before.contains(&base32_encode(&short.secret)));
+        assert_eq!(base32_decode(after).unwrap(), short.secret.to_vec());
+
+        let parsed = ShortInvite::from_link(&link.to_uppercase().replacen(
+            "VOID://I/",
+            SHORT_LINK_PREFIX,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(parsed.relay, short.relay, "the relay part is case-folded");
+        assert_eq!(parsed.secret, short.secret);
+        assert_eq!(
+            parsed.drop_queue().queue_id(),
+            short.drop_queue().queue_id()
+        );
+    }
+
+    #[test]
+    fn a_short_invite_opens_the_invitation_it_parked() {
+        let b = bundle();
+        let short = ShortInvite::generate("relay.onion").unwrap();
+        let parked = create_with_key(&b, 1_000, 3600, "Alice", short.link_key()).unwrap();
+
+        let opened = ShortInvite::from_link(&short.to_link())
+            .unwrap()
+            .open_parked(&parked.ciphertext, 1_001)
+            .unwrap();
+        assert_eq!(opened.bundle, b);
+        assert_eq!(opened.label, "Alice");
+
+        // Another link's secret opens nothing, and expiry still applies.
+        let other = ShortInvite::generate("relay.onion").unwrap();
+        assert!(other.open_parked(&parked.ciphertext, 1_001).is_err());
+        assert!(matches!(
+            short.open_parked(&parked.ciphertext, 1_000 + 3601),
+            Err(ProtoError::Expired)
+        ));
+    }
+
+    #[test]
+    fn a_short_invite_derives_independent_key_and_queue() {
+        let short = ShortInvite::generate("relay.onion").unwrap();
+        let key = short.link_key();
+        let queue = short.drop_queue();
+        assert_ne!(
+            &key,
+            queue.secret(),
+            "the two derivations must not coincide"
+        );
+        assert_ne!(key, short.secret);
+        // Holding the link is what authorises collecting: the retrieval key
+        // comes from the same secret.
+        let challenge = b"challenge";
+        assert!(short
+            .drop_queue()
+            .verify_retrieval(challenge, &queue.prove_retrieval(challenge)));
+    }
+
+    #[test]
+    fn malformed_short_links_are_rejected() {
+        let good = ShortInvite::generate("relay.onion").unwrap().to_link();
+        assert!(ShortInvite::from_link(&good).is_ok());
+        assert!(
+            ShortInvite::from_link("void://c/ABC#DEF").is_err(),
+            "a full link is not a short one"
+        );
+        assert!(
+            ShortInvite::from_link("void://i/relay.onion").is_err(),
+            "no fragment"
+        );
+        assert!(
+            ShortInvite::from_link("void://i/relay.onion#AAAA").is_err(),
+            "short secret"
+        );
+        assert!(
+            ShortInvite::from_link("void://i/#AAAA").is_err(),
+            "no relay"
+        );
+        let (_, secret) = good.split_once('#').unwrap();
+        for relay in ["re lay", "relay/x", "relay?x=1", "relay@host"] {
+            assert!(
+                ShortInvite::from_link(&alloc::format!("void://i/{relay}#{secret}")).is_err(),
+                "{relay}"
+            );
+            assert!(ShortInvite::generate(relay).is_err(), "{relay}");
+        }
+        assert!(ShortInvite::generate(&"a".repeat(MAX_RELAY_LEN + 1)).is_err());
+    }
+}

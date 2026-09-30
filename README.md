@@ -18,12 +18,12 @@ protocol and infrastructure**, not a shippable product — see
 | `void-relay` — mailbox relay | Working: queues, TTL, rate limiting, stateless retrieval auth, content-free push |
 | `void-client` — engine | Working: transport abstraction, constant-rate scheduler, sessions, contacts, restart-survival persistence, duress destruction wired end to end |
 | `void-tor` — Tor bootstrap | Working: bootstraps Arti, opens circuits, hands `TorTransport` a live stream. Also publishes and dials the ephemeral onion services calls use. Proven against the real Tor network — see below |
-| Calls | Protocol, engine, FFI, JNI, and both platform layers built; transport latency measured on the live network. **Never run between two real devices** — D-024 |
+| Calls | Protocol, engine, FFI, JNI, and both platform layers built. Run between two Android emulators over the live Tor network: rings in about 8 s, connects in about 6 s, ends from either side. **Never run on iOS or on a physical device, and nobody has heard a voice through it** — D-024, D-028, D-029 |
 | `void-cli` — reference client | Working. Plain TCP, loudly insecure, development only |
-| `void-ffi` — C ABI | Working, including conversations end to end (invite, accept, send, tick, contacts), Tor bootstrap/attach, and duress |
-| `ios/` | **Real.** Builds, links, launches, and passes `xcodebuild test` on Simulator, running the actual cross-compiled core — D-019 |
-| `void-jni` — JNI ABI | Compiles, for the host. Never cross-compiled for an Android target, never run in a JVM — D-023 |
-| `android/` | Gradle-scaffolded, and the JNI shim its Kotlin calls now exists. Still no NDK in this environment, so nothing here has been built or run — D-020 |
+| `void-ffi` — C ABI | Working: opening the persistent engine, short invitations (create, open, confirm, contact events), send, tick, history, contacts, Tor bootstrap/attach, calls, and duress |
+| `ios/` | Moved onto the current core: persistence behind a Secure Enclave key, Tor, one-QR invitations, calls. **Not rebuilt with Xcode since** — the Swift that calls the core was type-checked and run against it on Linux; the SwiftUI was not compiled — D-019, D-029 |
+| `void-jni` — JNI ABI | Cross-compiled for Android (arm64-v8a, x86_64) and run inside the app on emulators; run in a desktop JVM against the real core in CI — D-023, D-029 |
+| `android/` | Runs end to end on two emulators over the live Tor network: onboarding, a Keystore-held key, adding a contact, messages, calls, restarts. **Never run on a physical device; the QR camera is untested** (emulators have none) — D-020, D-029 |
 
 ### Known gaps — read these before believing the table above
 
@@ -33,12 +33,12 @@ Two things are **not** done:
    Nothing below substitutes for it, including the differential tests
    mentioned next — those catch disagreement between two implementations,
    not a flaw both share, and they are not an ACVP run.
-2. **Android has no working build.** See D-020 and D-023. The Gradle project,
-   the Kotlin, and now the JNI shim (`crates/void-jni`) are all structurally
-   real, and the shim compiles — for macOS, which is not where it runs.
-   `cargo check -p void-jni --target aarch64-linux-android` still fails for
-   want of an NDK, so nothing in `android/` has been compiled or run, unlike
-   every other row in the table above.
+2. **Neither app has run on a phone, and the iOS app has not run at all
+   since it moved onto the current core.** See D-029. The Android app ran end
+   to end on two emulators over the live Tor network. The iOS app's Swift
+   that calls the core was checked against it on Linux, but the app has not
+   been rebuilt with Xcode. Emulators have no camera and a silent microphone,
+   so scanning a QR code and what a call sounds like are both unverified.
 
 **Closed since the table above was last wrong:**
 
@@ -76,23 +76,21 @@ Two things are **not** done:
   cross-compiles `void-ffi` for device and simulator, generates its C header
   with `cbindgen`, and packages both into `Void.xcframework`; `ios/project.yml`
   (via `xcodegen`) produces a real `.xcodeproj` linking it. The engine's
-  conversation surface (`void_engine_create_invite`, `_poll_intro_queue`,
-  `_accept_conversation`, `_start_conversation`, `_send`, `_tick`,
-  `_contacts`) is wired into `AppState.swift`, which drives the existing
+  conversation surface is wired into `AppState.swift`, which drives the
   `ConversationViews`/`OnboardingViews`/`SecuritySettingsViews` — not mock
-  data. `xcodebuild build` and `xcodebuild test` both succeed for
-  `iphonesimulator`, and the app has been installed and launched on a booted
-  Simulator, reaching the onboarding screen on a live, cross-compiled
-  identity. See D-019 for the pipeline and the two build-time gotchas it
-  needed. What it does *not* yet do: persist across launches, use Tor, or
-  hold keys in the Secure Enclave — `AppState.swift`'s header comment lists
-  exactly what's left.
+  data. `xcodebuild build` and `xcodebuild test` both succeeded for
+  `iphonesimulator` before the move onto the current core (D-029), and the
+  app was installed and launched on a booted Simulator. See D-019 for the
+  pipeline and the two build-time gotchas it needed. It now opens a persistent
+  engine behind a Secure Enclave key, bootstraps Tor, and adds contacts with
+  one QR code; that version has not been rebuilt with Xcode yet.
 
-**What "Tor is real" does not yet mean.** Nothing in `ios/` or `android/`
-calls `void_tor_bootstrap` yet (that lands with the app work below), and the
-onion service in the test above is host-side C-tor for the test's own
-convenience, not a deployed relay — standing up the *production* relay as a
-long-running onion service is a deployment task, not a code gap.
+**What "Tor is real" does not yet mean.** Both apps bootstrap Arti at launch
+and attach the relay. The Android app has done so on emulators, over the live
+network; neither has done so on a phone. The onion services in these tests are
+host-side C-tor fronting a local relay, for the tests' own convenience, not a
+deployed relay — standing up the *production* relay as a long-running onion
+service is a deployment task, not a code gap.
 
 **Do not use this to protect anyone.** Not because it is sloppy — the security
 properties listed below are real and tested — but because "the cryptography is
@@ -109,8 +107,10 @@ Claims are cheap. Each of these is enforced by a test whose name is given, and
 - **A relay cannot read messages** — `the_relay_never_sees_plaintext`
 - **A relay cannot tell who sent one** — there is no sender field in the wire
   format at all: `the_deposit_contains_no_sender_field`
-- **A relay cannot link two of your queues** —
-  `the_relay_cannot_link_two_queues_of_one_user`
+- **A relay cannot link two of your queues from their identifiers** —
+  `the_relay_cannot_link_two_queues_of_one_user`. It can from how they are
+  collected: one client retrieves all of its queues over one circuit, in one
+  burst. See "Retrieval shape" under *Open* in `docs/DECISIONS.md`
 - **A relay cannot move a message between queues** —
   `a_relay_that_moves_a_deposit_between_queues_is_detected`
 - **A relay cannot kill a conversation by redelivering an old record** —
@@ -154,13 +154,15 @@ crates/
   void-relay    the untrusted mailbox relay
   void-client   engine: transport, scheduler, sessions
   void-tor      bootstraps Arti; the only crate with an async runtime
-  void-ffi      the C ABI — the only crate permitted `unsafe`
+  void-ffi      the C ABI iOS calls — one of two crates permitted `unsafe`
+  void-jni      the JNI ABI Android calls — the other
   void-cli      reference client and relay daemon
 docs/
   PROTOCOL.md   the wire specification
   DECISIONS.md  every decision, why, what it cost, how to reverse it
 ios/, android/  native clients
-scripts/        the CI checks that enforce the non-negotiables
+scripts/        the CI checks that enforce the non-negotiables, and the app builds
+tools/          app-bindings: runs the apps' Swift and Kotlin against the core on Linux
 ```
 
 ---
@@ -168,14 +170,15 @@ scripts/        the CI checks that enforce the non-negotiables
 ## Building
 
 ```sh
-cargo test --workspace          # 350+ tests
+cargo test --workspace          # 450+ tests
 cargo build --release
 ```
 
-The core has **no third-party dependencies at all**. This started as a
-constraint — the build environment had no package registry — and turned out to
-be worth keeping for `void-crypto`, where NFR-SEC-07 makes every dependency
-expensive to justify. `scripts/check_deps.sh` fails the build if that changes.
+The core's only third-party dependencies are RustCrypto's `ml-kem` and
+`ml-dsa`, in `void-crypto`, pinned to exact versions (D-006). It started with
+none — the build environment had no package registry — and that stayed worth
+defending in `void-crypto`, where NFR-SEC-07 makes every dependency expensive
+to justify. `scripts/check_deps.sh` fails the build if a third appears.
 
 ### Trying it end to end
 
@@ -187,7 +190,7 @@ cargo run --bin void-relayd -- --listen 127.0.0.1:9443
 cargo run --bin void -- invite 127.0.0.1:9443
 
 # terminal 3 — paste the link
-cargo run --bin void -- accept 127.0.0.1:9443 'void://c/...#...'
+cargo run --bin void -- accept 127.0.0.1:9443 'void://i/...#...'
 ```
 
 The CLI prints a warning on every invocation because it uses plain TCP and gives
@@ -206,7 +209,26 @@ something someone forgets; a failing build is not.
 ./scripts/check_no_direct_network.sh # FR-TRANS-03: no network outside Tor
 ./scripts/check_deps.sh              # NFR-SEC-07 + NFR-SEC-02
 ./scripts/check_reproducible.sh      # NFR-SEC-04: bit-identical core
+./scripts/check_ios_bindings.sh      # D-029: the iOS app's Swift against the real core
+./scripts/check_android_bindings.sh  # D-029: the Android app's Kotlin against the real core
+cargo run --release -p void-crypto --example ct_timing   # NFR-SEC-03: timing
 ```
+
+The bindings checks run on Linux: the Swift one needs `swiftc` and `cbindgen`,
+the Kotlin one a JDK. Each script's header says what it can and cannot cover.
+CI also builds, lints and cross-compiles the Android app, builds and tests the
+iOS app on macOS, and runs the FFI's handle tests under Miri.
+
+The timing check is dudect's method — two classes of input, Welch's t-test —
+over `ct::eq`, the AEAD tag check and ML-KEM decapsulation. It is
+informational in CI: a shared runner's noise can hide a small leak, and a
+pass on a server says nothing about a phone's CPU. It catches regressions as
+gross as an early-exit comparison.
+
+On a `v*` tag, CI signs the core's reproducible hashes into Sigstore's
+public transparency log (NFR-SEC-05), with the workflow's own identity, so
+anyone can rebuild a release and check it against the log. The CI file shows
+how.
 
 The reproducibility check covers the **Rust core only**. The App Store re-signs
 and re-encrypts the app binary, so a locally built copy provably will not match.
@@ -227,7 +249,7 @@ should require to pass.
 
 ## What was decided while building this
 
-[`docs/DECISIONS.md`](docs/DECISIONS.md) has all twenty entries. The ones worth
+[`docs/DECISIONS.md`](docs/DECISIONS.md) has all thirty entries. The ones worth
 knowing about before reading the code:
 
 - **D-005** — the ML-KEM ratchet runs every 4 DH steps, not every step. Doing it
@@ -258,9 +280,11 @@ knowing about before reading the code:
   never hand-edited, and two build-time gotchas are recorded there: C enums
   share one namespace unlike Rust's, and Arti's `rusqlite` dependency needs
   `libsqlite3.tbd` linked explicitly.
-- **D-020** — the Android app is Gradle-scaffolded but not JNI-wired, and
-  says so specifically rather than looking finished: there was no NDK
-  available to write or test the JNI shim `void-ffi` needs against.
+- **D-020, D-023** — the JNI shim is its own crate, `void-jni`, beside
+  `void-ffi`, so each crate that permits `unsafe` has one boundary shape;
+  `scripts/check_deps.sh` names both, and a third is a failing build. Until
+  D-029 ran it, the Android app said it was unwired and unrun rather than
+  looking finished.
 - **D-021** — the ratchet's receive path stages every state change and commits
   only after the AEAD tag verifies. Without that, a relay could permanently
   kill a conversation by handing back one sealed record it had already
@@ -270,6 +294,25 @@ knowing about before reading the code:
   rather than erroring, because fragments go missing for ordinary reasons
   (TTL expiry, a queue rotation) and the old behaviour turned sixty-four of
   those into a contact that never received again.
+- **D-025** — invitations belong to the engine, which collects them inside
+  its own retrieval slots, keeps partial handshakes between polls, and consumes
+  an invitation only for a handshake that verifies. Adding a contact had failed
+  in practice for four separate reasons, none of which the tests exercised.
+- **D-026** — the apps open a persistent engine, keyed by a KEK their hardware
+  keystore holds, and the app libraries unwind on panic so the FFI's guards
+  work. Before, every launch generated a new identity.
+- **D-027** — an invitation is a short link, one QR code, with the encrypted
+  invitation parked on the relay; it was thirteen codes.
+- **D-028** — a call connects when the callee's first authenticated frame
+  arrives, stale offers show as missed instead of ringing, nothing rings
+  forever, and a call during a call is answered "busy".
+- **D-029** — the apps run every engine call on one thread and can place
+  and answer calls. The Android app ran end to end on emulators, over the
+  live Tor network, which found four bugs no test had; this entry lists what
+  was and was not verified without a Mac or a phone.
+- **D-030** — a deposit the relay refuses waits its turn instead of holding
+  up every contact, and duress drops the identity's keys from memory as well
+  as destroying the store.
 - **D-024** — calls run over paired ephemeral onion services, so media never
   touches the relay. Signal/Discord-style calling is WebRTC over UDP, and Tor
   carries no UDP at all; running it outside Tor would put both IP addresses on

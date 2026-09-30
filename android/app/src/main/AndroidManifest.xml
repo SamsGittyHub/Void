@@ -10,15 +10,31 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
+    <!-- D-024: calls. Asked for when the user chooses to call or answer, never
+         at launch. MODIFY_AUDIO_SETTINGS lets a call switch the audio system
+         into communication mode (earpiece routing, echo cancellation). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- CallService: the microphone keeps working while a call runs with the
+         screen locked. Only while a call's audio is running. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <application
         android:name="app.void.VoidApplication"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="Void"
         android:theme="@style/Theme.Void"
         android:hardwareAccelerated="true">
         <!-- android:allowBackup="false" is FR-STOR-05's Android counterpart
              to iOS's isExcludedFromBackup: nothing Void writes should reach
-             adb backup or Auto Backup for Apps. -->
+             adb backup or Auto Backup for Apps. From Android 12 it no longer
+             covers device-to-device transfer, so dataExtractionRules excludes
+             everything from both. The database and the sealed key also live in
+             noBackupFilesDir, which neither ever copies. -->
 
         <!-- Fully-qualified, not ".MainActivity": AGP resolves a relative
              android:name against `namespace` (app.voidmessenger, chosen only
@@ -36,5 +52,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name="app.void.CallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>

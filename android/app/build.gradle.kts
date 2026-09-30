@@ -23,7 +23,7 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
-        // The four ABIs `scripts/build_android.sh` cross-compiles void-ffi
+        // The two ABIs `scripts/build_android.sh` cross-compiles void-jni
         // for. armeabi-v7a is deliberately absent: StrongBox (NFR-COMP-02's
         // preferred key backing) does not exist on any device old enough to
         // need 32-bit ARM support.
@@ -51,7 +51,7 @@ android {
         compose = true
     }
 
-    // libvoid_ffi.so per ABI, placed here by scripts/build_android.sh —
+    // libvoid_jni.so per ABI, placed here by scripts/build_android.sh —
     // never hand-copied; see that script's header for why.
     sourceSets {
         getByName("main") {

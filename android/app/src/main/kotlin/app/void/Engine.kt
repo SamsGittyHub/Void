@@ -1,16 +1,24 @@
 package app.void
 
+import java.io.File
+
 /**
  * The instance-level wrapper around [VoidCore]'s raw JNI handles — the
  * Kotlin analogue of `ios/Void/VoidCore.swift`'s `VoidCore` class. [VoidCore]
  * itself stays the thin `external fun` surface (and the home for the
  * identity/text functions that need no handle); this is where a live engine
  * handle becomes an idiomatic Kotlin API.
+ *
+ * Every method can block, so none may run on the main thread; [AppState] runs
+ * them all on one dedicated thread.
  */
 class Engine private constructor(private var handle: Long) {
 
     val fingerprintWords: String get() = VoidCore.fingerprintWords(handle)
     val fingerprintNumbers: String get() = VoidCore.fingerprintNumbers(handle)
+
+    /** The Tor client this engine's transport was built from, kept alive as long as the engine. */
+    private var attachedTor: TorHandle? = null
 
     fun close() {
         if (handle != 0L) {
@@ -19,38 +27,89 @@ class Engine private constructor(private var handle: Long) {
         }
     }
 
-    // --- establishing a conversation (FR-DISC-01, FR-DISC-02) --------------
+    // --- invitations (FR-DISC-01, FR-DISC-02) ------------------------------
 
-    /** Publishes an invite and returns it with the queue needed to detect acceptance. */
-    fun createInvite(relayHint: String, label: String, now: Long, ttlSeconds: Long): Pair<String, IntroQueue> {
-        val result = VoidCore.createInvite(handle, relayHint.toByteArray(Charsets.UTF_8), label, now, ttlSeconds)
+    data class CreatedInvite(val link: String, val id: ByteArray)
+
+    /**
+     * Make an invitation and return its short `void://i/` link — one QR code —
+     * with the id that names it in [takeContactEvents].
+     *
+     * The engine parks the invitation on [relay] through its outbox and
+     * watches for its acceptance on its own schedule; there is nothing to
+     * poll. [myLabel] travels inside the encrypted invitation and is shown to
+     * whoever opens it. [contactLabel] never leaves this device: it becomes the
+     * name of whoever accepts. `now` and `ttlSeconds` are in seconds.
+     */
+    fun createInvite(relay: String, myLabel: String, contactLabel: String, now: Long, ttlSeconds: Long): CreatedInvite {
+        val result = VoidCore.createInvite(handle, relay.toByteArray(Charsets.UTF_8), myLabel, contactLabel, now, ttlSeconds)
             ?: throw VoidException(VoidStatus.FAILED)
-        return result.link to IntroQueue(result.queueHandle)
+        return CreatedInvite(result.link, result.inviteId)
+    }
+
+    /** Withdraw an invitation. A handshake sent against it is never answered. */
+    fun cancelInvite(id: ByteArray): Boolean = VoidCore.cancelInvite(handle, id)
+
+    /**
+     * Records of an outstanding invitation still to be parked on the relay:
+     * 0 means whoever opens it can collect it now; `null` once it has been
+     * accepted, has expired, or was cancelled.
+     */
+    fun inviteUploadRemaining(id: ByteArray): Int? = VoidCore.inviteStatus(handle, id).takeIf { it >= 0 }
+
+    /**
+     * Open an invitation someone gave the user — scanned or pasted — and start
+     * collecting it. Returns the id its ready or failed event will carry.
+     */
+    fun openInvite(link: String, now: Long): ByteArray {
+        val result = VoidCore.openInvite(handle, link, now) ?: throw VoidException(VoidStatus.FAILED)
+        val status = VoidStatus.from(result.status)
+        if (status != VoidStatus.OK) throw VoidException(status)
+        return result.fetchId
     }
 
     /**
-     * Polls a queue from [createInvite] for a delivered handshake. `null`
-     * until someone has scanned the invite — that is normal, not an error,
-     * and this is safe to call on a repeating timer.
+     * Connect using an invitation reported ready. [localName] may be empty to
+     * keep the name it carried; [firstMessage] may be empty. Returns the new
+     * contact's fingerprint.
      */
-    fun pollIntroQueue(queue: IntroQueue): ByteArray? {
-        val result = VoidCore.pollIntroQueue(handle, queue.handle) ?: throw VoidException(VoidStatus.OFFLINE)
+    fun confirmInvite(fetchId: ByteArray, localName: String, firstMessage: String, now: Long): ByteArray {
+        val result = VoidCore.confirmInvite(handle, fetchId, localName, firstMessage, now)
+            ?: throw VoidException(VoidStatus.FAILED)
         val status = VoidStatus.from(result.status)
         if (status != VoidStatus.OK) throw VoidException(status)
-        return result.data.takeIf { it.isNotEmpty() }
+        return result.fingerprint
     }
 
-    /** Accepts a conversation from bytes [pollIntroQueue] returned. */
-    fun acceptConversation(queue: IntroQueue, initial: ByteArray, now: Long): Pair<ByteArray, String> {
-        val result = VoidCore.acceptConversation(handle, queue.handle, initial, now)
-            ?: throw VoidException(VoidStatus.FAILED)
-        return result.fingerprint to result.firstMessage
+    /** Stop waiting for an invitation the user opened. */
+    fun cancelFetch(fetchId: ByteArray) {
+        VoidCore.cancelFetch(handle, fetchId)
     }
 
-    /** Starts a conversation from a scanned or pasted invite link (the initiator side). */
-    fun startConversation(link: String, localName: String, firstMessage: String, now: Long): ByteArray =
-        VoidCore.startConversation(handle, link, localName, firstMessage, now)
-            ?: throw VoidException(VoidStatus.FAILED)
+    /** Everything that happened to contacts and invitations since the last drain. */
+    fun takeContactEvents(): List<ContactEvent> = ContactEvent.parseAll(VoidCore.takeContactEvents(handle))
+
+    // --- settings and names ------------------------------------------------------
+
+    /** The name the user puts on invitations. Stored in the encrypted database. */
+    val inviteName: String get() = VoidCore.inviteName(handle)
+
+    fun setInviteName(name: String) {
+        if (!VoidCore.setInviteName(handle, name)) throw VoidException(VoidStatus.FAILED)
+    }
+
+    /** Whether the user has been through the protection screen on this device (FR-UI-05). */
+    val protectionAcknowledged: Boolean get() = VoidCore.protectionAcknowledged(handle)
+
+    fun acknowledgeProtection() {
+        if (!VoidCore.acknowledgeProtection(handle)) throw VoidException(VoidStatus.FAILED)
+    }
+
+    /** Change the name this device shows for a contact. Never transmitted. */
+    fun renameContact(fingerprint: ByteArray, name: String) {
+        val status = VoidStatus.from(VoidCore.renameContact(handle, fingerprint, name))
+        if (status != VoidStatus.OK) throw VoidException(status)
+    }
 
     // --- sending and receiving -----------------------------------------------
 
@@ -67,7 +126,7 @@ class Engine private constructor(private var handle: Long) {
         data object SentPadding : TickResult()
         data object Deposited : TickResult()
         data object Refused : TickResult()
-        data class Retrieved(val messages: List<Pair<ByteArray, String>>) : TickResult()
+        class Retrieved(val messages: List<Pair<ByteArray, String>>) : TickResult()
         data object Offline : TickResult()
     }
 
@@ -89,47 +148,41 @@ class Engine private constructor(private var handle: Long) {
     }
 
     private fun decodeReceivedMessages(bytes: ByteArray): List<Pair<ByteArray, String>> {
+        val reader = ByteReader(bytes)
         val out = mutableListOf<Pair<ByteArray, String>>()
-        var pos = 0
-        while (pos + 36 <= bytes.size) {
-            val fp = bytes.copyOfRange(pos, pos + 32)
-            pos += 32
-            val len = (bytes[pos].toInt() and 0xFF) or
-                ((bytes[pos + 1].toInt() and 0xFF) shl 8) or
-                ((bytes[pos + 2].toInt() and 0xFF) shl 16) or
-                ((bytes[pos + 3].toInt() and 0xFF) shl 24)
-            pos += 4
-            if (pos + len > bytes.size) break
-            val text = String(bytes, pos, len, Charsets.UTF_8)
-            pos += len
+        while (!reader.isAtEnd) {
+            val fp = reader.bytes(32) ?: break
+            val length = reader.u32() ?: break
+            if (length > Int.MAX_VALUE) break
+            val text = reader.string(length.toInt()) ?: break
             out.add(fp to text)
         }
         return out
     }
 
+    /** The stored history with one contact, oldest first. */
+    fun messages(fingerprint: ByteArray): List<StoredMessage> =
+        StoredMessage.parseAll(VoidCore.messages(handle, fingerprint))
+
     // --- contacts --------------------------------------------------------------
 
-    data class ContactSummary(val fingerprint: ByteArray, val trust: TrustState, val name: String)
+    class ContactSummary(val fingerprint: ByteArray, val trust: TrustState, val name: String) {
+        /** Hex of the fingerprint: a stable map key, since arrays compare by identity. */
+        val key: String get() = fingerprint.toHex()
+    }
 
     /** The contact list, for the conversation list screen. */
     fun contacts(): List<ContactSummary> {
-        val bytes = VoidCore.contacts(handle)
+        val reader = ByteReader(VoidCore.contacts(handle))
         val out = mutableListOf<ContactSummary>()
-        var pos = 0
-        while (pos + 35 <= bytes.size) {
-            val fp = bytes.copyOfRange(pos, pos + 32)
-            pos += 32
-            val trust = when (bytes[pos].toInt()) {
+        while (!reader.isAtEnd) {
+            val fp = reader.bytes(32) ?: break
+            val trust = when (reader.u8() ?: break) {
                 1 -> TrustState.VERIFIED
                 2 -> TrustState.KEY_CHANGED
                 else -> TrustState.UNVERIFIED
             }
-            pos += 1
-            val nameLen = (bytes[pos].toInt() and 0xFF) or ((bytes[pos + 1].toInt() and 0xFF) shl 8)
-            pos += 2
-            if (pos + nameLen > bytes.size) break
-            val name = String(bytes, pos, nameLen, Charsets.UTF_8)
-            pos += nameLen
+            val name = reader.u16()?.let { reader.string(it) } ?: break
             out.add(ContactSummary(fp, trust, name))
         }
         return out
@@ -153,17 +206,19 @@ class Engine private constructor(private var handle: Long) {
      * Opens a circuit to `onionAddress:port` and makes it this engine's
      * transport (FR-TRANS-04's pinning: the onion address *is* the relay's
      * public key, so there is no certificate authority anywhere in this
-     * path). Call after [TorHandle.bootstrap] has returned.
+     * path). Blocks on the network, and does not hold the engine's lock while
+     * it connects.
      */
     fun attachTor(tor: TorHandle, onionAddress: String, port: Int) {
         val status = VoidStatus.from(VoidCore.engineAttachTor(handle, tor.handle, onionAddress, port))
         if (status != VoidStatus.OK) throw VoidException(status)
+        attachedTor = tor
     }
 
     // --- calls ---------------------------------------------------------------
 
-    /** What a call needs to open its media connection. */
-    data class CallCredentials(
+    /** What a call needs to open its media connection. Never rendered, never logged. */
+    class CallCredentials(
         val callId: ByteArray,
         val mediaSecret: ByteArray,
         val address: String,
@@ -172,16 +227,15 @@ class Engine private constructor(private var handle: Long) {
 
     /**
      * Place a call to a contact whose onion service is already publishing.
-     *
-     * Publish first ([CallHost.publish]) and pass that address in: the
-     * descriptor upload then finishes while this offer waits for the peer's
-     * next retrieval slot, so the two delays overlap rather than add.
+     * `now` is in seconds: the offer carries it, so one that reaches the
+     * callee too late to be live shows as missed instead of ringing.
      */
-    fun placeCall(fingerprint: ByteArray, onionAddress: String, port: Int): CallCredentials {
+    fun placeCall(fingerprint: ByteArray, onionAddress: String, port: Int, now: Long): CallCredentials {
         val callId = ByteArray(16)
         val secret = ByteArray(32)
-        val ok = VoidCore.enginePlaceCall(handle, fingerprint, onionAddress, port, callId, secret)
-        if (!ok) throw VoidException(VoidStatus.FAILED)
+        if (!VoidCore.enginePlaceCall(handle, fingerprint, onionAddress, port, now, callId, secret)) {
+            throw VoidException(VoidStatus.FAILED)
+        }
         return CallCredentials(callId, secret, onionAddress, port)
     }
 
@@ -191,8 +245,15 @@ class Engine private constructor(private var handle: Long) {
         val secret = ByteArray(32)
         val address = VoidCore.engineAnswerCall(handle, fingerprint, callId, secret)
         if (address.isEmpty()) throw VoidException(VoidStatus.FAILED)
+        // Every call's service listens on the one fixed port.
         return CallCredentials(callId, secret, address, VoidCore.callPort())
     }
+
+    /**
+     * The caller saw the callee's first authenticated media frame: the call is
+     * answered, without waiting a mailbox delay for the relayed answer.
+     */
+    fun markCallConnected(fingerprint: ByteArray): Boolean = VoidCore.engineMarkCallConnected(handle, fingerprint)
 
     /** End a call. Local state clears whether or not the signal gets out. */
     fun endCall(fingerprint: ByteArray, reason: CallEndReason) {
@@ -203,62 +264,93 @@ class Engine private constructor(private var handle: Long) {
     fun takeCallEvents(): List<CallEvent> =
         CallEvent.parseAll(VoidCore.engineTakeCallEvents(handle))
 
-    /** Dial the caller's service. Blocks; call from [Dispatchers.IO]. */
-    fun connectCallMedia(tor: TorHandle, credentials: CallCredentials): Long =
-        VoidCore.callMediaConnect(
-            tor.handle,
-            credentials.address,
-            credentials.port,
-            credentials.mediaSecret,
-            credentials.callId,
-        )
-
     companion object {
-        fun create(): Engine {
+        /** An engine held in memory only, with a fresh identity — for tests. */
+        fun inMemory(): Engine {
             val handle = VoidCore.engineNew()
             if (handle == 0L) throw VoidException(VoidStatus.FAILED)
+            return Engine(handle)
+        }
+
+        /**
+         * Open this device's engine: restore it, or create it with a fresh
+         * identity on first launch (D-026). [kek] is the key [KeyVault]
+         * released; it is zeroed before this returns. Throws
+         * [VoidStatus.LOCKED] if it does not open the existing database, and
+         * replaces nothing in that case.
+         */
+        fun open(dataDir: File, kek: ByteArray, backing: VaultBacking, nowMs: Long): Engine {
+            val status = IntArray(1)
+            val handle = try {
+                VoidCore.engineOpen(dataDir.absolutePath, kek, backing.raw, nowMs, status)
+            } finally {
+                kek.fill(0)
+            }
+            if (handle == 0L) {
+                throw VoidException(VoidStatus.from(status[0]).takeIf { it != VoidStatus.OK } ?: VoidStatus.FAILED)
+            }
             return Engine(handle)
         }
     }
 }
 
-/** A handle to an introduction queue, from [Engine.createInvite]. */
-class IntroQueue internal constructor(internal val handle: Long) {
-    fun close() = VoidCore.queueSecretFree(handle)
-}
+/** Hex rendering of a byte array, for map keys. */
+fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
-/**
- * A bootstrapped Arti client (D-009: the async runtime lives here, never in
- * [Engine]'s own dependency graph). [bootstrap] blocks the calling thread
- * until the circuit is up or bootstrap fails — commonly tens of seconds —
- * so call it from a background dispatcher, never from the main thread.
- */
 /**
  * An ephemeral onion service published for one outgoing call.
  *
- * Closing it unpublishes the service and deletes its keys, which is what makes
+ * Freeing it unpublishes the service and deletes its keys, which is what makes
  * each call's address unlinkable from the last one's.
  */
-class CallHost private constructor(private var handle: Long) {
+class CallHost private constructor(private val handle: Long) {
     /** The address to put in the offer. */
-    val address: String get() = VoidCore.callHostAddress(handle)
+    val address: String = VoidCore.callHostAddress(handle)
+
+    private val lock = Any()
+    private var accepting = false
+    private var releaseRequested = false
+    private var freed = false
 
     /**
-     * Block until the callee connects, then return a media handle.
-     *
-     * Waits up to ninety seconds and consumes the host either way. Never call
-     * this on the main thread.
+     * Block until the callee connects, the answer window closes, or
+     * [release]. Call it straight after placing the call — not once the
+     * relayed answer arrives: the callee dials the moment they answer, and
+     * their first authenticated frame is the answer (D-028). Never on the main
+     * thread.
      */
-    fun accept(credentials: Engine.CallCredentials): Long {
+    fun accept(credentials: Engine.CallCredentials): CallMedia? {
+        synchronized(lock) {
+            if (freed || releaseRequested) return null
+            accepting = true
+        }
         val media = VoidCore.callHostAccept(handle, credentials.mediaSecret, credentials.callId)
-        handle = 0
-        return media
+        synchronized(lock) {
+            accepting = false
+            if (releaseRequested && !freed) {
+                freed = true
+                VoidCore.callHostFree(handle)
+            }
+        }
+        return if (media != 0L) CallMedia(media) else null
     }
 
-    fun close() {
-        if (handle != 0L) {
-            VoidCore.callHostFree(handle)
-            handle = 0
+    /**
+     * Stop waiting and let the handle go: at once if nothing is using it,
+     * otherwise as soon as a blocked [accept] — woken here — returns. Freeing
+     * it while [accept] was still on its way into native code would free a
+     * handle about to be used. Safe to call more than once.
+     */
+    fun release() {
+        synchronized(lock) {
+            if (freed) return
+            if (accepting) {
+                releaseRequested = true
+                VoidCore.callHostCancel(handle)
+            } else {
+                freed = true
+                VoidCore.callHostFree(handle)
+            }
         }
     }
 
@@ -271,6 +363,57 @@ class CallHost private constructor(private var handle: Long) {
     }
 }
 
+/**
+ * One call's live media connection.
+ *
+ * Used from a sending thread and a receiving thread while the main thread may
+ * hang up. The core's handle is safe for that; the rule on this side is only
+ * the order of teardown: [close], join the threads that use it, then [free].
+ * [CallAudio.stop] does exactly that.
+ */
+class CallMedia internal constructor(private val handle: Long) {
+    /** Encrypt and send one encoded frame; empty is silence. False once the connection is gone. */
+    fun send(audio: ByteArray): Boolean = VoidCore.callMediaSend(handle, audio)
+
+    /** Receive one frame, waiting up to two seconds. */
+    fun receive(): MediaReceive {
+        val framed = VoidCore.callMediaRecv(handle)
+        if (framed.isEmpty()) return MediaReceive.Closed
+        return when (framed[0].toInt()) {
+            0 -> MediaReceive.Audio(framed.copyOfRange(1, framed.size))
+            1 -> MediaReceive.Silence
+            2 -> MediaReceive.Nothing
+            else -> MediaReceive.Closed
+        }
+    }
+
+    /** Wake a blocked [receive] within about a tenth of a second, and refuse later sends. */
+    fun close() = VoidCore.callMediaClose(handle)
+
+    /** Release the handle. Only after every thread using it has finished. */
+    fun free() = VoidCore.callMediaFree(handle)
+
+    companion object {
+        /** Dial the caller's service (the callee side). Blocks. */
+        fun connect(tor: TorHandle, credentials: Engine.CallCredentials): CallMedia? {
+            val media = VoidCore.callMediaConnect(
+                tor.handle,
+                credentials.address,
+                credentials.port,
+                credentials.mediaSecret,
+                credentials.callId,
+            )
+            return if (media != 0L) CallMedia(media) else null
+        }
+    }
+}
+
+/**
+ * A bootstrapped Arti client (D-009: the async runtime lives here, never in
+ * [Engine]'s own dependency graph). [bootstrap] blocks the calling thread
+ * until the circuit is up or bootstrap fails — commonly tens of seconds —
+ * so call it from a background dispatcher, never from the main thread.
+ */
 class TorHandle private constructor(internal val handle: Long) {
     fun close() = VoidCore.torFree(handle)
 
@@ -295,6 +438,13 @@ class VoidException(val status: VoidStatus) : Exception() {
                 "This contact's security code changed. Messaging is paused until you check " +
                     "with them through another channel."
             VoidStatus.LOCKED -> "Void is locked."
+            VoidStatus.EXPIRED -> "This invitation has expired. Ask them for a new one."
+            VoidStatus.ALREADY_CONNECTED -> "You're already connected with this person."
+            VoidStatus.OWN_INVITE ->
+                "That's your own invitation. Send it to the person you want to talk to."
+            VoidStatus.WRONG_RELAY ->
+                "This invitation uses a different Void server from this app, so it can't be " +
+                    "opened here."
             else -> "Something went wrong. Nothing was sent."
         }
 }

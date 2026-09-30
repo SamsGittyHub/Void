@@ -11,13 +11,19 @@
 
 use std::sync::{Arc, Mutex};
 
-use void_client::engine::{CallEvent, Engine, SecurityMode, TickOutcome};
+use void_client::engine::{
+    CallEvent, ContactEvent, Engine, InviteFailure, SecurityMode, TickOutcome,
+    CALLER_TIMEOUT_SECONDS, INVITE_ACCEPT_GRACE_SECONDS, OFFER_MAX_AGE_SECONDS,
+    RING_TIMEOUT_SECONDS,
+};
 use void_client::transport::MemoryTransport;
+use void_client::ClientError;
 use void_proto::identity::Identity;
 use void_proto::record::PAD_INTERVAL_MS;
+use void_relay::protocol::{Frame, FrameType};
 use void_relay::server::{NoPush, Relay};
 use void_relay::store::Config;
-use void_store::model::Settings;
+use void_store::model::{Settings, TrustState};
 
 fn relay() -> Arc<Relay> {
     Arc::new(Relay::new(Config::default(), Box::new(NoPush)))
@@ -71,38 +77,485 @@ fn pump(engine: &mut Engine, start_ms: u64, slots: u64) -> (u64, Vec<String>) {
     (t, received)
 }
 
+/// Take an invitation link from `inviter` to `invitee` the way the apps do:
+/// the invitee opens it; both keep ticking — the inviter parking the
+/// invitation on the relay, the invitee collecting it — until it is ready;
+/// then the invitee confirms. Returns the time reached and the confirmation's
+/// result, which is the inviter's fingerprint or why it was refused.
+fn accept_invite(
+    inviter: &mut Engine,
+    invitee: &mut Engine,
+    link: &str,
+    name: &str,
+    first_message: &str,
+    start_ms: u64,
+) -> (u64, Result<[u8; 32], ClientError>) {
+    let fetch = invitee.open_invite(link, start_ms / 1000).unwrap();
+    let mut t = start_ms;
+    for _ in 0..400 {
+        inviter.tick(t).unwrap();
+        invitee.tick(t).unwrap();
+        for event in invitee.take_contact_events() {
+            match event {
+                ContactEvent::InviteReady { fetch_id, .. } if fetch_id == fetch => {
+                    let result = invitee.confirm_invite(&fetch, name, first_message, t / 1000);
+                    return (t, result);
+                }
+                ContactEvent::InviteFailed { fetch_id, reason } if fetch_id == fetch => {
+                    panic!("the invitation failed: {reason:?}");
+                }
+                _ => {}
+            }
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    panic!("the invitation never became ready");
+}
+
+/// Tick every engine once per emission slot, in turn, until `done` says stop
+/// or the budget runs out. Returns the time reached and every contact event
+/// the first engine (the inviter) reported along the way.
+fn run_until(
+    engines: &mut [&mut Engine],
+    start_ms: u64,
+    slots: u64,
+    mut done: impl FnMut(&[ContactEvent]) -> bool,
+) -> (u64, Vec<ContactEvent>) {
+    let mut t = start_ms;
+    let mut events = Vec::new();
+    for _ in 0..slots {
+        for engine in engines.iter_mut() {
+            engine.tick(t).unwrap();
+        }
+        events.extend(engines[0].take_contact_events());
+        if done(&events) {
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    (t, events)
+}
+
+fn added(events: &[ContactEvent]) -> Vec<(String, [u8; 32], String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ContactEvent::Added {
+                name,
+                contact_fingerprint,
+                first_message,
+                ..
+            } => Some((name.clone(), *contact_fingerprint, first_message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn poll_intro_queue_is_how_the_responder_side_actually_receives_a_handshake() {
-    // Every other test in this file collects the handshake with a hand-rolled
-    // Challenge/Retrieve loop, because that used to be the only way — this is
-    // the one that goes through `Engine::poll_intro_queue`, the real method a
-    // platform layer (and `void-ffi`) calls instead of reimplementing the
-    // retrieval protocol.
+fn an_invite_polled_while_it_is_still_arriving_completes() {
+    // The order a real app produces, which every other test here avoids by
+    // flushing the whole handshake before the inviter looks: Bob keeps
+    // ticking — and so keeps collecting from his intro queue — while Alice's
+    // handshake is still uploading one record per slot. The relay deletes
+    // each record as it hands it over, so Bob has to keep the fragments he
+    // already has between retrievals, or the contact never appears.
     let relay = relay();
     let clock = Arc::new(Mutex::new(1_000_000u64));
     let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 91);
     let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 92);
 
-    let (bundle, intro_queue) = bob.create_bundle(b"relay.onion").unwrap();
+    let invite = bob
+        .create_invite(b"relay.onion", "Bob", "Alice", 1_000, 86_400)
+        .unwrap();
+    // Alice opens the link the moment Bob shows it — before his phone has
+    // finished parking the invitation on the relay.
+    assert!(bob.invite_upload_remaining(&invite.id).unwrap() > 0);
+    let fetch = alice.open_invite(&invite.link, 0).unwrap();
+    let mut t = 0u64;
+    let mut ready = None;
+    let mut collected_mid_upload = false;
+    for _ in 0..200 {
+        bob.tick(t).unwrap();
+        let outcome = alice.tick(t).unwrap();
+        if matches!(outcome, TickOutcome::Retrieved(_))
+            && bob.invite_upload_remaining(&invite.id).unwrap() > 0
+        {
+            collected_mid_upload = true;
+        }
+        if let Some(event) = alice.take_contact_events().into_iter().next() {
+            ready = Some(event);
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    assert!(
+        collected_mid_upload,
+        "alice must have collected while bob was still uploading"
+    );
+    assert_eq!(
+        ready,
+        Some(ContactEvent::InviteReady {
+            fetch_id: fetch,
+            inviter_label: "Bob".to_string(),
+            inviter_fingerprint: bob.fingerprint(),
+        }),
+        "the invitation arrives whole, from Bob, under the name he gave it"
+    );
     alice
-        .start_conversation(&bundle, "Bob", "hello from the real path", 1_000_000)
+        .confirm_invite(&fetch, "", "hello from the real path", t / 1000)
         .unwrap();
-    drain(&mut alice, 0, 40);
+    assert_eq!(
+        alice.contact(&bob.fingerprint()).unwrap().local_name,
+        "Bob",
+        "an empty name takes the one the invitation carried"
+    );
+    assert!(alice.outbox_len() > 4, "a handshake spans many records");
 
-    let initial = bob
-        .poll_intro_queue(&intro_queue)
-        .unwrap()
-        .expect("bob must receive the handshake via poll_intro_queue");
+    let mut added_event = None;
+    let mut retrievals_mid_arrival = 0;
+    for _ in 0..400 {
+        alice.tick(t).unwrap();
+        let outcome = bob.tick(t).unwrap();
+        if matches!(outcome, TickOutcome::Retrieved(_)) && alice.outbox_len() > 0 {
+            retrievals_mid_arrival += 1;
+        }
+        if let Some(event) = bob.take_contact_events().into_iter().next() {
+            added_event = Some(event);
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    assert!(
+        retrievals_mid_arrival > 0,
+        "bob must have collected while the handshake was still arriving"
+    );
+    let Some(ContactEvent::Added {
+        invite_id,
+        contact_fingerprint,
+        name,
+        first_message,
+    }) = added_event
+    else {
+        panic!("bob never reported the new contact, got {added_event:?}");
+    };
+    assert_eq!(invite_id, invite.id);
+    assert_eq!(contact_fingerprint, alice.identity_public().fingerprint());
+    assert_eq!(
+        name, "Alice",
+        "the invite's contact label names whoever accepts"
+    );
+    assert_eq!(first_message, "hello from the real path");
+    assert!(
+        !bob.has_pending_invite(&invite.id),
+        "an accepted invite is consumed"
+    );
 
-    let (alice_fp, first) = bob
-        .accept_conversation(bundle.queue.queue_id, &initial, 1_000_000)
+    // And the conversation that came out of it works in both directions.
+    let bob_fp = bob.fingerprint();
+    bob.send(&contact_fingerprint, "got it", 2_000).unwrap();
+    let (t2, _) = drain(&mut bob, t, 60);
+    let (_, got) = pump(&mut alice, t2, 60);
+    assert!(got.contains(&"got it".to_string()), "got {got:?}");
+    assert!(alice.contact(&bob_fp).is_some());
+}
+
+#[test]
+fn a_stranger_depositing_junk_cannot_spend_an_invite() {
+    // The intro queue's deposit key is in every copy of the link, so a
+    // stranger who has it can deposit whatever they like. Here Mallory sends
+    // a real, complete handshake of her own with its first message corrupted:
+    // it decodes and its signature verifies, and only the decryption fails.
+    // The inviter must discard it and still accept Alice.
+    use void_proto::content::Content;
+    use void_proto::envelope::seal;
+    use void_proto::record::fragment;
+
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 93);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 94);
+    let mallory = Identity::from_seeds(&[66u8; 32], &[67u8; 32], &[68u8; 32]);
+
+    // The bundle itself, as anyone who opened the link would hold it.
+    let (bundle, _) = bob.create_bundle(b"relay.onion").unwrap();
+    let invite_id = bundle.queue.queue_id;
+
+    let (forged, _, deposit_key) =
+        void_proto::handshake::initiate(&mallory, &bundle, &Content::text("let me in").encode())
+            .unwrap();
+    let mut bytes = forged.encode();
+    *bytes.last_mut().unwrap() ^= 1;
+    for record in fragment(0xDEAD, &bytes).unwrap() {
+        let deposit = seal(&deposit_key, &record).unwrap();
+        let reply = relay
+            .handle(&Frame::new(FrameType::Deposit, deposit.encode()), 0)
+            .unwrap();
+        assert_eq!(reply.kind, FrameType::Ack);
+    }
+
+    // Bob collects the forgery in full before Alice has done anything.
+    let (t, events) = run_until(&mut [&mut bob], 0, 40, |_| false);
+    assert!(
+        events.is_empty(),
+        "the forgery must not surface: {events:?}"
+    );
+    assert!(
+        bob.has_pending_invite(&invite_id),
+        "a handshake that fails verification must not consume the invite"
+    );
+
+    alice
+        .start_conversation(&bundle, "Bob", "it's really me", 1_000)
         .unwrap();
-    assert_eq!(first, "hello from the real path");
-    assert_eq!(alice_fp, alice.identity_public().fingerprint());
+    let (_, events) = run_until(&mut [&mut bob, &mut alice], t, 400, |e| !e.is_empty());
+    let added = added(&events);
+    assert_eq!(added.len(), 1, "{events:?}");
+    assert_eq!(added[0].1, alice.fingerprint());
+    assert_eq!(added[0].2, "it's really me");
+}
 
-    // Polling again after acceptance finds nothing new — the queue was
-    // consumed, not left to redeliver the same handshake forever.
-    assert!(bob.poll_intro_queue(&intro_queue).unwrap().is_none());
+#[test]
+fn two_outstanding_invites_both_complete() {
+    // One invite per person, all open at once. The apps used to hold a single
+    // pending invite and freed the first when a second was made, so the first
+    // person could never connect.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 95);
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 96);
+    let mut carol = engine(Arc::clone(&relay), Arc::clone(&clock), 97);
+
+    let for_alice = bob
+        .create_invite(b"relay.onion", "Bob", "Alice", 1_000, 86_400)
+        .unwrap();
+    let for_carol = bob
+        .create_invite(b"relay.onion", "Bob", "Carol", 1_000, 86_400)
+        .unwrap();
+    assert_ne!(for_alice.id, for_carol.id);
+    assert_ne!(for_alice.link, for_carol.link);
+    assert_eq!(
+        bob.invite_link(&for_alice.id),
+        Some(for_alice.link.as_str())
+    );
+
+    let alice_fetch = alice.open_invite(&for_alice.link, 0).unwrap();
+    let carol_fetch = carol.open_invite(&for_carol.link, 0).unwrap();
+    let mut t = 0u64;
+    let mut bob_events = Vec::new();
+    for _ in 0..800 {
+        bob.tick(t).unwrap();
+        alice.tick(t).unwrap();
+        carol.tick(t).unwrap();
+        for event in alice.take_contact_events() {
+            if matches!(event, ContactEvent::InviteReady { fetch_id, .. } if fetch_id == alice_fetch)
+            {
+                alice
+                    .confirm_invite(&alice_fetch, "", "hi, alice here", t / 1000)
+                    .unwrap();
+            }
+        }
+        for event in carol.take_contact_events() {
+            if matches!(event, ContactEvent::InviteReady { fetch_id, .. } if fetch_id == carol_fetch)
+            {
+                // Carol connects without saying anything yet.
+                carol
+                    .confirm_invite(&carol_fetch, "", "", t / 1000)
+                    .unwrap();
+            }
+        }
+        bob_events.extend(bob.take_contact_events());
+        if added(&bob_events).len() == 2 {
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    let mut names: Vec<(String, String)> = added(&bob_events)
+        .into_iter()
+        .map(|(name, _, first)| (name, first))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            ("Alice".to_string(), "hi, alice here".to_string()),
+            ("Carol".to_string(), String::new()),
+        ],
+        "each invite names whoever accepted it, and an empty first message stays empty"
+    );
+    assert_eq!(bob.contacts().len(), 2);
+}
+
+#[test]
+fn an_expired_invite_is_forgotten() {
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 98);
+
+    let invite = bob
+        .create_invite(b"relay.onion", "Bob", "", 1_000, 60)
+        .unwrap();
+    // Past the link's own expiry, but inside the grace period: a handshake
+    // started in time may still be on its way, so the invite is kept.
+    let inside_grace_ms = (1_000 + 60 + INVITE_ACCEPT_GRACE_SECONDS - 1) * 1000;
+    bob.tick(inside_grace_ms).unwrap();
+    assert!(bob.has_pending_invite(&invite.id));
+    assert!(bob.take_contact_events().is_empty());
+
+    let past_grace_ms = (1_000 + 60 + INVITE_ACCEPT_GRACE_SECONDS + 1) * 1000;
+    bob.tick(past_grace_ms).unwrap();
+    assert!(!bob.has_pending_invite(&invite.id));
+    assert_eq!(bob.invite_upload_remaining(&invite.id), None);
+    assert_eq!(
+        bob.take_contact_events(),
+        vec![ContactEvent::InviteExpired {
+            invite_id: invite.id
+        }]
+    );
+}
+
+#[test]
+fn rescanning_a_known_contact_is_refused_not_a_silent_session_swap() {
+    // Replacing the session on one side only leaves the two ends on different
+    // queues, and every message after that silently vanishes. Users retry
+    // when adding a contact seems to fail, so this must refuse and change
+    // nothing.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 99);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 100);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let second = bob
+        .create_invite(b"relay.onion", "Bob", "", 1_000, 86_400)
+        .unwrap();
+    let outbox_before = alice.outbox_len();
+    let (t, result) = accept_invite(&mut bob, &mut alice, &second.link, "Bob again", "hi", t);
+    assert_eq!(result, Err(ClientError::AlreadyConnected));
+    assert_eq!(alice.outbox_len(), outbox_before, "nothing may be queued");
+    assert_eq!(alice.contact(&bob_fp).unwrap().local_name, "Bob");
+
+    // The original conversation is untouched.
+    alice.send(&bob_fp, "still here", 1_000).unwrap();
+    let (t2, _) = drain(&mut alice, t, 60);
+    let (_, got) = pump(&mut bob, t2, 60);
+    assert!(got.contains(&"still here".to_string()), "got {got:?}");
+}
+
+#[test]
+fn a_new_handshake_from_a_known_identity_keeps_trust_and_name() {
+    // Alice lost her session with Bob and asks him for a new invitation. The
+    // identity — and so the fingerprint Bob verified — is unchanged, so Bob's
+    // verification and the name he chose must survive the new session.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 101);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 102);
+    let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+    bob.mark_verified(&alice_fp).unwrap();
+    bob.rename_contact(&alice_fp, "Alice (work)").unwrap();
+
+    alice.revoke_contact(&bob_fp).unwrap();
+    let again = bob
+        .create_invite(b"relay.onion", "Bob", "", 1_000, 86_400)
+        .unwrap();
+    let (t, result) = accept_invite(&mut bob, &mut alice, &again.link, "", "me again", t);
+    assert!(result.is_ok());
+    let (_, events) = run_until(&mut [&mut bob, &mut alice], t, 400, |e| {
+        !added(e).is_empty()
+    });
+    assert_eq!(added(&events).len(), 1, "{events:?}");
+    let contact = bob.contact(&alice_fp).unwrap();
+    assert_eq!(contact.trust, TrustState::Verified);
+    assert_eq!(contact.local_name, "Alice (work)");
+    assert_eq!(
+        bob.contacts().len(),
+        1,
+        "the same person, not a second contact"
+    );
+}
+
+#[test]
+fn scanning_your_own_invite_is_refused() {
+    // Collecting it would also destroy it for the person it was made for: the
+    // relay deletes as it hands over. So this is refused before anything is
+    // fetched.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 103);
+    let invite = bob
+        .create_invite(b"relay.onion", "Bob", "", 1_000, 86_400)
+        .unwrap();
+    assert_eq!(
+        bob.open_invite(&invite.link, 1_000),
+        Err(ClientError::OwnInvite)
+    );
+    assert!(bob.contacts().is_empty());
+}
+
+#[test]
+fn an_invite_on_another_relay_is_refused_clearly() {
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 106);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 107);
+    alice.set_relay("relay-a.onion:9443");
+    let invite = bob
+        .create_invite(b"relay-b.onion:9443", "Bob", "", 1_000, 86_400)
+        .unwrap();
+    assert_eq!(
+        alice.open_invite(&invite.link, 1_000),
+        Err(ClientError::WrongRelay)
+    );
+    assert_eq!(
+        alice.open_invite("void://i/relay-a.onion:9443#NOTBASE32!", 1_000),
+        Err(ClientError::InvalidInvite)
+    );
+}
+
+#[test]
+fn a_cancelled_invite_is_never_answered() {
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 104);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 105);
+    let invite = bob
+        .create_invite(b"relay.onion", "Bob", "", 1_000, 86_400)
+        .unwrap();
+    assert!(bob.cancel_invite(&invite.id));
+    assert!(
+        !bob.cancel_invite(&invite.id),
+        "cancelling twice is a no-op"
+    );
+    assert_eq!(bob.invite_upload_remaining(&invite.id), None);
+    assert_eq!(
+        bob.outbox_len(),
+        0,
+        "a withdrawn invitation is not uploaded"
+    );
+
+    // Alice opens it anyway. Nothing was parked, so nothing arrives, and she
+    // is told so rather than left waiting forever.
+    let fetch = alice.open_invite(&invite.link, 0).unwrap();
+    let mut failed = None;
+    let mut t = 0u64;
+    for _ in 0..200 {
+        bob.tick(t).unwrap();
+        alice.tick(t).unwrap();
+        if let Some(event) = alice.take_contact_events().into_iter().next() {
+            failed = Some(event);
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    assert_eq!(
+        failed,
+        Some(ContactEvent::InviteFailed {
+            fetch_id: fetch,
+            reason: InviteFailure::TimedOut
+        })
+    );
+    assert!(bob.contacts().is_empty());
+    assert!(alice.contacts().is_empty());
 }
 
 #[test]
@@ -547,6 +1000,34 @@ fn connect(relay: &Arc<Relay>, alice: &mut Engine, bob: &mut Engine) -> (u64, [u
     (t, alice_fp, bob_fp)
 }
 
+/// Tick `sender` then `watcher`, one slot at a time, until `watcher` reports a
+/// call event or the budget runs out. Returns the time reached, the events,
+/// and any chat messages `watcher` received on the way — which, for call
+/// signalling, must be none.
+fn until_call_event(
+    sender: &mut Engine,
+    watcher: &mut Engine,
+    start_ms: u64,
+    slots: u64,
+) -> (u64, Vec<CallEvent>, Vec<String>) {
+    let mut t = start_ms;
+    let mut messages = Vec::new();
+    for _ in 0..slots {
+        sender.tick(t).unwrap();
+        if let TickOutcome::Retrieved(received) = watcher.tick(t).unwrap() {
+            messages.extend(received.into_iter().map(|m| m.text));
+        }
+        let events = watcher.take_call_events();
+        if !events.is_empty() {
+            return (t, events, messages);
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    (t, Vec::new(), messages)
+}
+
+const ONION: &str = "abcdefghij234567.onion";
+
 #[test]
 fn a_call_rings_answers_and_ends_through_the_relay() {
     // Signalling rides exactly the path a text message rides: ratchet,
@@ -560,27 +1041,22 @@ fn a_call_rings_answers_and_ends_through_the_relay() {
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
     // Alice's platform layer has published a service and hands the address in.
-    let call = alice
-        .place_call(&bob_fp, "abcdefghij234567.onion", 9999)
-        .unwrap();
+    let call = alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
     assert_eq!(call.role, void_proto::call::Role::Caller);
     assert!(!call.answered);
 
-    let (t2, _) = drain(&mut alice, t, 40);
-    let (t3, msgs) = pump(&mut bob, t2, 40);
+    let (t2, events, msgs) = until_call_event(&mut alice, &mut bob, t, 40);
     assert!(
         msgs.is_empty(),
         "a call must never surface as a chat message, got {msgs:?}"
     );
-
-    let events = bob.take_call_events();
     assert_eq!(events.len(), 1, "bob should have exactly one ring");
     let incoming = match &events[0] {
         CallEvent::Incoming(c) => c.clone(),
         other => panic!("expected an incoming call, got {other:?}"),
     };
     assert_eq!(incoming.peer, alice_fp);
-    assert_eq!(incoming.onion_address, "abcdefghij234567.onion");
+    assert_eq!(incoming.onion_address, ONION);
     assert_eq!(incoming.call_id, call.call_id);
     assert_eq!(
         incoming.media_secret, call.media_secret,
@@ -590,9 +1066,7 @@ fn a_call_rings_answers_and_ends_through_the_relay() {
     // Bob answers.
     let answered = bob.answer_call(&alice_fp).unwrap();
     assert_eq!(answered.role, void_proto::call::Role::Callee);
-    let (t4, _) = drain(&mut bob, t3, 40);
-    let (t5, _) = pump(&mut alice, t4, 40);
-    let events = alice.take_call_events();
+    let (t3, events, _) = until_call_event(&mut bob, &mut alice, t2, 40);
     assert!(
         matches!(&events[..], [CallEvent::Answered(c)] if c.call_id == call.call_id),
         "alice should learn the call was answered, got {events:?}"
@@ -604,9 +1078,7 @@ fn a_call_rings_answers_and_ends_through_the_relay() {
         .end_call(&bob_fp, void_proto::call::EndReason::HungUp)
         .unwrap();
     assert!(alice.active_call(&bob_fp).is_none());
-    let (t6, _) = drain(&mut alice, t5, 40);
-    let (_, _) = pump(&mut bob, t6, 40);
-    let events = bob.take_call_events();
+    let (_, events, _) = until_call_event(&mut alice, &mut bob, t3, 40);
     assert!(
         matches!(
             &events[..],
@@ -628,20 +1100,14 @@ fn a_declined_call_leaves_no_message_and_no_state() {
     let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 74);
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
-    alice
-        .place_call(&bob_fp, "abcdefghij234567.onion", 9999)
-        .unwrap();
-    let (t2, _) = drain(&mut alice, t, 40);
-    let (t3, _) = pump(&mut bob, t2, 40);
-    assert_eq!(bob.take_call_events().len(), 1);
+    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
+    assert_eq!(events.len(), 1);
 
     bob.end_call(&alice_fp, void_proto::call::EndReason::Declined)
         .unwrap();
-    let (t4, _) = drain(&mut bob, t3, 40);
-    let (t5, msgs) = pump(&mut alice, t4, 40);
+    let (t3, events, msgs) = until_call_event(&mut bob, &mut alice, t2, 40);
     assert!(msgs.is_empty(), "declining is not a message");
-
-    let events = alice.take_call_events();
     assert!(matches!(
         &events[..],
         [CallEvent::Ended {
@@ -654,8 +1120,8 @@ fn a_declined_call_leaves_no_message_and_no_state() {
 
     // And the conversation is untouched: text still flows both ways.
     alice.send(&bob_fp, "so anyway", 1_000_500).unwrap();
-    let (t6, _) = drain(&mut alice, t5, 40);
-    let (_, got) = pump(&mut bob, t6, 40);
+    let (t4, _) = drain(&mut alice, t3, 40);
+    let (_, got) = pump(&mut bob, t4, 40);
     assert!(got.contains(&"so anyway".to_string()), "got {got:?}");
 }
 
@@ -674,9 +1140,7 @@ fn call_signalling_is_indistinguishable_from_a_message_to_the_relay() {
     let (t2, _) = drain(&mut alice, t, 40);
     let after_text = relay.metrics().unwrap().records;
 
-    alice
-        .place_call(&bob_fp, "abcdefghij234567.onion", 9999)
-        .unwrap();
+    alice.place_call(&bob_fp, ONION, 9999, t2 / 1000).unwrap();
     let (_t3, _) = drain(&mut alice, t2, 40);
     let after_call = relay.metrics().unwrap().records;
 
@@ -697,20 +1161,246 @@ fn a_second_offer_from_the_same_contact_is_refused_not_silently_swapped() {
     let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 78);
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
-    alice
-        .place_call(&bob_fp, "abcdefghij234567.onion", 9999)
-        .unwrap();
+    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
     let first_id = alice.active_call(&bob_fp).unwrap().call_id;
 
     // Placing a second call while one is live is refused locally.
-    assert!(alice.place_call(&bob_fp, "other.onion", 9999).is_err());
+    assert!(alice
+        .place_call(&bob_fp, "other.onion", 9999, t / 1000)
+        .is_err());
     assert_eq!(alice.active_call(&bob_fp).unwrap().call_id, first_id);
 
-    let (t2, _) = drain(&mut alice, t, 40);
-    let (_, _) = pump(&mut bob, t2, 40);
-    let events = bob.take_call_events();
+    let (_, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
     assert_eq!(events.len(), 1);
     assert!(bob.active_call(&alice_fp).is_some());
+}
+
+#[test]
+fn a_stale_offer_is_missed_not_ringing() {
+    // Offers wait in the mailbox like any message. One that arrives long after
+    // it was sent — the callee's phone was off — must not ring for nobody.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 81);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 82);
+    let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    // Alice's offer says it was sent at `sent`; Bob collects it well past
+    // OFFER_MAX_AGE_SECONDS later.
+    let sent = t / 1000;
+    let call = alice.place_call(&bob_fp, ONION, 9999, sent).unwrap();
+    let (t2, _) = drain(&mut alice, t, 40);
+    let late = t2.max((sent + OFFER_MAX_AGE_SECONDS + 5) * 1000);
+    let (_, events, _) = until_call_event(&mut alice, &mut bob, late, 40);
+    assert!(
+        matches!(
+            &events[..],
+            [CallEvent::Missed { contact_fingerprint, call_id }]
+                if *contact_fingerprint == alice_fp && *call_id == call.call_id
+        ),
+        "a stale offer is a missed call, got {events:?}"
+    );
+    assert!(bob.active_call(&alice_fp).is_none(), "nothing rings");
+}
+
+#[test]
+fn an_unanswered_call_times_out_as_missed_at_both_ends() {
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 83);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 84);
+    let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
+    assert!(matches!(&events[..], [CallEvent::Incoming(_)]));
+
+    // Nobody answers. Both ends give up on their own clocks.
+    let mut alice_events = Vec::new();
+    let mut bob_events = Vec::new();
+    let mut now = t2;
+    while now < t2 + (CALLER_TIMEOUT_SECONDS + 10) * 1000 {
+        alice.tick(now).unwrap();
+        bob.tick(now).unwrap();
+        alice_events.extend(alice.take_call_events());
+        bob_events.extend(bob.take_call_events());
+        now += PAD_INTERVAL_MS;
+    }
+    let missed = |events: &[CallEvent]| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                CallEvent::Ended {
+                    reason: void_proto::call::EndReason::Missed,
+                    ..
+                }
+            )
+        })
+    };
+    assert!(
+        missed(&alice_events),
+        "the caller stops ringing: {alice_events:?}"
+    );
+    assert!(
+        missed(&bob_events),
+        "and so does the callee: {bob_events:?}"
+    );
+    assert!(alice.active_call(&bob_fp).is_none());
+    assert!(bob.active_call(&alice_fp).is_none());
+}
+
+#[test]
+fn a_callee_that_stops_ringing_tells_the_caller() {
+    // The callee's ring is shorter than the caller's wait, so without word from
+    // the callee the caller rings into nothing for minutes. Alice's clock runs
+    // far ahead here, so her own timer cannot be what stops her.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 111);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 112);
+    let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let ahead = t / 1000 + 10 * CALLER_TIMEOUT_SECONDS;
+    alice.place_call(&bob_fp, ONION, 9999, ahead).unwrap();
+    let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
+    assert!(
+        matches!(&events[..], [CallEvent::Incoming(_)]),
+        "an offer from a clock that runs ahead still rings, got {events:?}"
+    );
+
+    // Nobody answers. Bob's ring runs out, and he says so.
+    let mut alice_events = Vec::new();
+    let mut now = t2;
+    while alice_events.is_empty() && now < t2 + (RING_TIMEOUT_SECONDS + 180) * 1000 {
+        bob.tick(now).unwrap();
+        alice.tick(now).unwrap();
+        alice_events.extend(alice.take_call_events());
+        now += PAD_INTERVAL_MS;
+    }
+    assert!(
+        matches!(
+            &alice_events[..],
+            [CallEvent::Ended {
+                reason: void_proto::call::EndReason::Missed,
+                ..
+            }]
+        ),
+        "the caller learns the ring ended, got {alice_events:?}"
+    );
+    assert!(alice.active_call(&bob_fp).is_none());
+    assert!(bob.active_call(&alice_fp).is_none());
+}
+
+#[test]
+fn an_offer_during_a_call_is_declined_busy() {
+    // Bob is on a call with Alice when Carol calls. Carol must hear "busy",
+    // not ring into nothing; Bob must see a missed call; and the call with
+    // Alice must be untouched.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 85);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 86);
+    let mut carol = engine(Arc::clone(&relay), Arc::clone(&clock), 87);
+    let (t_alice, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+    let (t_carol, carol_fp, bob_fp_for_carol) = connect(&relay, &mut carol, &mut bob);
+    assert_eq!(bob_fp, bob_fp_for_carol);
+    // Each inviter's emission grid ends where its own handshake finished, so
+    // start from the later one: before it, one of them has no slot to send in.
+    let t = t_alice.max(t_carol);
+
+    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
+    assert!(matches!(&events[..], [CallEvent::Incoming(_)]));
+    bob.answer_call(&alice_fp).unwrap();
+
+    let carols = carol
+        .place_call(&bob_fp, "carol.onion", 9999, t2 / 1000)
+        .unwrap();
+    let (t3, events, _) = until_call_event(&mut carol, &mut bob, t2, 40);
+    assert!(
+        matches!(
+            &events[..],
+            [CallEvent::Missed { contact_fingerprint, call_id }]
+                if *contact_fingerprint == carol_fp && *call_id == carols.call_id
+        ),
+        "bob sees carol's call as missed, got {events:?}"
+    );
+    let (_, events, _) = until_call_event(&mut bob, &mut carol, t3, 40);
+    assert!(
+        matches!(
+            &events[..],
+            [CallEvent::Ended {
+                reason: void_proto::call::EndReason::Busy,
+                ..
+            }]
+        ),
+        "carol hears busy, got {events:?}"
+    );
+    assert!(
+        bob.active_call(&alice_fp).is_some(),
+        "the call with alice is untouched"
+    );
+    assert!(bob.active_call(&carol_fp).is_none());
+}
+
+#[test]
+fn call_signals_go_ahead_of_queued_messages() {
+    // A ring must not wait behind a long message: one record goes out per
+    // slot either way, but the offer takes the next one.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 88);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 89);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let long = "x".repeat(5_000);
+    let message_id = alice.send(&bob_fp, &long, t / 1000).unwrap();
+    assert!(alice.outbox_len() >= 5);
+    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+
+    let mut now = t;
+    let first = loop {
+        if let TickOutcome::Deposited(id) = alice.tick(now).unwrap() {
+            break id;
+        }
+        now += PAD_INTERVAL_MS;
+    };
+    assert_ne!(first, message_id, "the offer went out first");
+}
+
+#[test]
+fn media_that_connects_first_is_the_answer() {
+    // The caller learns the call was answered from the callee's first
+    // authenticated media frame — seconds — rather than from the relayed
+    // answer — a mailbox delay. The relayed answer that follows changes
+    // nothing and announces nothing, and a connected call never times out.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 90);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 110);
+    let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    let (t2, _, _) = until_call_event(&mut alice, &mut bob, t, 40);
+    bob.answer_call(&alice_fp).unwrap();
+
+    // Bob's media reaches Alice's service before his answer reaches her queue.
+    assert!(alice.mark_call_connected(&bob_fp));
+    assert!(!alice.mark_call_connected(&alice_fp), "no call with nobody");
+
+    let mut now = t2;
+    let mut events = Vec::new();
+    while now < t2 + (CALLER_TIMEOUT_SECONDS + 30) * 1000 {
+        bob.tick(now).unwrap();
+        alice.tick(now).unwrap();
+        events.extend(alice.take_call_events());
+        now += PAD_INTERVAL_MS;
+    }
+    assert!(events.is_empty(), "nothing further to announce: {events:?}");
+    assert!(
+        alice.active_call(&bob_fp).is_some(),
+        "a connected call does not time out"
+    );
 }
 
 /// A relay that keeps a copy of every deposit and can hand one back later.
@@ -749,6 +1439,178 @@ impl void_client::transport::Transport for HoardingRelay {
     }
 
     fn disconnect(&mut self) {}
+}
+
+/// A relay that refuses every deposit into the queues in `refuse` — which is
+/// all a client can see of a relay enforcing one queue's deposit rate or
+/// capacity, since a refusal deliberately carries no reason. Remembers the
+/// queue of the last deposit it was offered, so a test can learn a contact's.
+struct RefusingRelay {
+    relay: Arc<Relay>,
+    clock: Arc<Mutex<u64>>,
+    refuse: Arc<Mutex<Vec<[u8; 16]>>>,
+    last_queue: Arc<Mutex<Option<[u8; 16]>>>,
+}
+
+impl void_client::transport::Transport for RefusingRelay {
+    fn kind(&self) -> void_client::transport::TransportKind {
+        void_client::transport::TransportKind::InMemory
+    }
+
+    fn exchange(&mut self, request: &Frame) -> void_client::ClientResult<Frame> {
+        if request.kind == FrameType::Deposit {
+            if let Ok(deposit) = void_proto::envelope::Deposit::decode(&request.body) {
+                *self.last_queue.lock().unwrap() = Some(deposit.queue_id);
+                if self.refuse.lock().unwrap().contains(&deposit.queue_id) {
+                    return Ok(Frame::new(FrameType::Refuse, Vec::new()));
+                }
+            }
+        }
+        let now = *self.clock.lock().unwrap();
+        self.relay
+            .handle(request, now)
+            .map_err(|_| void_client::ClientError::Protocol)
+    }
+
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn disconnect(&mut self) {}
+}
+
+#[test]
+fn a_queue_the_relay_keeps_refusing_does_not_hold_up_other_contacts() {
+    // The relay refuses without saying why, and its reasons — one queue's
+    // deposit rate, its capacity — pass. So a refused record is kept and
+    // retried. But one queue's refusals must not stop every other contact's
+    // messages behind it, which is what retrying it at the head of the outbox
+    // did: one record per slot, and every slot spent on the same refusal.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let refuse = Arc::new(Mutex::new(Vec::new()));
+    let last_queue = Arc::new(Mutex::new(None));
+    let mut alice = Engine::new(
+        Identity::from_seeds(&[123u8; 32], &[124u8; 32], &[125u8; 32]),
+        Settings::default(),
+        Box::new(RefusingRelay {
+            relay: Arc::clone(&relay),
+            clock: Arc::clone(&clock),
+            refuse: Arc::clone(&refuse),
+            last_queue: Arc::clone(&last_queue),
+        }),
+        SecurityMode::InsecureForTesting,
+        0,
+    )
+    .unwrap();
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 126);
+    let mut carol = engine(Arc::clone(&relay), Arc::clone(&clock), 127);
+    let (t1, _, bob_fp) = connect(&relay, &mut alice, &mut bob);
+    let (t2, carol_fp, _) = connect(&relay, &mut carol, &mut alice);
+    let t = t1.max(t2);
+
+    // Learn Bob's queue from one message that gets through, then have the
+    // relay refuse it from now on.
+    alice.send(&bob_fp, "first", t / 1000).unwrap();
+    let (t, _) = drain(&mut alice, t, 40);
+    let bobs_queue = last_queue.lock().unwrap().expect("a deposit to bob");
+    refuse.lock().unwrap().push(bobs_queue);
+
+    alice.send(&bob_fp, "refused for now", t / 1000).unwrap();
+    alice
+        .send(&carol_fp, "still gets through", t / 1000)
+        .unwrap();
+    let mut got = Vec::new();
+    let mut now = t;
+    for _ in 0..60 {
+        alice.tick(now).unwrap();
+        if let TickOutcome::Retrieved(messages) = carol.tick(now).unwrap() {
+            got.extend(messages.into_iter().map(|m| m.text));
+        }
+        if !got.is_empty() {
+            break;
+        }
+        now += PAD_INTERVAL_MS;
+    }
+    assert_eq!(
+        got,
+        vec!["still gets through".to_string()],
+        "carol's message must not wait behind bob's"
+    );
+    assert!(
+        alice.outbox_len() > 0,
+        "the refused record is kept to retry, not dropped"
+    );
+
+    // And once the relay takes it again, it is delivered.
+    refuse.lock().unwrap().clear();
+    let (t, _) = drain(&mut alice, now, 40);
+    let (_, delivered) = pump(&mut bob, t, 40);
+    assert!(
+        delivered.contains(&"refused for now".to_string()),
+        "got {delivered:?}"
+    );
+}
+
+#[test]
+fn a_short_invite_is_unreadable_to_the_relay() {
+    // The parked invitation carries the inviter's whole signed bundle and the
+    // name they go by. The relay stores it, so it must learn neither: every
+    // record it holds is sealed to a queue derived from a secret that exists
+    // only in the link's fragment, which is never sent anywhere.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let hoard = Arc::new(Mutex::new(Vec::new()));
+    let mut alice = Engine::new(
+        Identity::from_seeds(&[128u8; 32], &[129u8; 32], &[130u8; 32]),
+        Settings::default(),
+        Box::new(HoardingRelay {
+            relay: Arc::clone(&relay),
+            clock: Arc::clone(&clock),
+            hoard: Arc::clone(&hoard),
+        }),
+        SecurityMode::InsecureForTesting,
+        0,
+    )
+    .unwrap();
+    let label = "Alice Unmistakable";
+    let created = alice
+        .create_invite(b"relay.onion", label, "", 1_000, 86_400)
+        .unwrap();
+    let (_, _) = drain(&mut alice, 0, 40);
+    assert!(
+        alice.invite_upload_remaining(&created.id) == Some(0),
+        "the whole invitation is parked"
+    );
+
+    let parked = hoard.lock().unwrap().clone();
+    assert!(
+        parked.len() >= 5,
+        "a bundle this size is several records: {}",
+        parked.len()
+    );
+    let public = alice.identity_public().clone();
+    let secret = created.link.rsplit('#').next().unwrap().as_bytes().to_vec();
+    let contains =
+        |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+    for body in &parked {
+        assert!(
+            !contains(body, label.as_bytes()),
+            "the name on it reached the relay"
+        );
+        assert!(
+            !contains(body, &public.ed25519),
+            "the identity key reached the relay"
+        );
+        assert!(
+            !contains(body, &public.mldsa[..64]),
+            "the signing key reached the relay"
+        );
+        assert!(
+            !contains(body, &secret),
+            "the link's secret reached the relay"
+        );
+    }
 }
 
 #[test]

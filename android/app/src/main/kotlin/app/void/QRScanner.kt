@@ -2,6 +2,10 @@ package app.void
 
 import android.Manifest
 import android.content.pm.PackageManager
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -9,10 +13,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -30,67 +35,42 @@ import com.journeyapps.barcodescanner.DecoratedBarcodeView
 import com.journeyapps.barcodescanner.DefaultDecoderFactory
 
 /**
- * Reads back what `QRCode.kt`'s carousel produces — the other half of
- * FR-DISC-01, and the Kotlin mirror of `ios/Void/QRScanner.swift`.
- *
- * `zxing-android-embedded`'s [DecoratedBarcodeView] decodes continuously
- * rather than closing after one hit, which is what a multi-frame `VOID1`
- * sequence needs — a steady hand rarely gets every frame in one pass, so
- * partial progress persists across frames rather than resetting on every
- * miss, exactly like the iOS `ScanProgress` this mirrors.
+ * Reads an invitation's QR code — the other half of FR-DISC-01, and the Kotlin
+ * mirror of `ios/Void/QRScanner.swift`. An invitation is one code (D-027), so
+ * the first `void://` link in view is the whole thing.
  */
-object QRReassembler {
-    data class Frame(val index: Int, val total: Int, val data: String)
-
-    /** `null` means it wasn't one of ours — a stray QR code in view, not a corrupt scan. */
-    fun parse(payload: String): Frame? {
-        val parts = payload.split("/", limit = 4)
-        if (parts.size != 4 || parts[0] != "VOID1") return null
-        val index = parts[1].toIntOrNull() ?: return null
-        val total = parts[2].toIntOrNull() ?: return null
-        if (index < 1 || total < 1 || index > total) return null
-        return Frame(index, total, parts[3])
-    }
-
-    /** Joins collected frames back into the original link once all of `1..total` are present. */
-    fun reassemble(frames: Map<Int, Frame>): String? {
-        val total = frames.values.firstOrNull()?.total ?: return null
-        if (frames.values.any { it.total != total }) return null
-        if ((1..total).any { frames[it] == null }) return null
-        return (1..total).joinToString("") { frames[it]!!.data }
-    }
-}
+fun isVoidLink(payload: String): Boolean = payload.trim().lowercase().startsWith("void://")
 
 /**
- * The screen presented for "Scan a QR code": live camera behind a progress
- * readout, calling [onScanned] and stopping the moment the last chunk
- * lands. Requests the camera permission itself on first composition and
- * falls back to a plain message — never a silent dead end — if it's denied.
+ * The screen presented for "Scan their code": live camera, calling [onScanned]
+ * the moment an invitation is in view. Requests the camera permission itself
+ * and falls back to a plain message — never a silent dead end — if it is
+ * denied. The camera is released when the screen goes away.
  */
 @Composable
 fun InviteScanScreen(onScanned: (String) -> Unit, onCancel: () -> Unit) {
     val context = LocalContext.current
     var hasPermission by remember {
         mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
-                PackageManager.PERMISSION_GRANTED,
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED,
         )
     }
-    val launcher = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
-    ) { granted -> hasPermission = granted }
-
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        hasPermission = granted
+    }
     LaunchedEffect(Unit) {
         if (!hasPermission) launcher.launch(Manifest.permission.CAMERA)
     }
+    BackHandler(onBack = onCancel)
 
     Column(modifier = Modifier.fillMaxSize()) {
+        TextButton(onClick = onCancel, modifier = Modifier.padding(8.dp)) { Text("Cancel") }
         if (!hasPermission) {
             Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Camera permission is needed to scan a code.", style = MaterialTheme.typography.bodyMedium)
                     Text(
-                        "Paste the invite link instead, or grant the permission in Settings.",
+                        "Paste the invitation link instead, or allow the camera in Settings.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -99,8 +79,12 @@ fun InviteScanScreen(onScanned: (String) -> Unit, onCancel: () -> Unit) {
             return@Column
         }
 
-        val frames = remember { mutableStateMapOf<Int, QRReassembler.Frame>() }
-        var completed by remember { mutableStateOf(false) }
+        var done by remember { mutableStateOf(false) }
+        var scanner by remember { mutableStateOf<DecoratedBarcodeView?>(null) }
+        // Without this the camera stayed on after scanning, until the process died.
+        DisposableEffect(Unit) {
+            onDispose { scanner?.pause() }
+        }
 
         Box(modifier = Modifier.weight(1f)) {
             AndroidView(
@@ -110,23 +94,17 @@ fun InviteScanScreen(onScanned: (String) -> Unit, onCancel: () -> Unit) {
                         barcodeView.decoderFactory = DefaultDecoderFactory(listOf(BarcodeFormat.QR_CODE))
                         decodeContinuous(object : BarcodeCallback {
                             override fun barcodeResult(result: BarcodeResult) {
-                                if (completed) return
-                                val frame = QRReassembler.parse(result.text) ?: return
-                                val existingTotal = frames.values.firstOrNull()?.total
-                                if (existingTotal != null && existingTotal != frame.total) {
-                                    frames.clear()
-                                }
-                                frames[frame.index] = frame
-                                val joined = QRReassembler.reassemble(frames)
-                                if (joined != null) {
-                                    completed = true
-                                    onScanned(joined)
-                                }
+                                val text = result.text ?: return
+                                if (done || !isVoidLink(text)) return
+                                done = true
+                                pause()
+                                onScanned(text.trim())
                             }
 
                             override fun possibleResultPoints(resultPoints: MutableList<ResultPoint>) {}
                         })
                         resume()
+                        scanner = this
                     }
                 },
             )
@@ -135,10 +113,8 @@ fun InviteScanScreen(onScanned: (String) -> Unit, onCancel: () -> Unit) {
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
                 shape = MaterialTheme.shapes.large,
             ) {
-                val total = frames.values.firstOrNull()?.total
                 Text(
-                    text = if (total != null) "${frames.size} of $total codes scanned"
-                    else "Point the camera at the first code",
+                    "Point the camera at their Void code",
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                     style = MaterialTheme.typography.bodyMedium,
                 )

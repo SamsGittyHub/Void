@@ -49,6 +49,8 @@ pub const LABEL_QUEUE_AUTH: &[u8] = b"void/v1/queue/auth";
 pub const LABEL_WAKE_ID: &[u8] = b"void/v1/push/wake-id";
 /// Invitation: one-time link key.
 pub const LABEL_INVITE: &[u8] = b"void/v1/invite/link";
+/// Short invitation: the queue its encrypted body is parked in on the relay.
+pub const LABEL_INVITE_DROP: &[u8] = b"void/v1/invite/drop";
 
 /// Every label defined above, for the uniqueness test and for documentation
 /// generation.
@@ -69,6 +71,7 @@ pub const ALL_LABELS: &[&[u8]] = &[
     LABEL_QUEUE_AUTH,
     LABEL_WAKE_ID,
     LABEL_INVITE,
+    LABEL_INVITE_DROP,
 ];
 
 /// Combine several input secrets into one key.

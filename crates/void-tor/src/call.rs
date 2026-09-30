@@ -20,11 +20,23 @@
 //! 4,500 packets. Mouth-to-ear works out at roughly 470–870 ms once a jitter
 //! buffer sized to p95 is added.
 //!
-//! That is a walkie-talkie, not a phone call, and the UI says so. ITU-T G.114
-//! puts the limit for natural interactive conversation at 400 ms; at 750 ms
-//! two people talking freely collide constantly, while two people taking turns
-//! do fine. Calling this "calls" in the interface would generate bug reports
-//! about echo and talk-over that no amount of engineering can close.
+//! That is a call with real lag — about a second each way, which is fine for
+//! taking turns and bad for interrupting. It is a call rather than
+//! push-to-talk (D-024): the microphone is open both ways, and the interface
+//! says how long the delay is instead of making the user operate around it.
+//!
+//! ## One stream, two threads, and frames that stay whole
+//!
+//! A call sends and receives at once, so [`MediaSocket::split`] hands the
+//! sending and receiving halves of the stream to two owners that share
+//! nothing. Frames are fixed-size and carry no framing of their own, so a frame
+//! must only ever be read or written whole: a reader that gave up halfway
+//! through one would read every later frame out of alignment, and every one of
+//! them would fail to authenticate for the rest of the call. So [`MediaReader`]
+//! keeps a partly read frame across calls, and [`MediaWriter`] finishes a
+//! partly written one before it starts the next. Tor stalls — runs of late
+//! packets of half a second and more are in the measurements — are normal,
+//! and a stall must cost audio, never the call.
 //!
 //! ## Ephemeral, and what that does and does not hide
 //!
@@ -38,18 +50,19 @@
 //! direct connection and is the honest trade against the mailbox model, which
 //! hides exactly that.
 
-use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use safelog::DisplayRedacted as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tor_cell::relaycell::msg::Connected;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::{handle_rend_requests, HsNickname, RunningOnionService};
+use tor_proto::stream::IncomingStreamRequest;
 
 use void_proto::call::MEDIA_FRAME_LEN;
 
@@ -63,13 +76,26 @@ use crate::{TorError, TorHandle};
 /// an identifier.
 pub const CALL_PORT: u16 = 9999;
 
-/// How long to wait for the callee to connect before giving up on a call.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long to wait for the callee to connect before giving up on a call:
+/// exactly as long as the caller's engine waits for an answer
+/// (`void_client::engine::CALLER_TIMEOUT_SECONDS`), so the service is not
+/// torn down while the call is still ringing, nor kept once it has stopped.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(void_client::engine::CALLER_TIMEOUT_SECONDS);
 
-/// How long a single media read or write may block before the call is
-/// considered dead. Short, unlike the relay transport's timeout: a call that
-/// has stopped moving audio for two seconds has stopped being a call.
+/// How long a single receive waits for a frame before reporting that none
+/// arrived. The call is not over when this passes — the platform decides that
+/// from how many pass in a row — it just returns control so silence can be
+/// played and a hang-up can be noticed.
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a send may wait for Tor to take a frame before the next frame is
+/// dropped instead. Short: audio twenty milliseconds late is worth sending,
+/// audio a second late is not worth delaying everything behind it for.
+const SEND_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How often a blocked wait checks whether it has been cancelled. Bounds how
+/// long hanging up can take to reach a thread that is waiting on the network.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// A published onion service waiting for one caller.
 ///
@@ -100,16 +126,36 @@ impl CallHost {
         &self.onion_address
     }
 
-    /// Block until the callee connects, or the answer window closes.
-    pub fn accept(self) -> Result<MediaSocket, TorError> {
-        let stream = self
-            .incoming
-            .recv_timeout(ANSWER_TIMEOUT)
-            .map_err(|_| TorError::Connect(String::from("nobody answered")))?;
-        Ok(MediaSocket {
-            handle: self.handle.clone(),
-            inner: stream,
-        })
+    /// Block until the callee connects, the answer window closes, or
+    /// `cancelled` is set — the caller hung up while it rang.
+    ///
+    /// Called the moment the service is published, not once an answer has
+    /// come back through the relay: the callee dials as soon as they answer,
+    /// and waiting a mailbox delay for the relayed answer before accepting
+    /// left their audio queuing in a stream nobody read.
+    pub fn accept(self, cancelled: &AtomicBool) -> Result<MediaSocket, TorError> {
+        let deadline = Instant::now() + ANSWER_TIMEOUT;
+        loop {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(TorError::Connect(String::from("the call was cancelled")));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TorError::Connect(String::from("nobody answered")));
+            }
+            match self.incoming.recv_timeout(CANCEL_POLL.min(deadline - now)) {
+                Ok(stream) => {
+                    return Ok(MediaSocket {
+                        handle: self.handle.clone(),
+                        inner: stream,
+                    })
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(TorError::Connect(String::from("the service stopped")));
+                }
+            }
+        }
     }
 }
 
@@ -158,9 +204,19 @@ impl TorHandle {
             tokio::spawn(async move {
                 let mut streams = Box::pin(handle_rend_requests(rend_requests));
                 while let Some(request) = streams.next().await {
-                    // Only ever accept the one port a call uses. Accepting
-                    // anything else would make this service behave differently
-                    // from every other Void client's, which is a fingerprint.
+                    // Only ever accept a BEGIN for the one port a call uses,
+                    // and refuse everything else the way every other onion
+                    // service does — an END with reason DONE. Behaving
+                    // differently would make this service distinguishable from
+                    // every other Void client's, which is a fingerprint.
+                    let wanted = matches!(
+                        request.request(),
+                        IncomingStreamRequest::Begin(begin) if begin.port() == CALL_PORT
+                    );
+                    if !wanted {
+                        let _ = request.reject(End::new_with_reason(EndReason::DONE)).await;
+                        continue;
+                    }
                     if let Ok(stream) = request.accept(Connected::new_empty()).await {
                         if tx.send(stream).is_err() {
                             break;
@@ -181,13 +237,22 @@ impl TorHandle {
         })
     }
 
-    /// Dial a caller's onion service to join a call.
+    /// Dial a caller's onion service to join a call. Gives up after
+    /// [`crate::CONNECT_TIMEOUT`], for the reason given there: the callee would
+    /// otherwise sit on "Connecting…" for as long as Arti cared to wait.
     pub fn connect_call(&self, onion_address: &str, port: u16) -> Result<MediaSocket, TorError> {
         let client = Arc::clone(&self.client);
         let target = onion_address.to_string();
         let stream = self
             .runtime
-            .block_on(async move { client.connect((target.as_str(), port)).await })
+            .block_on(async move {
+                tokio::time::timeout(
+                    crate::CONNECT_TIMEOUT,
+                    client.connect((target.as_str(), port)),
+                )
+                .await
+            })
+            .map_err(|_| TorError::Connect(String::from("timed out dialling the caller")))?
             .map_err(|e| TorError::Connect(e.to_string()))?;
         Ok(MediaSocket {
             handle: self.runtime.handle().clone(),
@@ -196,10 +261,10 @@ impl TorHandle {
     }
 }
 
-/// One call's media connection, as blocking frame I/O.
+/// One call's media connection, before it is split for sending and receiving.
 ///
 /// Frames are fixed-size ([`MEDIA_FRAME_LEN`]) and already encrypted by
-/// `void_proto::call::MediaStream` before they reach here — this type moves
+/// `void_proto::call::MediaSealer` before they reach here — this type moves
 /// bytes and knows nothing about what is in them.
 pub struct MediaSocket {
     handle: tokio::runtime::Handle,
@@ -207,68 +272,162 @@ pub struct MediaSocket {
 }
 
 impl MediaSocket {
-    /// Send one media frame.
-    pub fn send_frame(&mut self, frame: &[u8]) -> Result<(), TorError> {
+    /// Separate the halves, for a sending thread and a receiving thread that
+    /// must never wait on each other.
+    #[must_use]
+    pub fn split(self) -> (MediaReader, MediaWriter) {
+        let (reader, writer) = self.inner.split();
+        (
+            MediaReader {
+                handle: self.handle.clone(),
+                inner: reader,
+                buf: [0u8; MEDIA_FRAME_LEN],
+                filled: 0,
+            },
+            MediaWriter {
+                handle: self.handle,
+                inner: writer,
+                pending: Vec::with_capacity(2 * MEDIA_FRAME_LEN),
+            },
+        )
+    }
+}
+
+/// The receiving half of a call's media stream. Generic only so the framing can
+/// be tested over an in-memory stream; in use it is always Arti's.
+pub struct MediaReader<R = arti_client::DataReader> {
+    handle: tokio::runtime::Handle,
+    inner: R,
+    /// The frame being read, kept across calls so a stall mid-frame costs time
+    /// and never alignment.
+    buf: [u8; MEDIA_FRAME_LEN],
+    filled: usize,
+}
+
+impl<R: AsyncRead + Unpin> MediaReader<R> {
+    /// Wait up to two seconds for the next whole frame.
+    ///
+    /// `Ok(Some(frame))` is a frame; `Ok(None)` means none finished arriving
+    /// in time — any part of one that did is kept for the next call; `Err`
+    /// means the stream is closed, or `cancelled` was set.
+    pub fn recv_frame(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<[u8; MEDIA_FRAME_LEN]>, TorError> {
+        self.recv_frame_within(cancelled, MEDIA_TIMEOUT)
+    }
+
+    fn recv_frame_within(
+        &mut self,
+        cancelled: &AtomicBool,
+        limit: Duration,
+    ) -> Result<Option<[u8; MEDIA_FRAME_LEN]>, TorError> {
+        let deadline = Instant::now() + limit;
+        while self.filled < MEDIA_FRAME_LEN {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(TorError::Connect(String::from("the call was closed")));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let wait = CANCEL_POLL.min(deadline - now);
+            let inner = &mut self.inner;
+            let target = &mut self.buf[self.filled..];
+            // `read` is cancellation-safe: when the timeout wins, nothing was
+            // read, so nothing is lost. (`read_exact` is not — the reason this
+            // is a loop over `read` rather than one `read_exact`.)
+            let read = self
+                .handle
+                .block_on(async move { tokio::time::timeout(wait, inner.read(target)).await });
+            match read {
+                Err(_elapsed) => continue,
+                Ok(Ok(0)) => {
+                    return Err(TorError::Connect(String::from("the call's stream closed")))
+                }
+                Ok(Ok(n)) => self.filled += n,
+                Ok(Err(e)) => return Err(TorError::Connect(e.to_string())),
+            }
+        }
+        self.filled = 0;
+        Ok(Some(self.buf))
+    }
+}
+
+/// The sending half of a call's media stream. Generic only so the framing can
+/// be tested over an in-memory stream; in use it is always Arti's.
+pub struct MediaWriter<W = arti_client::DataWriter> {
+    handle: tokio::runtime::Handle,
+    inner: W,
+    /// Bytes of an accepted frame that Tor has not yet taken. Always finished
+    /// before another frame starts, so frames only ever go out whole.
+    pending: Vec<u8>,
+}
+
+impl<W: AsyncWrite + Unpin> MediaWriter<W> {
+    /// Send one frame of exactly [`MEDIA_FRAME_LEN`] bytes.
+    ///
+    /// `Ok(true)` means the frame is on its way — possibly with its tail still
+    /// waiting, which the next call finishes first. `Ok(false)` means it was
+    /// dropped because the previous frame has still not gone: while the
+    /// circuit is backed up, new audio is dropped rather than queued, since
+    /// queued audio is just delay that never goes away. `Err` means the stream
+    /// is closed.
+    pub fn send_frame(&mut self, frame: &[u8]) -> Result<bool, TorError> {
+        self.send_frame_within(frame, SEND_TIMEOUT)
+    }
+
+    fn send_frame_within(&mut self, frame: &[u8], limit: Duration) -> Result<bool, TorError> {
         if frame.len() != MEDIA_FRAME_LEN {
             return Err(TorError::Connect(String::from("wrong media frame size")));
         }
-        let inner = &mut self.inner;
-        self.handle
-            .block_on(async move {
-                tokio::time::timeout(MEDIA_TIMEOUT, async {
-                    inner.write_all(frame).await?;
-                    inner.flush().await
-                })
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "media write timed out"))?
-            })
-            .map_err(|e| TorError::Connect(e.to_string()))
+        if !self.pending.is_empty() {
+            self.write_pending(limit)?;
+            if !self.pending.is_empty() {
+                return Ok(false);
+            }
+        }
+        self.pending.extend_from_slice(frame);
+        self.write_pending(limit)?;
+        Ok(true)
     }
 
-    /// Receive one media frame, blocking until it arrives or the call stalls.
-    pub fn recv_frame(&mut self) -> Result<Vec<u8>, TorError> {
-        let mut buf = vec![0u8; MEDIA_FRAME_LEN];
+    /// Hand Tor as much of `pending` as it takes within `limit`, then flush.
+    fn write_pending(&mut self, limit: Duration) -> Result<(), TorError> {
+        let deadline = Instant::now() + limit;
+        while !self.pending.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            let wait = deadline - now;
+            let inner = &mut self.inner;
+            let data = &self.pending[..];
+            // `write` is cancellation-safe: when the timeout wins, nothing was
+            // written, and the unwritten bytes stay in `pending`.
+            let written = self
+                .handle
+                .block_on(async move { tokio::time::timeout(wait, inner.write(data)).await });
+            match written {
+                Err(_elapsed) => return Ok(()),
+                Ok(Ok(0)) => {
+                    return Err(TorError::Connect(String::from("the call's stream closed")))
+                }
+                Ok(Ok(n)) => {
+                    self.pending.drain(..n);
+                }
+                Ok(Err(e)) => return Err(TorError::Connect(e.to_string())),
+            }
+        }
         let inner = &mut self.inner;
-        let slice = &mut buf[..];
-        self.handle
-            .block_on(async move {
-                tokio::time::timeout(MEDIA_TIMEOUT, inner.read_exact(slice))
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "media read timed out"))?
-            })
-            .map_err(|e| TorError::Connect(e.to_string()))?;
-        Ok(buf)
-    }
-}
-
-impl Read for MediaSocket {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let inner = &mut self.inner;
-        self.handle.block_on(async move {
-            tokio::time::timeout(MEDIA_TIMEOUT, inner.read(buf))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "media read timed out"))?
-        })
-    }
-}
-
-impl Write for MediaSocket {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let inner = &mut self.inner;
-        self.handle.block_on(async move {
-            tokio::time::timeout(MEDIA_TIMEOUT, inner.write(buf))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "media write timed out"))?
-        })
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let inner = &mut self.inner;
-        self.handle.block_on(async move {
-            tokio::time::timeout(MEDIA_TIMEOUT, inner.flush())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "media flush timed out"))?
-        })
+        match self
+            .handle
+            .block_on(async move { tokio::time::timeout(limit, inner.flush()).await })
+        {
+            Ok(Err(e)) => Err(TorError::Connect(e.to_string())),
+            // Flushed, or still flushing: either way the bytes are Tor's now.
+            Ok(Ok(())) | Err(_) => Ok(()),
+        }
     }
 }
 
@@ -308,5 +467,124 @@ mod tests {
         // FR-MSG-02's reasoning applied to calls: anything that varies per
         // user is a way to tell users apart.
         assert_eq!(CALL_PORT, 9999);
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn frame(fill: u8) -> [u8; MEDIA_FRAME_LEN] {
+        [fill; MEDIA_FRAME_LEN]
+    }
+
+    #[test]
+    fn media_survives_a_stall_mid_frame() {
+        // Half a frame arrives, then the circuit stalls for longer than one
+        // receive waits. The half must be kept: dropping it put every later
+        // frame out of alignment, and a call went silent for good.
+        let rt = runtime();
+        let (mut far, near) = tokio::io::duplex(4 * MEDIA_FRAME_LEN);
+        let mut reader = MediaReader {
+            handle: rt.handle().clone(),
+            inner: near,
+            buf: [0u8; MEDIA_FRAME_LEN],
+            filled: 0,
+        };
+        let never = AtomicBool::new(false);
+        let patience = Duration::from_millis(200);
+
+        rt.block_on(far.write_all(&frame(1)[..50])).unwrap();
+        assert_eq!(reader.recv_frame_within(&never, patience).unwrap(), None);
+
+        rt.block_on(async {
+            far.write_all(&frame(1)[50..]).await?;
+            far.write_all(&frame(2)).await
+        })
+        .unwrap();
+        assert_eq!(
+            reader.recv_frame_within(&never, patience).unwrap(),
+            Some(frame(1)),
+            "the half that arrived before the stall is completed, not dropped"
+        );
+        assert_eq!(
+            reader.recv_frame_within(&never, patience).unwrap(),
+            Some(frame(2)),
+            "and every frame after it is still aligned"
+        );
+
+        drop(far);
+        assert!(
+            reader.recv_frame_within(&never, patience).is_err(),
+            "a closed stream is reported as closed, not as silence"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_receive_returns_promptly() {
+        let rt = runtime();
+        let (_far, near) = tokio::io::duplex(MEDIA_FRAME_LEN);
+        let mut reader = MediaReader {
+            handle: rt.handle().clone(),
+            inner: near,
+            buf: [0u8; MEDIA_FRAME_LEN],
+            filled: 0,
+        };
+        let cancelled = AtomicBool::new(true);
+        let started = Instant::now();
+        assert!(reader.recv_frame(&cancelled).is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_backed_up_writer_drops_new_frames_but_never_splits_one() {
+        // Tor will not take more: the first frame goes partly out and its tail
+        // waits; the next frame is dropped rather than queued behind it; and
+        // once the circuit drains, what arrives is whole frames, in order.
+        let rt = runtime();
+        let (mut far, near) = tokio::io::duplex(64);
+        let mut writer = MediaWriter {
+            handle: rt.handle().clone(),
+            inner: near,
+            pending: Vec::new(),
+        };
+        let patience = Duration::from_millis(100);
+
+        assert!(writer.send_frame_within(&frame(1), patience).unwrap());
+        assert!(!writer.pending.is_empty(), "its tail is waiting");
+        assert!(
+            !writer.send_frame_within(&frame(2), patience).unwrap(),
+            "backed up: the new frame is dropped, not queued"
+        );
+
+        // The far end reads everything; the writer can finish frame 1 and send 3.
+        let reader = rt.spawn(async move {
+            let mut got = vec![0u8; 2 * MEDIA_FRAME_LEN];
+            far.read_exact(&mut got).await.map(|_| got)
+        });
+        let mut sent_third = false;
+        for _ in 0..50 {
+            if writer.send_frame_within(&frame(3), patience).unwrap() {
+                sent_third = true;
+                break;
+            }
+        }
+        assert!(sent_third);
+        while !writer.pending.is_empty() {
+            writer.write_pending(patience).unwrap();
+        }
+        let got = rt.block_on(reader).unwrap().unwrap();
+        assert_eq!(&got[..MEDIA_FRAME_LEN], &frame(1)[..]);
+        assert_eq!(&got[MEDIA_FRAME_LEN..], &frame(3)[..]);
+    }
+
+    #[test]
+    fn the_service_waits_exactly_as_long_as_the_caller_does() {
+        assert_eq!(
+            ANSWER_TIMEOUT,
+            Duration::from_secs(void_client::engine::CALLER_TIMEOUT_SECONDS)
+        );
     }
 }

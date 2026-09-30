@@ -42,10 +42,8 @@ use std::sync::Mutex;
 
 use void_client::engine::{Engine, SecurityMode, TickOutcome};
 use void_proto::fingerprint;
-use void_proto::handshake::PrekeyBundle;
 use void_proto::identity::Identity;
-use void_proto::invite::{self, Invite};
-use void_proto::queue::QueueSecret;
+use void_proto::queue::QueueId;
 use void_store::model::Settings;
 use void_store::vault::{DURESS_CONFIRMATION_PHRASE, DURESS_DISCLOSURE};
 
@@ -71,6 +69,33 @@ pub enum VoidStatus {
     Locked = 5,
     /// An internal invariant failed. Reported rather than panicking.
     Internal = 6,
+    /// The invitation has expired. The person who made it needs to make a new
+    /// one.
+    Expired = 7,
+    /// A conversation with this person already exists (see
+    /// `void_client::ClientError::AlreadyConnected` for why this refuses).
+    AlreadyConnected = 8,
+    /// The invitation is the user's own.
+    OwnInvite = 9,
+    /// The invitation is parked on a different relay from the one this app
+    /// uses.
+    WrongRelay = 10,
+}
+
+/// The largest `now` this boundary accepts: 3000-01-01T00:00:00Z, in Unix
+/// seconds.
+///
+/// Every `now` crossing the boundary is in **seconds** (`now_ms` parameters
+/// say so in their name). A millisecond value passed by mistake is about a
+/// thousand times larger than any plausible time in seconds, so it lands far
+/// past this bound and is refused as [`VoidStatus::BadArgument`]. That mix-up
+/// is not hypothetical: the Android app made it, and its invitations expired
+/// 3.6 seconds after they were created.
+const MAX_PLAUSIBLE_UNIX_SECONDS: u64 = 32_503_680_000;
+
+/// Whether `now` can be a time in seconds. See [`MAX_PLAUSIBLE_UNIX_SECONDS`].
+fn plausible_seconds(now: u64) -> bool {
+    now <= MAX_PLAUSIBLE_UNIX_SECONDS
 }
 
 /// An owned byte buffer handed to the platform.
@@ -129,10 +154,11 @@ fn guard_bytes<F: FnOnce() -> VoidBytes>(f: F) -> VoidBytes {
 
 // --- lifecycle ---------------------------------------------------------------
 
-/// Create an engine with a freshly generated identity.
+/// Create an engine with a freshly generated identity, held in memory only.
 ///
 /// Generation is entirely offline (FR-ID-04): no network round trip, no server
-/// state, nothing to register.
+/// state, nothing to register. Nothing it holds outlives the process, so this
+/// is for tests; the apps use [`void_engine_open`].
 ///
 /// # Safety
 /// `out` must be a valid pointer to a `*mut VoidEngine`.
@@ -146,8 +172,8 @@ pub unsafe extern "C" fn void_engine_new(out: *mut *mut VoidEngine) -> VoidStatu
             return VoidStatus::Failed;
         };
         // The platform layer supplies a Tor-routed transport through
-        // `void_engine_attach_transport`; until then the engine has none and
-        // every send queues, which is the correct fail-closed default.
+        // `void_engine_attach_tor`; until then the engine has none and every
+        // send queues, which is the correct fail-closed default.
         let Ok(engine) = Engine::new(
             identity,
             Settings::default(),
@@ -165,10 +191,164 @@ pub unsafe extern "C" fn void_engine_new(out: *mut *mut VoidEngine) -> VoidStatu
     })
 }
 
+/// The database file inside the data directory [`void_engine_open`] is given.
+const DATABASE_FILE: &str = "void.db";
+
+/// Open this device's engine: restore it if it has run here before, otherwise
+/// create it with a freshly generated identity. The apps call this, not
+/// [`void_engine_new`], which keeps nothing past the process.
+///
+/// `kek` is the 32-byte key-encryption key the platform's hardware keystore
+/// released for this launch (Secure Enclave on iOS, Keystore on Android), and
+/// `backing` says truthfully what protects it at rest on this device
+/// (NFR-COMP-02). This crate copies it into a vault used only to unwrap the
+/// database key, and zeroizes every copy it made before returning. Deleting
+/// the hardware key — duress destruction's irreversible step — stays the
+/// platform's job (D-017).
+///
+/// `data_dir` must be app-private and excluded from backup (FR-STOR-05); it is
+/// created if missing. The engine starts on a transport that carries nothing,
+/// so every send queues until [`void_engine_attach_tor`] (FR-TRANS-05).
+///
+/// Returns `Locked` if the key does not open the existing database — a wrong
+/// key, or one destroyed by a duress PIN. Never falls back to creating a new
+/// database in its place: that would silently replace the user's identity,
+/// which every contact would then see as a key change.
+///
+/// # Safety
+/// `data_dir` must be a valid, NUL-terminated UTF-8 string. `kek` must point
+/// to 32 readable bytes. `out` must be a valid pointer to a `*mut VoidEngine`.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_open(
+    data_dir: *const c_char,
+    kek: *const u8,
+    backing: VoidVaultBacking,
+    now_ms: u64,
+    out: *mut *mut VoidEngine,
+) -> VoidStatus {
+    if data_dir.is_null() || kek.is_null() || out.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let Ok(dir) = CStr::from_ptr(data_dir).to_str() else {
+            return VoidStatus::BadArgument;
+        };
+        let dir = std::path::Path::new(dir);
+        if std::fs::create_dir_all(dir).is_err() {
+            return VoidStatus::Failed;
+        }
+        let mut key = [0u8; 32];
+        std::ptr::copy_nonoverlapping(kek, key.as_mut_ptr(), 32);
+        // The vault takes its own copy (and zeroizes it when dropped at the end
+        // of this call); this one is wiped immediately.
+        let vault = void_store::vault::PlatformVault::new(key, backing.to_store());
+        void_crypto::Zeroize::zeroize(&mut key);
+
+        let backend = void_store::db::FileBackend::new(dir.join(DATABASE_FILE));
+        let transport = Box::new(void_client::transport::NullTransport::new());
+        let engine = if void_store::db::Backend::exists(&backend) {
+            let db = match void_store::db::Database::open(backend, &vault) {
+                Ok(db) => db,
+                Err(void_store::StoreError::VaultDestroyed) => return VoidStatus::Locked,
+                Err(_) => return VoidStatus::Failed,
+            };
+            Engine::restore(Box::new(db), transport, SecurityMode::Enforcing, now_ms)
+        } else {
+            let Ok((identity, seeds)) = Identity::generate_with_seeds() else {
+                return VoidStatus::Failed;
+            };
+            let Ok(db) = void_store::db::Database::create(
+                backend,
+                &vault,
+                void_crypto::argon2::Params::DEFAULT,
+            ) else {
+                return VoidStatus::Failed;
+            };
+            Engine::new_persisted(
+                identity,
+                &seeds,
+                Settings::default(),
+                transport,
+                SecurityMode::Enforcing,
+                now_ms,
+                Box::new(db),
+            )
+        };
+        let Ok(engine) = engine else {
+            return VoidStatus::Failed;
+        };
+        *out = Box::into_raw(Box::new(VoidEngine {
+            inner: Mutex::new(engine),
+        }));
+        VoidStatus::Ok
+    })
+}
+
+/// The stored history with one contact, oldest first — what a conversation
+/// screen shows when it reopens after a restart.
+///
+/// Layout, repeated per message:
+///
+/// ```text
+///   u8(direction)        1 = sent by us, 2 = received
+///   u8(delivery)         0 queued, 1 sent, 2 delivered, 3 failed, 4 received
+///   u64 LE(timestamp)    Unix seconds, local clock
+///   u32 LE(text_len) || raw(text)
+/// ```
+///
+/// Empty for an engine with no store attached.
+///
+/// # Safety
+/// `engine` must be valid and `fingerprint` must point to 32 readable bytes.
+/// Free the result with [`void_free_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_messages(
+    engine: *const VoidEngine,
+    fingerprint: *const u8,
+) -> VoidBytes {
+    if engine.is_null() || fingerprint.is_null() {
+        return VoidBytes::empty();
+    }
+    guard_bytes(|| {
+        let mut fp = [0u8; 32];
+        std::ptr::copy_nonoverlapping(fingerprint, fp.as_mut_ptr(), 32);
+        let Ok(guard) = (*engine).inner.lock() else {
+            return VoidBytes::empty();
+        };
+        let Ok(messages) = guard.messages(&fp) else {
+            return VoidBytes::empty();
+        };
+        VoidBytes::from_vec(encode_stored_messages(&messages))
+    })
+}
+
+fn encode_stored_messages(messages: &[void_store::model::StoredMessage]) -> Vec<u8> {
+    use void_store::model::{DeliveryState, Direction};
+    let mut out = Vec::new();
+    for m in messages {
+        out.push(match m.direction {
+            Direction::Outgoing => 1u8,
+            Direction::Incoming => 2u8,
+        });
+        out.push(match m.delivery {
+            DeliveryState::Queued => 0u8,
+            DeliveryState::Deposited => 1,
+            DeliveryState::Collected => 2,
+            DeliveryState::Failed => 3,
+            DeliveryState::Received => 4,
+        });
+        out.extend_from_slice(&m.timestamp.to_le_bytes());
+        out.extend_from_slice(&(m.body.len() as u32).to_le_bytes());
+        out.extend_from_slice(m.body.as_bytes());
+    }
+    out
+}
+
 /// Destroy an engine, zeroizing its secrets.
 ///
 /// # Safety
-/// `engine` must have come from [`void_engine_new`] and must not be used after.
+/// `engine` must have come from [`void_engine_new`] or [`void_engine_open`]
+/// and must not be used after.
 #[no_mangle]
 pub unsafe extern "C" fn void_engine_free(engine: *mut VoidEngine) {
     if engine.is_null() {
@@ -459,7 +639,12 @@ pub unsafe extern "C" fn void_engine_attach_tor(
             return VoidStatus::Internal;
         };
         match guard.set_transport(Box::new(transport)) {
-            Ok(()) => VoidStatus::Ok,
+            Ok(()) => {
+                // What short invitations made here name, and what ones opened
+                // here must name.
+                guard.set_relay(&format!("{onion_address}:{port}"));
+                VoidStatus::Ok
+            }
             Err(_) => VoidStatus::Failed,
         }
     })
@@ -475,214 +660,517 @@ pub unsafe extern "C" fn void_engine_attach_tor(
 // minutes is worth more than a dependency. Each function's doc comment
 // states its exact layout.
 
-/// An opaque handle to an introduction queue secret — what
-/// [`void_engine_create_invite`] hands back alongside the invite link, and
-/// what [`void_engine_poll_intro_queue`] and [`void_engine_accept_conversation`]
-/// need to detect and accept whoever scans that invite.
-pub struct VoidQueueSecret {
-    inner: QueueSecret,
-}
-
-/// Free a queue secret handle.
+/// Publish an invitation (FR-DISC-01, FR-DISC-02) and return its link.
+///
+/// `out_link` receives the `void://` link — render it as a QR code or share
+/// sheet text; both are the same string. `out_invite_id` receives 16 bytes
+/// naming this invitation in [`void_engine_take_contact_events`] and
+/// [`void_engine_cancel_invite`].
+///
+/// `relay_hint` is where the invitation is parked; empty (null with length 0)
+/// means the relay [`void_engine_attach_tor`] attached. `my_label` travels
+/// inside the encrypted invitation and is shown to whoever opens it.
+/// `contact_label` never leaves the device: it becomes the name of whoever
+/// accepts. Either may be empty.
+///
+/// The link is short — one QR code — because the invitation itself is parked
+/// on the relay; see [`void_engine_invite_status`] for how far along that is.
+///
+/// The engine keeps the invitation and watches for its acceptance on its own
+/// schedule; the platform does nothing but tick and drain contact events. Any
+/// number of invitations can be outstanding at once.
+///
+/// `now` and `ttl_seconds` are in **seconds**. A millisecond `now` is refused
+/// as `BadArgument` rather than misread.
 ///
 /// # Safety
-/// `queue` must have come from [`void_engine_create_invite`] and must not be
-/// used after.
-#[no_mangle]
-pub unsafe extern "C" fn void_queue_secret_free(queue: *mut VoidQueueSecret) {
-    if queue.is_null() {
-        return;
-    }
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        drop(Box::from_raw(queue));
-    }));
-}
-
-/// Publish a prekey bundle as a shareable invite link (FR-DISC-01), and
-/// return the queue handle needed to detect when someone accepts it.
-///
-/// `out_link` receives the `void://c/...` link — render it as a QR code or
-/// share sheet text, both are the same string (FR-DISC-01's QR and link
-/// paths are one code path, not two). `out_queue` receives the handle for
-/// [`void_engine_poll_intro_queue`].
-///
-/// # Safety
-/// `engine` must be valid. `relay_hint`/`label` must be valid for their
-/// lengths (label may be null with length 0). `out_link` and `out_queue`
-/// must be valid output pointers.
+/// `engine` must be valid. Each pointer/length pair must be valid for its
+/// length. `out_link` must be a valid output pointer and `out_invite_id` must
+/// be valid for 16 writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn void_engine_create_invite(
     engine: *mut VoidEngine,
     relay_hint: *const u8,
     relay_hint_len: usize,
-    label: *const u8,
-    label_len: usize,
+    my_label: *const u8,
+    my_label_len: usize,
+    contact_label: *const u8,
+    contact_label_len: usize,
     now: u64,
     ttl_seconds: u64,
     out_link: *mut VoidBytes,
-    out_queue: *mut *mut VoidQueueSecret,
+    out_invite_id: *mut u8,
 ) -> VoidStatus {
-    if engine.is_null() || out_link.is_null() || out_queue.is_null() {
+    if engine.is_null() || out_link.is_null() || out_invite_id.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    if !plausible_seconds(now) {
         return VoidStatus::BadArgument;
     }
     guard(|| {
-        let (Some(hint), Some(label_bytes)) = (
+        let (Some(hint), Some(my_label), Some(contact_label)) = (
             slice_from(relay_hint, relay_hint_len),
-            slice_from(label, label_len),
+            slice_from(my_label, my_label_len),
+            slice_from(contact_label, contact_label_len),
         ) else {
             return VoidStatus::BadArgument;
         };
-        let Ok(label) = std::str::from_utf8(label_bytes) else {
+        let (Ok(my_label), Ok(contact_label)) = (
+            std::str::from_utf8(my_label),
+            std::str::from_utf8(contact_label),
+        ) else {
             return VoidStatus::BadArgument;
         };
         let Ok(mut guard) = (*engine).inner.lock() else {
             return VoidStatus::Internal;
         };
-        let Ok((bundle, queue)) = guard.create_bundle(hint) else {
-            return VoidStatus::Failed;
-        };
-        let Ok(invite) = invite::create(&bundle, now, ttl_seconds, label) else {
-            return VoidStatus::Failed;
-        };
-        *out_link = VoidBytes::from_vec(invite.to_link().into_bytes());
-        *out_queue = Box::into_raw(Box::new(VoidQueueSecret { inner: queue }));
-        VoidStatus::Ok
-    })
-}
-
-/// Poll an introduction queue published via [`void_engine_create_invite`].
-///
-/// `out` is empty (`data` null, `len` 0) if nothing has arrived yet — that
-/// is success, not failure; keep polling. When something has arrived, `out`
-/// holds the raw bytes to pass to [`void_engine_accept_conversation`].
-///
-/// # Safety
-/// `engine` and `queue` must be valid. `out` must be a valid output pointer.
-#[no_mangle]
-pub unsafe extern "C" fn void_engine_poll_intro_queue(
-    engine: *mut VoidEngine,
-    queue: *const VoidQueueSecret,
-    out: *mut VoidBytes,
-) -> VoidStatus {
-    if engine.is_null() || queue.is_null() || out.is_null() {
-        return VoidStatus::BadArgument;
-    }
-    guard(|| {
-        let Ok(mut guard) = (*engine).inner.lock() else {
-            return VoidStatus::Internal;
-        };
-        match guard.poll_intro_queue(&(*queue).inner) {
-            Ok(Some(bytes)) => {
-                *out = VoidBytes::from_vec(bytes);
+        match guard.create_invite(hint, my_label, contact_label, now, ttl_seconds) {
+            Ok(created) => {
+                *out_link = VoidBytes::from_vec(created.link.into_bytes());
+                std::ptr::copy_nonoverlapping(created.id.as_ptr(), out_invite_id, 16);
                 VoidStatus::Ok
             }
-            Ok(None) => {
-                *out = VoidBytes::empty();
-                VoidStatus::Ok
-            }
-            Err(_) => VoidStatus::Offline,
+            Err(e) => client_status(e),
         }
     })
 }
 
-/// Accept a conversation from bytes [`void_engine_poll_intro_queue`] returned
-/// (the responder side).
-///
-/// `out_fingerprint` must point to a 32-byte buffer; `out_first_message`
-/// receives the sender's first plaintext.
+/// Withdraw an invitation. A handshake sent against it afterwards is never
+/// answered. Returns `Failed` if it was not outstanding (already accepted,
+/// expired, or cancelled).
 ///
 /// # Safety
-/// `engine`, `queue`, and `initial` must be valid for their lengths.
-/// `out_fingerprint` must be valid for 32 bytes. `out_first_message` must be
-/// a valid output pointer.
+/// `engine` must be valid and `invite_id` must point to 16 readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn void_engine_accept_conversation(
+pub unsafe extern "C" fn void_engine_cancel_invite(
     engine: *mut VoidEngine,
-    queue: *const VoidQueueSecret,
-    initial: *const u8,
-    initial_len: usize,
-    now: u64,
-    out_fingerprint: *mut u8,
-    out_first_message: *mut VoidBytes,
+    invite_id: *const u8,
 ) -> VoidStatus {
-    if engine.is_null()
-        || queue.is_null()
-        || out_fingerprint.is_null()
-        || out_first_message.is_null()
-    {
+    if engine.is_null() || invite_id.is_null() {
         return VoidStatus::BadArgument;
     }
     guard(|| {
-        let Some(initial_bytes) = slice_from(initial, initial_len) else {
-            return VoidStatus::BadArgument;
-        };
+        let mut id: QueueId = [0u8; 16];
+        std::ptr::copy_nonoverlapping(invite_id, id.as_mut_ptr(), 16);
         let Ok(mut guard) = (*engine).inner.lock() else {
             return VoidStatus::Internal;
         };
-        let queue_id = (*queue).inner.queue_id();
-        match guard.accept_conversation(queue_id, initial_bytes, now) {
-            Ok((fingerprint, text)) => {
-                std::ptr::copy_nonoverlapping(fingerprint.as_ptr(), out_fingerprint, 32);
-                *out_first_message = VoidBytes::from_vec(text.into_bytes());
-                VoidStatus::Ok
-            }
-            Err(_) => VoidStatus::Failed,
+        if guard.cancel_invite(&id) {
+            VoidStatus::Ok
+        } else {
+            VoidStatus::Failed
         }
     })
 }
 
-/// Start a conversation from a scanned or pasted invite link (the initiator
-/// side, FR-DISC-01).
+/// Drain everything that has happened to contacts and invitations since the
+/// last drain. Call it after every [`void_engine_tick`].
 ///
-/// `out_fingerprint` must point to a 32-byte buffer.
+/// Layout, repeated per event:
+///
+/// ```text
+///   u8(kind)              1 = someone accepted one of our invitations
+///                         2 = one of our invitations expired unaccepted
+///                         3 = an invitation the user opened is ready to confirm
+///                         4 / 5 / 6 = one the user opened could not be used:
+///                                     expired / invalid / never arrived
+///   raw(id : 16)          our invitation's id (1, 2) or the fetch id (3–6)
+///   raw(fingerprint : 32) kind 1: the new contact; kind 3: who made the
+///                         invitation; otherwise zero
+///   u16 LE(name_len)      || raw(name)      kind 1: the contact's local name;
+///                                           kind 3: the name the invitation
+///                                           carried; otherwise empty
+///   u32 LE(message_len)   || raw(message)   kind 1: their first message, which
+///                                           may be empty; otherwise empty
+/// ```
 ///
 /// # Safety
-/// `engine` must be valid. `link`, `local_name`, and `first_message` must be
-/// valid, NUL-terminated UTF-8 strings. `out_fingerprint` must be valid for
-/// 32 bytes.
+/// `engine` must be valid. Free the result with [`void_free_bytes`].
 #[no_mangle]
-pub unsafe extern "C" fn void_engine_start_conversation(
+pub unsafe extern "C" fn void_engine_take_contact_events(engine: *mut VoidEngine) -> VoidBytes {
+    if engine.is_null() {
+        return VoidBytes::empty();
+    }
+    guard_bytes(|| {
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidBytes::empty();
+        };
+        VoidBytes::from_vec(encode_contact_events(&guard.take_contact_events()))
+    })
+}
+
+fn encode_contact_events(events: &[void_client::engine::ContactEvent]) -> Vec<u8> {
+    use void_client::engine::ContactEvent;
+    let mut out = Vec::new();
+    for event in events {
+        match event {
+            ContactEvent::Added {
+                invite_id,
+                contact_fingerprint,
+                name,
+                first_message,
+            } => {
+                out.push(1u8);
+                out.extend_from_slice(invite_id);
+                out.extend_from_slice(contact_fingerprint);
+                // Contact names are bounded far below this; the clamp is so a
+                // pathological one cannot make the length field lie.
+                let name = &name.as_bytes()[..name.len().min(u16::MAX as usize)];
+                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                out.extend_from_slice(name);
+                out.extend_from_slice(&(first_message.len() as u32).to_le_bytes());
+                out.extend_from_slice(first_message.as_bytes());
+            }
+            ContactEvent::InviteExpired { invite_id } => {
+                out.push(2u8);
+                out.extend_from_slice(invite_id);
+                out.extend_from_slice(&[0u8; 32]);
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+            ContactEvent::InviteReady {
+                fetch_id,
+                inviter_label,
+                inviter_fingerprint,
+            } => {
+                out.push(3u8);
+                out.extend_from_slice(fetch_id);
+                out.extend_from_slice(inviter_fingerprint);
+                // Bounded by `MAX_LABEL_LEN` already; the clamp keeps the
+                // length field honest regardless.
+                let label = &inviter_label.as_bytes()[..inviter_label.len().min(u16::MAX as usize)];
+                out.extend_from_slice(&(label.len() as u16).to_le_bytes());
+                out.extend_from_slice(label);
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+            ContactEvent::InviteFailed { fetch_id, reason } => {
+                out.push(match reason {
+                    void_client::engine::InviteFailure::Expired => 4u8,
+                    void_client::engine::InviteFailure::Invalid => 5u8,
+                    void_client::engine::InviteFailure::TimedOut => 6u8,
+                });
+                out.extend_from_slice(fetch_id);
+                out.extend_from_slice(&[0u8; 32]);
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Open an invitation someone gave the user — scanned or pasted — and start
+/// collecting it (FR-DISC-01). Nothing about the contact list changes yet.
+///
+/// Writes a 16-byte id to `out_fetch_id`. Watch [`void_engine_take_contact_events`]
+/// for kind 3 (ready: show who it is from, then [`void_engine_confirm_invite`])
+/// or kinds 4–6 (it could not be used). A full `void://c/` link is ready at
+/// once; a short `void://i/` one is collected from the relay, normally within
+/// one emission slot.
+///
+/// Returns `BadArgument` for something that is not a Void invitation,
+/// `Expired`, `WrongRelay` for one parked on another relay, and `OwnInvite`
+/// for the user's own. `now` is in seconds.
+///
+/// # Safety
+/// `engine` must be valid, `link` a valid NUL-terminated UTF-8 string, and
+/// `out_fetch_id` valid for 16 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_open_invite(
     engine: *mut VoidEngine,
     link: *const c_char,
+    now: u64,
+    out_fetch_id: *mut u8,
+) -> VoidStatus {
+    if engine.is_null() || link.is_null() || out_fetch_id.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    if !plausible_seconds(now) {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let Ok(link) = CStr::from_ptr(link).to_str() else {
+            return VoidStatus::BadArgument;
+        };
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        match guard.open_invite(link, now) {
+            Ok(id) => {
+                std::ptr::copy_nonoverlapping(id.as_ptr(), out_fetch_id, 16);
+                VoidStatus::Ok
+            }
+            Err(e) => client_status(e),
+        }
+    })
+}
+
+/// Connect using an invitation reported ready. Writes the new contact's
+/// fingerprint to `out_fingerprint`.
+///
+/// `local_name` may be empty, to use the name the invitation carried.
+/// `first_message` may be empty, to connect without saying anything yet —
+/// the other side shows nothing for it. `now` is in seconds.
+///
+/// Returns `AlreadyConnected` if this person is already a contact, `OwnInvite`
+/// for the user's own invitation, and `Expired` if it expired while the user
+/// was deciding.
+///
+/// # Safety
+/// `engine` must be valid, `fetch_id` must point to 16 readable bytes,
+/// `local_name` and `first_message` must be valid NUL-terminated UTF-8
+/// strings, and `out_fingerprint` must be valid for 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_confirm_invite(
+    engine: *mut VoidEngine,
+    fetch_id: *const u8,
     local_name: *const c_char,
     first_message: *const c_char,
     now: u64,
     out_fingerprint: *mut u8,
 ) -> VoidStatus {
     if engine.is_null()
-        || link.is_null()
+        || fetch_id.is_null()
         || local_name.is_null()
         || first_message.is_null()
         || out_fingerprint.is_null()
     {
         return VoidStatus::BadArgument;
     }
+    if !plausible_seconds(now) {
+        return VoidStatus::BadArgument;
+    }
     guard(|| {
-        let (Ok(link), Ok(local_name), Ok(first_message)) = (
-            CStr::from_ptr(link).to_str(),
+        let (Ok(local_name), Ok(first_message)) = (
             CStr::from_ptr(local_name).to_str(),
             CStr::from_ptr(first_message).to_str(),
         ) else {
             return VoidStatus::BadArgument;
         };
-        let Ok(parsed) = Invite::from_link(link) else {
-            return VoidStatus::BadArgument;
-        };
-        let Ok(body) = invite::open(&parsed, now) else {
-            return VoidStatus::Failed;
-        };
-        let bundle: PrekeyBundle = body.bundle;
+        let mut id: QueueId = [0u8; 16];
+        std::ptr::copy_nonoverlapping(fetch_id, id.as_mut_ptr(), 16);
         let Ok(mut guard) = (*engine).inner.lock() else {
             return VoidStatus::Internal;
         };
-        match guard.start_conversation(&bundle, local_name, first_message, now) {
+        match guard.confirm_invite(&id, local_name, first_message, now) {
             Ok(fingerprint) => {
                 std::ptr::copy_nonoverlapping(fingerprint.as_ptr(), out_fingerprint, 32);
                 VoidStatus::Ok
             }
-            Err(_) => VoidStatus::Failed,
+            Err(e) => client_status(e),
         }
     })
+}
+
+/// Stop waiting for an invitation the user opened.
+///
+/// # Safety
+/// `engine` must be valid and `fetch_id` must point to 16 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_cancel_fetch(
+    engine: *mut VoidEngine,
+    fetch_id: *const u8,
+) -> VoidStatus {
+    if engine.is_null() || fetch_id.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let mut id: QueueId = [0u8; 16];
+        std::ptr::copy_nonoverlapping(fetch_id, id.as_mut_ptr(), 16);
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        if guard.cancel_fetch(&id) {
+            VoidStatus::Ok
+        } else {
+            VoidStatus::Failed
+        }
+    })
+}
+
+/// Where one of the user's own outstanding invitations stands: how many of
+/// its records are still waiting to be parked on the relay (0 means whoever
+/// opens it can collect it now), or -1 once it has been accepted, has
+/// expired, or was cancelled.
+///
+/// # Safety
+/// `engine` must be valid and `invite_id` must point to 16 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_invite_status(
+    engine: *const VoidEngine,
+    invite_id: *const u8,
+) -> i32 {
+    if engine.is_null() || invite_id.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let mut id: QueueId = [0u8; 16];
+        std::ptr::copy_nonoverlapping(invite_id, id.as_mut_ptr(), 16);
+        let Ok(guard) = (*engine).inner.lock() else {
+            return -1;
+        };
+        match guard.invite_upload_remaining(&id) {
+            Some(remaining) => i32::try_from(remaining).unwrap_or(i32::MAX),
+            None => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// The link of one of the user's own outstanding invitations, so the app can
+/// show its code again. Empty once it is no longer outstanding.
+///
+/// # Safety
+/// `engine` must be valid and `invite_id` must point to 16 readable bytes.
+/// Free the result with [`void_free_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_invite_link(
+    engine: *const VoidEngine,
+    invite_id: *const u8,
+) -> VoidBytes {
+    if engine.is_null() || invite_id.is_null() {
+        return VoidBytes::empty();
+    }
+    guard_bytes(|| {
+        let mut id: QueueId = [0u8; 16];
+        std::ptr::copy_nonoverlapping(invite_id, id.as_mut_ptr(), 16);
+        let Ok(guard) = (*engine).inner.lock() else {
+            return VoidBytes::empty();
+        };
+        match guard.invite_link(&id) {
+            Some(link) => VoidBytes::from_vec(link.as_bytes().to_vec()),
+            None => VoidBytes::empty(),
+        }
+    })
+}
+
+/// Change the name this device shows for a contact. Never transmitted.
+///
+/// # Safety
+/// `engine` must be valid, `fingerprint` must point to 32 readable bytes, and
+/// `name` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_rename_contact(
+    engine: *mut VoidEngine,
+    fingerprint: *const u8,
+    name: *const c_char,
+) -> VoidStatus {
+    if engine.is_null() || fingerprint.is_null() || name.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let Ok(name) = CStr::from_ptr(name).to_str() else {
+            return VoidStatus::BadArgument;
+        };
+        let mut fp = [0u8; 32];
+        std::ptr::copy_nonoverlapping(fingerprint, fp.as_mut_ptr(), 32);
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        match guard.rename_contact(&fp, name) {
+            Ok(()) => VoidStatus::Ok,
+            Err(e) => client_status(e),
+        }
+    })
+}
+
+/// The name the user puts on invitations they make (empty until they choose
+/// one). Stored in the encrypted database, not the platform's preferences.
+///
+/// # Safety
+/// `engine` must be valid. Free the result with [`void_free_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_invite_name(engine: *const VoidEngine) -> VoidBytes {
+    if engine.is_null() {
+        return VoidBytes::empty();
+    }
+    guard_bytes(|| {
+        let Ok(guard) = (*engine).inner.lock() else {
+            return VoidBytes::empty();
+        };
+        VoidBytes::from_vec(guard.settings().invite_name.as_bytes().to_vec())
+    })
+}
+
+/// Set the name the user puts on invitations they make.
+///
+/// # Safety
+/// `engine` must be valid and `name` a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_set_invite_name(
+    engine: *mut VoidEngine,
+    name: *const c_char,
+) -> VoidStatus {
+    if engine.is_null() || name.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let Ok(name) = CStr::from_ptr(name).to_str() else {
+            return VoidStatus::BadArgument;
+        };
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        guard.set_invite_name(name);
+        VoidStatus::Ok
+    })
+}
+
+/// Whether the user has been through the "what Void does and does not
+/// protect" screen (FR-UI-05) on this device. Persisted, so onboarding is not
+/// repeated at every launch.
+///
+/// # Safety
+/// `engine` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_protection_acknowledged(engine: *const VoidEngine) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        (*engine)
+            .inner
+            .lock()
+            .map(|g| g.settings().protection_screen_acknowledged)
+            .unwrap_or(false)
+    }))
+    .unwrap_or(false)
+}
+
+/// Record that the user has been through the protection screen.
+///
+/// # Safety
+/// `engine` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_acknowledge_protection(engine: *mut VoidEngine) -> VoidStatus {
+    if engine.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        let mut settings = guard.settings().clone();
+        settings.protection_screen_acknowledged = true;
+        guard.set_settings(settings);
+        VoidStatus::Ok
+    })
+}
+
+/// The status a failed engine call reports across the boundary.
+fn client_status(e: void_client::ClientError) -> VoidStatus {
+    use void_client::ClientError as E;
+    match e {
+        E::TorUnavailable => VoidStatus::Offline,
+        E::ContactKeyChanged => VoidStatus::KeyChanged,
+        E::Storage => VoidStatus::Locked,
+        E::InviteExpired => VoidStatus::Expired,
+        E::AlreadyConnected => VoidStatus::AlreadyConnected,
+        E::OwnInvite => VoidStatus::OwnInvite,
+        E::WrongRelay => VoidStatus::WrongRelay,
+        E::InvalidInvite => VoidStatus::BadArgument,
+        _ => VoidStatus::Failed,
+    }
 }
 
 /// Send a message. Queues it; transmission happens on the scheduler's own
@@ -701,6 +1189,9 @@ pub unsafe extern "C" fn void_engine_send(
     out_message_id: *mut u64,
 ) -> VoidStatus {
     if engine.is_null() || fingerprint.is_null() || text.is_null() || out_message_id.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    if !plausible_seconds(now) {
         return VoidStatus::BadArgument;
     }
     guard(|| {
@@ -962,8 +1453,8 @@ pub unsafe extern "C" fn void_fingerprint_numbers(engine: *const VoidEngine) -> 
 ///
 /// [`void_fingerprint_words`] only renders the local engine's own — this is
 /// for a contact's, which the caller already holds as raw bytes from
-/// [`void_engine_start_conversation`], [`void_engine_accept_conversation`],
-/// or [`void_engine_contacts`].
+/// [`void_engine_confirm_invite`], [`void_engine_take_contact_events`], or
+/// [`void_engine_contacts`].
 ///
 /// # Safety
 /// `fingerprint` must be valid for 32 bytes.
@@ -1064,18 +1555,36 @@ pub enum VoidVaultBacking {
     Software = 3,
 }
 
-/// Plain-language description of what is protecting the keys.
-#[no_mangle]
-pub extern "C" fn void_vault_backing_description(backing: VoidVaultBacking) -> VoidBytes {
-    guard_bytes(|| {
-        let b = match backing {
+impl VoidVaultBacking {
+    fn to_store(self) -> void_store::vault::VaultBacking {
+        match self {
             VoidVaultBacking::SecureEnclave => void_store::vault::VaultBacking::SecureEnclave,
             VoidVaultBacking::StrongBox => void_store::vault::VaultBacking::StrongBox,
             VoidVaultBacking::Tee => void_store::vault::VaultBacking::TrustedExecutionEnvironment,
             VoidVaultBacking::Software => void_store::vault::VaultBacking::Software,
-        };
-        VoidBytes::from_vec(b.user_description().as_bytes().to_vec())
-    })
+        }
+    }
+}
+
+/// Plain-language description of what is protecting the keys.
+#[no_mangle]
+pub extern "C" fn void_vault_backing_description(backing: VoidVaultBacking) -> VoidBytes {
+    guard_bytes(|| VoidBytes::from_vec(backing.to_store().user_description().as_bytes().to_vec()))
+}
+
+/// Byte-slice equality usable in a `const` assertion.
+const fn bytes_equal(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// The protocol version this build speaks.
@@ -1098,7 +1607,14 @@ pub extern "C" fn void_record_size() -> usize {
 pub extern "C" fn void_protocol_id() -> *const c_char {
     // A static, NUL-terminated string checked at compile time. Nothing is
     // allocated and there is nothing for the caller to free.
-    const ID: &CStr = c"void/v2/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
+    const ID: &CStr = c"void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
+    // A literal, because a static C string needs its NUL; checked against the
+    // core's constant at compile time, so this copy cannot drift the way
+    // PROTOCOL.md's and `PROTOCOL_VERSION` had.
+    const _: () = assert!(bytes_equal(
+        ID.to_bytes(),
+        void_proto::handshake::PROTOCOL_ID
+    ));
     ID.as_ptr()
 }
 
@@ -1113,16 +1629,73 @@ pub extern "C" fn void_protocol_id() -> *const c_char {
 // The platform never sees a media key. It hands over encoded audio and gets
 // encoded audio back; everything between those two points is this crate's
 // problem. See `void_proto::call` and `void_tor::call` (D-024).
+//
+// ## Threads, and why these handles are reference-counted
+//
+// A call is used from several threads at once: one sends, one receives, and
+// the UI thread hangs up. An earlier version gave both `send` and `recv` a
+// `&mut` to the same struct with no lock — a data race — and freed it from the
+// UI thread while the receiving thread could still be inside `recv`. Now:
+//
+// - the sending and receiving halves are separate, each behind its own lock,
+//   so a receive blocked on the network never delays a send;
+// - `void_call_media_close` and `void_call_host_cancel` wake a blocked
+//   receive or accept within about a tenth of a second;
+// - the handles are `Arc`s, and every call takes its own reference for its
+//   duration, so a free racing an in-flight call leaves that call a live
+//   object to finish with.
+//
+// The contract for the platform is still: close (or cancel), join the threads
+// that use the handle, then free — and never start a call on a handle after
+// freeing it.
 
 /// A published onion service waiting for the callee to connect.
 pub struct VoidCallHost {
-    inner: Option<void_tor::call::CallHost>,
+    host: Mutex<Option<void_tor::call::CallHost>>,
+    address: String,
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 /// One call's media connection, with its encryption attached.
 pub struct VoidCallMedia {
-    socket: void_tor::call::MediaSocket,
-    stream: void_proto::call::MediaStream,
+    sending: Mutex<(void_tor::call::MediaWriter, void_proto::call::MediaSealer)>,
+    receiving: Mutex<(void_tor::call::MediaReader, void_proto::call::MediaOpener)>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl VoidCallMedia {
+    fn new(
+        socket: void_tor::call::MediaSocket,
+        secret: &[u8; 32],
+        role: void_proto::call::Role,
+        call_id: [u8; 16],
+    ) -> VoidCallMedia {
+        let (reader, writer) = socket.split();
+        let (sealer, opener) = void_proto::call::MediaStream::new(secret, role, call_id).split();
+        VoidCallMedia {
+            sending: Mutex::new((writer, sealer)),
+            receiving: Mutex::new((reader, opener)),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Take a counted reference to a handle the platform holds, so the object
+/// outlives this call even if the platform frees its handle meanwhile.
+///
+/// # Safety
+/// `ptr` must have come from `Arc::into_raw` and not yet have been freed.
+unsafe fn retain<T>(ptr: *const T) -> std::sync::Arc<T> {
+    std::sync::Arc::increment_strong_count(ptr);
+    std::sync::Arc::from_raw(ptr)
 }
 
 /// Why a call ended, matching `void_proto::call::EndReason`.
@@ -1137,6 +1710,8 @@ pub enum VoidCallEndReason {
     Missed = 3,
     /// The media connection failed or was lost.
     Failed = 4,
+    /// The other end was already on a call.
+    Busy = 5,
 }
 
 impl VoidCallEndReason {
@@ -1147,6 +1722,7 @@ impl VoidCallEndReason {
             VoidCallEndReason::Declined => E::Declined,
             VoidCallEndReason::Missed => E::Missed,
             VoidCallEndReason::Failed => E::Failed,
+            VoidCallEndReason::Busy => E::Busy,
         }
     }
 
@@ -1157,15 +1733,34 @@ impl VoidCallEndReason {
             E::Declined => 2,
             E::Missed => 3,
             E::Failed => 4,
+            E::Busy => 5,
         }
     }
+}
+
+/// What one [`void_call_media_recv`] produced.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VoidMediaRecv {
+    /// An authenticated frame of audio, in the output buffer. Play it.
+    Audio = 0,
+    /// An authenticated frame of silence. Nothing to play — but it proves the
+    /// other end is there, which is how the caller learns the call connected.
+    Silence = 1,
+    /// Nothing usable arrived: a two-second wait with no whole frame, or a
+    /// frame that did not authenticate, or a replay. Play nothing. Many in a
+    /// row mean the connection has stalled.
+    Nothing = 2,
+    /// The connection is gone, or the handle was closed. End the call.
+    Closed = 3,
 }
 
 /// Publish an ephemeral onion service for an outgoing call.
 ///
 /// Returns immediately, before the service is reachable — the descriptor
 /// upload takes a few seconds and overlaps the peer's polling delay. Call
-/// [`void_engine_place_call`] with the address as soon as this returns.
+/// [`void_engine_place_call`] with the address as soon as this returns, and
+/// [`void_call_host_accept`] on a background thread straight after that.
 ///
 /// # Safety
 /// `tor` must be valid. `key_dir` must be a valid, NUL-terminated UTF-8
@@ -1188,7 +1783,13 @@ pub unsafe extern "C" fn void_call_host_publish(
             .publish_call_service(std::path::Path::new(key_dir))
         {
             Ok(host) => {
-                *out = Box::into_raw(Box::new(VoidCallHost { inner: Some(host) }));
+                let address = String::from(host.onion_address());
+                let handle = std::sync::Arc::new(VoidCallHost {
+                    host: Mutex::new(Some(host)),
+                    address,
+                    cancelled: std::sync::atomic::AtomicBool::new(false),
+                });
+                *out = std::sync::Arc::into_raw(handle) as *mut VoidCallHost;
                 VoidStatus::Ok
             }
             Err(_) => VoidStatus::Offline,
@@ -1205,17 +1806,19 @@ pub unsafe extern "C" fn void_call_host_address(host: *const VoidCallHost) -> Vo
     if host.is_null() {
         return VoidBytes::empty();
     }
-    guard_bytes(|| match (*host).inner.as_ref() {
-        Some(h) => VoidBytes::from_vec(h.onion_address().as_bytes().to_vec()),
-        None => VoidBytes::empty(),
+    guard_bytes(|| {
+        let host = retain(host);
+        VoidBytes::from_vec(host.address.as_bytes().to_vec())
     })
 }
 
 /// Block until the callee connects, then hand back the media connection.
 ///
-/// Consumes the host: after this returns `Ok`, free the host handle. The
-/// platform should call this on a background thread, because it blocks for up
-/// to ninety seconds waiting for an answer.
+/// Call it on a background thread as soon as the call is placed — not once an
+/// answer has come back through the relay. The callee dials the moment they
+/// answer, and their first authenticated frame is the answer (see
+/// [`void_engine_mark_call_connected`]). Blocks for up to the caller's answer
+/// window, or until [`void_call_host_cancel`]. Can succeed once per host.
 ///
 /// # Safety
 /// `host`, `media_secret` (32 bytes), `call_id` (16 bytes), and `out` must be
@@ -1231,7 +1834,8 @@ pub unsafe extern "C" fn void_call_host_accept(
         return VoidStatus::BadArgument;
     }
     guard(|| {
-        let Some(h) = (*host).inner.take() else {
+        let handle = retain(host as *const VoidCallHost);
+        let Some(h) = handle.host.lock().ok().and_then(|mut slot| slot.take()) else {
             return VoidStatus::BadArgument;
         };
         let mut secret = [0u8; 32];
@@ -1239,19 +1843,39 @@ pub unsafe extern "C" fn void_call_host_accept(
         let mut id = [0u8; 16];
         id.copy_from_slice(std::slice::from_raw_parts(call_id, 16));
 
-        match h.accept() {
+        let status = match h.accept(&handle.cancelled) {
             Ok(socket) => {
-                let stream =
-                    void_proto::call::MediaStream::new(&secret, void_proto::call::Role::Caller, id);
-                *out = Box::into_raw(Box::new(VoidCallMedia { socket, stream }));
+                let media = VoidCallMedia::new(socket, &secret, void_proto::call::Role::Caller, id);
+                *out = std::sync::Arc::into_raw(std::sync::Arc::new(media)) as *mut VoidCallMedia;
                 VoidStatus::Ok
             }
             Err(_) => VoidStatus::Offline,
-        }
+        };
+        void_crypto::Zeroize::zeroize(&mut secret);
+        status
     })
 }
 
-/// Free a call host, unpublishing its service and deleting its keys.
+/// Stop waiting for the callee: a blocked [`void_call_host_accept`] returns
+/// `Offline` within about a tenth of a second. The caller hung up while it
+/// rang.
+///
+/// # Safety
+/// `host` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_call_host_cancel(host: *const VoidCallHost) {
+    if host.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        retain(host)
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+}
+
+/// Release a call host. Cancels a pending accept; the service is unpublished
+/// and its keys deleted once nothing is using it.
 ///
 /// # Safety
 /// `host` must have come from [`void_call_host_publish`] and must not be used
@@ -1262,7 +1886,11 @@ pub unsafe extern "C" fn void_call_host_free(host: *mut VoidCallHost) {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        drop(Box::from_raw(host));
+        let handle = std::sync::Arc::from_raw(host as *const VoidCallHost);
+        handle
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(handle);
     }));
 }
 
@@ -1297,15 +1925,16 @@ pub unsafe extern "C" fn void_call_media_connect(
         let mut id = [0u8; 16];
         id.copy_from_slice(std::slice::from_raw_parts(call_id, 16));
 
-        match (*tor).inner.connect_call(address, port) {
+        let status = match (*tor).inner.connect_call(address, port) {
             Ok(socket) => {
-                let stream =
-                    void_proto::call::MediaStream::new(&secret, void_proto::call::Role::Callee, id);
-                *out = Box::into_raw(Box::new(VoidCallMedia { socket, stream }));
+                let media = VoidCallMedia::new(socket, &secret, void_proto::call::Role::Callee, id);
+                *out = std::sync::Arc::into_raw(std::sync::Arc::new(media)) as *mut VoidCallMedia;
                 VoidStatus::Ok
             }
             Err(_) => VoidStatus::Offline,
-        }
+        };
+        void_crypto::Zeroize::zeroize(&mut secret);
+        status
     })
 }
 
@@ -1315,6 +1944,11 @@ pub unsafe extern "C" fn void_call_media_connect(
 /// [`void_call_media_payload_len`] bytes. Passing a null pointer with zero
 /// length sends a silence frame, which is what keeps the cadence constant
 /// while nobody is speaking — see `void_proto::call` on why that matters.
+///
+/// `Ok` also covers a frame dropped because the circuit is backed up: queued
+/// audio is only delay. `Offline` means the connection is gone.
+///
+/// Call it from one sending thread. It never waits on a receive.
 ///
 /// # Safety
 /// `media` must be valid. `audio` must point to `audio_len` readable bytes, or
@@ -1329,52 +1963,96 @@ pub unsafe extern "C" fn void_call_media_send(
         return VoidStatus::BadArgument;
     }
     guard(|| {
+        let media = retain(media as *const VoidCallMedia);
+        if media.is_closed() {
+            return VoidStatus::Offline;
+        }
         let frame_audio: &[u8] = if audio_len == 0 {
             &[]
         } else {
             std::slice::from_raw_parts(audio, audio_len)
         };
-        let m = &mut *media;
-        let Ok(frame) = m.stream.seal(frame_audio) else {
+        let Ok(mut sending) = media.sending.lock() else {
+            return VoidStatus::Internal;
+        };
+        let (writer, sealer) = &mut *sending;
+        let Ok(frame) = sealer.seal(frame_audio) else {
             return VoidStatus::BadArgument;
         };
-        match m.socket.send_frame(&frame) {
-            Ok(()) => VoidStatus::Ok,
-            Err(_) => VoidStatus::Offline,
+        match writer.send_frame(&frame) {
+            Ok(_sent_or_dropped) => VoidStatus::Ok,
+            Err(_) => {
+                media.close();
+                VoidStatus::Offline
+            }
         }
     })
 }
 
-/// Receive and decrypt one audio frame.
+/// Receive and decrypt one audio frame, waiting up to two seconds.
 ///
-/// Returns an empty buffer when the frame did not authenticate, was a replay,
-/// or arrived out of order — all of which the caller should treat identically,
-/// by playing nothing and moving on. An empty buffer is also what a silence
-/// frame produces, which is the same thing to a speaker.
+/// Writes audio to `out_audio` only for [`VoidMediaRecv::Audio`]; free it with
+/// [`void_free_bytes`]. Returns [`VoidMediaRecv::Closed`] once the connection
+/// is gone or [`void_call_media_close`] was called — end the call then.
 ///
-/// Blocks until a frame arrives or the call stalls, so call it on the audio
-/// thread and not the UI thread.
+/// Call it from one receiving thread. It never waits on a send.
 ///
 /// # Safety
-/// `media` must be valid. Free the result with [`void_free_bytes`].
+/// `media` must be valid and `out_audio` a valid output pointer.
 #[no_mangle]
-pub unsafe extern "C" fn void_call_media_recv(media: *mut VoidCallMedia) -> VoidBytes {
-    if media.is_null() {
-        return VoidBytes::empty();
+pub unsafe extern "C" fn void_call_media_recv(
+    media: *mut VoidCallMedia,
+    out_audio: *mut VoidBytes,
+) -> VoidMediaRecv {
+    if media.is_null() || out_audio.is_null() {
+        return VoidMediaRecv::Closed;
     }
-    guard_bytes(|| {
-        let m = &mut *media;
-        let Ok(frame) = m.socket.recv_frame() else {
-            return VoidBytes::empty();
+    *out_audio = VoidBytes::empty();
+    catch_unwind(AssertUnwindSafe(|| {
+        let media = retain(media as *const VoidCallMedia);
+        let Ok(mut receiving) = media.receiving.lock() else {
+            return VoidMediaRecv::Closed;
         };
-        match m.stream.open(&frame) {
-            Ok(audio) => VoidBytes::from_vec(audio),
-            Err(_) => VoidBytes::empty(),
+        let (reader, opener) = &mut *receiving;
+        match reader.recv_frame(&media.closed) {
+            Ok(Some(frame)) => match opener.open(&frame) {
+                Ok(audio) if audio.is_empty() => VoidMediaRecv::Silence,
+                Ok(audio) => {
+                    *out_audio = VoidBytes::from_vec(audio);
+                    VoidMediaRecv::Audio
+                }
+                // A frame that does not authenticate, or a replay: play
+                // nothing, keep listening.
+                Err(_) => VoidMediaRecv::Nothing,
+            },
+            Ok(None) => VoidMediaRecv::Nothing,
+            Err(_) => {
+                media.close();
+                VoidMediaRecv::Closed
+            }
         }
-    })
+    }))
+    .unwrap_or(VoidMediaRecv::Closed)
 }
 
-/// Close a call's media connection.
+/// Close a call's media connection: a blocked [`void_call_media_recv`] returns
+/// `Closed` within about a tenth of a second, and later sends are refused.
+/// Hang up with this, join the audio threads, then free.
+///
+/// # Safety
+/// `media` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_call_media_close(media: *const VoidCallMedia) {
+    if media.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        retain(media).close();
+    }));
+}
+
+/// Release a call's media connection. Closes it first; the connection and its
+/// keys are dropped once nothing is using them.
 ///
 /// # Safety
 /// `media` must have come from [`void_call_host_accept`] or
@@ -1385,7 +2063,9 @@ pub unsafe extern "C" fn void_call_media_free(media: *mut VoidCallMedia) {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        drop(Box::from_raw(media));
+        let media = std::sync::Arc::from_raw(media as *const VoidCallMedia);
+        media.close();
+        drop(media);
     }));
 }
 
@@ -1424,7 +2104,9 @@ pub extern "C" fn void_call_disclosure() -> VoidBytes {
 /// Place a call to a contact whose onion service is already publishing.
 ///
 /// Writes the call id (16 bytes) and media secret (32 bytes) the platform
-/// needs to open the media connection once the peer answers.
+/// needs for [`void_call_host_accept`]. `now` is in seconds: the offer carries
+/// it, so an offer that reaches the callee too late to be live is shown as
+/// missed instead of ringing.
 ///
 /// # Safety
 /// `engine` must be valid. `fingerprint` must point to 32 readable bytes,
@@ -1436,6 +2118,7 @@ pub unsafe extern "C" fn void_engine_place_call(
     fingerprint: *const u8,
     onion_address: *const c_char,
     port: u16,
+    now: u64,
     out_call_id: *mut u8,
     out_media_secret: *mut u8,
 ) -> VoidStatus {
@@ -1447,6 +2130,9 @@ pub unsafe extern "C" fn void_engine_place_call(
     {
         return VoidStatus::BadArgument;
     }
+    if !plausible_seconds(now) {
+        return VoidStatus::BadArgument;
+    }
     guard(|| {
         let Ok(address) = CStr::from_ptr(onion_address).to_str() else {
             return VoidStatus::BadArgument;
@@ -1456,14 +2142,41 @@ pub unsafe extern "C" fn void_engine_place_call(
         let Ok(mut engine_guard) = (*engine).inner.lock() else {
             return VoidStatus::Internal;
         };
-        match engine_guard.place_call(&fp, address, port) {
+        match engine_guard.place_call(&fp, address, port, now) {
             Ok(call) => {
                 std::ptr::copy_nonoverlapping(call.call_id.as_ptr(), out_call_id, 16);
                 std::ptr::copy_nonoverlapping(call.media_secret.as_ptr(), out_media_secret, 32);
                 VoidStatus::Ok
             }
-            Err(void_client::ClientError::ContactKeyChanged) => VoidStatus::KeyChanged,
-            Err(_) => VoidStatus::Failed,
+            Err(e) => client_status(e),
+        }
+    })
+}
+
+/// The caller's side has seen the callee's first authenticated media frame
+/// ([`VoidMediaRecv::Audio`] or [`VoidMediaRecv::Silence`]): the call is
+/// answered. Stops the ring timer without waiting for the relayed answer.
+///
+/// # Safety
+/// `engine` must be valid and `fingerprint` must point to 32 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_mark_call_connected(
+    engine: *mut VoidEngine,
+    fingerprint: *const u8,
+) -> VoidStatus {
+    if engine.is_null() || fingerprint.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(std::slice::from_raw_parts(fingerprint, 32));
+        let Ok(mut engine_guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        if engine_guard.mark_call_connected(&fp) {
+            VoidStatus::Ok
+        } else {
+            VoidStatus::Failed
         }
     })
 }
@@ -1505,8 +2218,7 @@ pub unsafe extern "C" fn void_engine_answer_call(
                 *out_port = call.port;
                 VoidStatus::Ok
             }
-            Err(void_client::ClientError::ContactKeyChanged) => VoidStatus::KeyChanged,
-            Err(_) => VoidStatus::Failed,
+            Err(e) => client_status(e),
         }
     })
 }
@@ -1532,7 +2244,7 @@ pub unsafe extern "C" fn void_engine_end_call(
         };
         match engine_guard.end_call(&fp, reason.to_proto()) {
             Ok(()) => VoidStatus::Ok,
-            Err(_) => VoidStatus::Failed,
+            Err(e) => client_status(e),
         }
     })
 }
@@ -1542,7 +2254,7 @@ pub unsafe extern "C" fn void_engine_end_call(
 /// Layout, repeated per event:
 ///
 /// ```text
-///   u8(kind)              1 = incoming, 2 = answered, 3 = ended
+///   u8(kind)              1 = incoming, 2 = answered, 3 = ended, 4 = missed
 ///   raw(fingerprint : 32)
 ///   raw(call_id : 16)
 ///   u8(end_reason)        0 unless kind == 3
@@ -1550,6 +2262,9 @@ pub unsafe extern "C" fn void_engine_end_call(
 ///   raw(address)          empty unless kind == 1
 ///   u16 LE(port)          0 unless kind == 1
 /// ```
+///
+/// "Missed" is a call that never rang here: it arrived too late to be live,
+/// or this device was already on a call. Show it in the conversation.
 ///
 /// The media secret is deliberately **not** in this encoding. It is fetched
 /// separately by answering, so that a routine event poll never copies key
@@ -1566,44 +2281,57 @@ pub unsafe extern "C" fn void_engine_take_call_events(engine: *mut VoidEngine) -
         let Ok(mut engine_guard) = (*engine).inner.lock() else {
             return VoidBytes::empty();
         };
-        let events = engine_guard.take_call_events();
-        let mut out = Vec::new();
-        for event in events {
-            match event {
-                void_client::engine::CallEvent::Incoming(call) => {
-                    out.push(1u8);
-                    out.extend_from_slice(&call.peer);
-                    out.extend_from_slice(&call.call_id);
-                    out.push(0);
-                    let addr = call.onion_address.as_bytes();
-                    out.extend_from_slice(&(addr.len() as u32).to_le_bytes());
-                    out.extend_from_slice(addr);
-                    out.extend_from_slice(&call.port.to_le_bytes());
-                }
-                void_client::engine::CallEvent::Answered(call) => {
-                    out.push(2u8);
-                    out.extend_from_slice(&call.peer);
-                    out.extend_from_slice(&call.call_id);
-                    out.push(0);
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                    out.extend_from_slice(&0u16.to_le_bytes());
-                }
-                void_client::engine::CallEvent::Ended {
-                    contact_fingerprint,
-                    call_id,
-                    reason,
-                } => {
-                    out.push(3u8);
-                    out.extend_from_slice(&contact_fingerprint);
-                    out.extend_from_slice(&call_id);
-                    out.push(VoidCallEndReason::from_proto(reason));
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                    out.extend_from_slice(&0u16.to_le_bytes());
-                }
-            }
-        }
-        VoidBytes::from_vec(out)
+        VoidBytes::from_vec(encode_call_events(&engine_guard.take_call_events()))
     })
+}
+
+fn encode_call_events(events: &[void_client::engine::CallEvent]) -> Vec<u8> {
+    use void_client::engine::CallEvent;
+    let mut out = Vec::new();
+    for event in events {
+        let (kind, peer, call_id, reason, address, port): (
+            u8,
+            &[u8; 32],
+            &[u8; 16],
+            u8,
+            &[u8],
+            u16,
+        ) = match event {
+            CallEvent::Incoming(call) => (
+                1,
+                &call.peer,
+                &call.call_id,
+                0,
+                call.onion_address.as_bytes(),
+                call.port,
+            ),
+            CallEvent::Answered(call) => (2, &call.peer, &call.call_id, 0, &[], 0),
+            CallEvent::Ended {
+                contact_fingerprint,
+                call_id,
+                reason,
+            } => (
+                3,
+                contact_fingerprint,
+                call_id,
+                VoidCallEndReason::from_proto(*reason),
+                &[],
+                0,
+            ),
+            CallEvent::Missed {
+                contact_fingerprint,
+                call_id,
+            } => (4, contact_fingerprint, call_id, 0, &[], 0),
+        };
+        out.push(kind);
+        out.extend_from_slice(peer);
+        out.extend_from_slice(call_id);
+        out.push(reason);
+        out.extend_from_slice(&(address.len() as u32).to_le_bytes());
+        out.extend_from_slice(address);
+        out.extend_from_slice(&port.to_le_bytes());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1620,6 +2348,125 @@ mod tests {
             // Freeing null must be a no-op, not a crash.
             void_engine_free(std::ptr::null_mut());
         }
+    }
+
+    /// A fresh data directory for one test, removed by the caller.
+    fn temp_data_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("void-ffi-open-test-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    unsafe fn open(dir: &std::path::Path, kek: &[u8; 32]) -> (VoidStatus, *mut VoidEngine) {
+        let dir_c = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let mut engine: *mut VoidEngine = std::ptr::null_mut();
+        let status = void_engine_open(
+            dir_c.as_ptr(),
+            kek.as_ptr(),
+            VoidVaultBacking::Software,
+            0,
+            &mut engine,
+        );
+        (status, engine)
+    }
+
+    #[test]
+    fn an_engine_opened_twice_with_the_same_key_keeps_its_identity() {
+        // The apps used to call void_engine_new at every launch, so every
+        // launch was a new identity and every contact was gone.
+        let dir = temp_data_dir("same-key");
+        let kek = [42u8; 32];
+        unsafe {
+            let (status, first) = open(&dir, &kek);
+            assert_eq!(status, VoidStatus::Ok);
+            let fingerprint = (*first).inner.lock().unwrap().fingerprint();
+            assert!((*first).inner.lock().unwrap().is_persisted());
+            void_engine_free(first);
+
+            let (status, second) = open(&dir, &kek);
+            assert_eq!(status, VoidStatus::Ok);
+            assert_eq!(
+                (*second).inner.lock().unwrap().fingerprint(),
+                fingerprint,
+                "reopening must restore the same identity, not generate a new one"
+            );
+            void_engine_free(second);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wrong_key_reports_locked_and_replaces_nothing() {
+        let dir = temp_data_dir("wrong-key");
+        unsafe {
+            let (status, first) = open(&dir, &[1u8; 32]);
+            assert_eq!(status, VoidStatus::Ok);
+            let fingerprint = (*first).inner.lock().unwrap().fingerprint();
+            void_engine_free(first);
+
+            let (status, engine) = open(&dir, &[2u8; 32]);
+            assert_eq!(status, VoidStatus::Locked);
+            assert!(engine.is_null());
+
+            // Nothing was overwritten: the right key still opens the original.
+            let (status, again) = open(&dir, &[1u8; 32]);
+            assert_eq!(status, VoidStatus::Ok);
+            assert_eq!((*again).inner.lock().unwrap().fingerprint(), fingerprint);
+            void_engine_free(again);
+
+            let mut out: *mut VoidEngine = std::ptr::null_mut();
+            assert_eq!(
+                void_engine_open(
+                    std::ptr::null(),
+                    [0u8; 32].as_ptr(),
+                    VoidVaultBacking::Software,
+                    0,
+                    &mut out
+                ),
+                VoidStatus::BadArgument
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_message_encoding_matches_its_documented_layout() {
+        use void_store::model::{DeliveryState, Direction, StoredMessage};
+        let encoded = encode_stored_messages(&[
+            StoredMessage {
+                contact_fingerprint: [1u8; 32],
+                direction: Direction::Outgoing,
+                timestamp: 1_700_000_000,
+                body: "sent".to_string(),
+                delivery: DeliveryState::Deposited,
+            },
+            StoredMessage {
+                contact_fingerprint: [1u8; 32],
+                direction: Direction::Incoming,
+                timestamp: 1_700_000_060,
+                body: "got".to_string(),
+                delivery: DeliveryState::Received,
+            },
+        ]);
+        let mut pos = 0;
+        let mut decoded = Vec::new();
+        while pos < encoded.len() {
+            let direction = encoded[pos];
+            let delivery = encoded[pos + 1];
+            let timestamp = u64::from_le_bytes(encoded[pos + 2..pos + 10].try_into().unwrap());
+            let len = u32::from_le_bytes(encoded[pos + 10..pos + 14].try_into().unwrap()) as usize;
+            let text = std::str::from_utf8(&encoded[pos + 14..pos + 14 + len]).unwrap();
+            decoded.push((direction, delivery, timestamp, text.to_string()));
+            pos += 14 + len;
+        }
+        assert_eq!(
+            decoded,
+            vec![
+                (1, 1, 1_700_000_000, "sent".to_string()),
+                (2, 4, 1_700_000_060, "got".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1739,6 +2586,8 @@ mod tests {
                     0,
                     std::ptr::null(),
                     0,
+                    std::ptr::null(),
+                    0,
                     0,
                     0,
                     std::ptr::null_mut(),
@@ -1746,6 +2595,13 @@ mod tests {
                 ),
                 VoidStatus::BadArgument
             );
+            assert_eq!(
+                void_engine_cancel_invite(std::ptr::null_mut(), std::ptr::null()),
+                VoidStatus::BadArgument
+            );
+            assert!(void_engine_take_contact_events(std::ptr::null_mut())
+                .data
+                .is_null());
             assert_eq!(
                 void_engine_send(
                     std::ptr::null_mut(),
@@ -1761,7 +2617,6 @@ mod tests {
                 void_engine_mark_verified(std::ptr::null_mut(), std::ptr::null()),
                 VoidStatus::BadArgument
             );
-            void_queue_secret_free(std::ptr::null_mut());
         }
     }
 
@@ -1796,6 +2651,60 @@ mod tests {
         assert_eq!(decoded[1], (vec![9u8; 32], String::new()));
     }
 
+    /// One decoded contact event: (kind, invite id, fingerprint, name, first
+    /// message).
+    type DecodedContactEvent = (u8, [u8; 16], [u8; 32], String, String);
+
+    /// Decode [`void_engine_take_contact_events`]'s layout the way Swift and
+    /// Kotlin do.
+    fn decode_contact_events(b: &[u8]) -> Vec<DecodedContactEvent> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 1 + 16 + 32 + 2 <= b.len() {
+            let kind = b[pos];
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&b[pos + 1..pos + 17]);
+            let mut fp = [0u8; 32];
+            fp.copy_from_slice(&b[pos + 17..pos + 49]);
+            pos += 49;
+            let name_len = u16::from_le_bytes([b[pos], b[pos + 1]]) as usize;
+            pos += 2;
+            let name = String::from_utf8(b[pos..pos + name_len].to_vec()).unwrap();
+            pos += name_len;
+            let msg_len = u32::from_le_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let msg = String::from_utf8(b[pos..pos + msg_len].to_vec()).unwrap();
+            pos += msg_len;
+            out.push((kind, id, fp, name, msg));
+        }
+        assert_eq!(pos, b.len(), "the layout must account for every byte");
+        out
+    }
+
+    #[test]
+    fn contact_event_encoding_matches_its_documented_layout() {
+        use void_client::engine::ContactEvent;
+        let encoded = encode_contact_events(&[
+            ContactEvent::Added {
+                invite_id: [1u8; 16],
+                contact_fingerprint: [2u8; 32],
+                name: "Ada".to_string(),
+                first_message: "hi".to_string(),
+            },
+            ContactEvent::InviteExpired {
+                invite_id: [3u8; 16],
+            },
+        ]);
+        let decoded = decode_contact_events(&encoded);
+        assert_eq!(
+            decoded,
+            vec![
+                (1, [1u8; 16], [2u8; 32], "Ada".to_string(), "hi".to_string()),
+                (2, [3u8; 16], [0u8; 32], String::new(), String::new()),
+            ]
+        );
+    }
+
     #[test]
     fn a_full_conversation_works_end_to_end_across_the_ffi_boundary() {
         // Two real engines, wired to each other's transport by a shared
@@ -1804,7 +2713,11 @@ mod tests {
         // field since void-ffi has no public "attach a test transport" hook
         // (only void_engine_attach_tor, which needs real Tor). Everything
         // from here on goes through the C ABI, exactly as Swift would call
-        // it: invite creation, polling, acceptance, sending, and ticking.
+        // it: invite creation, ticking both sides, draining contact events.
+        //
+        // Both engines tick on the same schedule throughout, as two phones
+        // would, so the inviter is collecting while the handshake is still
+        // arriving — the order the apps actually produce.
         use std::sync::{Arc, Mutex};
         use void_client::engine::{Engine, SecurityMode};
         use void_client::transport::MemoryTransport;
@@ -1844,114 +2757,410 @@ mod tests {
         }));
 
         unsafe {
+            let now_secs = 1_000_000u64;
             let relay_hint = b"relay.onion";
+            let my_label = b"Bob";
+            let contact_label = b"Alice";
             let mut link = VoidBytes::empty();
-            let mut queue: *mut VoidQueueSecret = std::ptr::null_mut();
+            let mut invite_id = [0u8; 16];
             assert_eq!(
                 void_engine_create_invite(
                     bob,
                     relay_hint.as_ptr(),
                     relay_hint.len(),
-                    std::ptr::null(),
-                    0,
-                    1_000_000,
+                    my_label.as_ptr(),
+                    my_label.len(),
+                    contact_label.as_ptr(),
+                    contact_label.len(),
+                    now_secs,
                     3600,
                     &mut link,
-                    &mut queue,
+                    invite_id.as_mut_ptr(),
                 ),
                 VoidStatus::Ok
             );
-            assert!(!queue.is_null());
             let link_str = std::str::from_utf8(std::slice::from_raw_parts(link.data, link.len))
                 .unwrap()
                 .to_string();
             void_free_bytes(link);
 
+            assert!(link_str.len() < 150, "one QR code: {link_str}");
             let link_c = std::ffi::CString::new(link_str).unwrap();
-            let name_c = std::ffi::CString::new("Bob").unwrap();
+            let mut fetch_id = [0u8; 16];
+            assert_eq!(
+                void_engine_open_invite(alice, link_c.as_ptr(), now_secs, fetch_id.as_mut_ptr()),
+                VoidStatus::Ok
+            );
+
+            // Both phones tick: Bob parks the invitation, Alice collects it.
+            let tick_both = |t_ms: u64| {
+                for engine in [alice, bob] {
+                    let mut outcome = VoidTickOutcome::Waiting;
+                    let mut msgs = VoidBytes::empty();
+                    assert_eq!(
+                        void_engine_tick(engine, t_ms, &mut outcome, &mut msgs),
+                        VoidStatus::Ok
+                    );
+                    void_free_bytes(msgs);
+                }
+            };
+            let mut t_ms = now_secs * 1000;
+            let mut ready = Vec::new();
+            for _ in 0..200u64 {
+                tick_both(t_ms);
+                let events = void_engine_take_contact_events(alice);
+                if events.len > 0 {
+                    ready =
+                        decode_contact_events(std::slice::from_raw_parts(events.data, events.len));
+                }
+                void_free_bytes(events);
+                if !ready.is_empty() {
+                    break;
+                }
+                t_ms += 5000;
+            }
+            assert_eq!(ready.len(), 1, "alice must be told the invitation is ready");
+            let (kind, id, inviter_fp, inviter_label, _) = ready.remove(0);
+            assert_eq!(kind, 3);
+            assert_eq!(id, fetch_id);
+            assert_eq!(inviter_label, "Bob");
+            assert_eq!(inviter_fp, (*bob).inner.lock().unwrap().fingerprint());
+
+            let empty_name = std::ffi::CString::new("").unwrap();
             let msg_c = std::ffi::CString::new("hello across the boundary").unwrap();
-            let mut alice_fp = [0u8; 32];
+            let mut bob_fp = [0u8; 32];
             assert_eq!(
-                void_engine_start_conversation(
+                void_engine_confirm_invite(
                     alice,
-                    link_c.as_ptr(),
-                    name_c.as_ptr(),
+                    fetch_id.as_ptr(),
+                    empty_name.as_ptr(),
                     msg_c.as_ptr(),
-                    1_000_000,
-                    alice_fp.as_mut_ptr(),
+                    t_ms / 1000,
+                    bob_fp.as_mut_ptr(),
                 ),
                 VoidStatus::Ok
             );
-
-            // Drain alice's outbox so the handshake actually reaches the relay.
-            let mut t = 1_000_000u64;
-            for _ in 0..40u64 {
-                let mut outcome = VoidTickOutcome::Waiting;
-                let mut msgs = VoidBytes::empty();
-                void_engine_tick(alice, t, &mut outcome, &mut msgs);
-                t += 5000;
-                if (*alice).inner.lock().unwrap().outbox_len() == 0 {
-                    break;
-                }
-            }
-            // A few more ticks so the deposit definitely lands.
-            for _ in 0..3u64 {
-                let mut outcome = VoidTickOutcome::Waiting;
-                let mut msgs = VoidBytes::empty();
-                void_engine_tick(alice, t, &mut outcome, &mut msgs);
-                t += 5000;
-            }
-
-            let mut initial = VoidBytes::empty();
-            let mut got_it = false;
-            for _ in 0..10 {
-                assert_eq!(
-                    void_engine_poll_intro_queue(bob, queue, &mut initial),
-                    VoidStatus::Ok
-                );
-                if initial.len > 0 {
-                    got_it = true;
-                    break;
-                }
-            }
-            assert!(got_it, "bob must receive the handshake");
-
-            let mut bob_alice_fp = [0u8; 32];
-            let mut first_message = VoidBytes::empty();
+            // Confirming it a second time finds nothing: it was used.
+            let mut again = [0u8; 32];
             assert_eq!(
-                void_engine_accept_conversation(
-                    bob,
-                    queue,
-                    initial.data,
-                    initial.len,
-                    1_000_000,
-                    bob_alice_fp.as_mut_ptr(),
-                    &mut first_message,
+                void_engine_confirm_invite(
+                    alice,
+                    fetch_id.as_ptr(),
+                    empty_name.as_ptr(),
+                    msg_c.as_ptr(),
+                    t_ms / 1000,
+                    again.as_mut_ptr(),
                 ),
-                VoidStatus::Ok
+                VoidStatus::Failed
             );
-            // `alice_fp` (from start_conversation) is bob's fingerprint as
-            // alice sees it; `bob_alice_fp` (from accept_conversation) is
-            // alice's fingerprint as bob sees it — two different identities.
-            // What must actually match is bob's view of alice against
-            // alice's own engine.
-            assert_eq!(bob_alice_fp, (*alice).inner.lock().unwrap().fingerprint());
-            let first_text = std::str::from_utf8(std::slice::from_raw_parts(
-                first_message.data,
-                first_message.len,
-            ))
-            .unwrap();
-            assert_eq!(first_text, "hello across the boundary");
-            void_free_bytes(first_message);
-            void_free_bytes(initial);
+
+            let mut added = Vec::new();
+            for _ in 0..400u64 {
+                for engine in [alice, bob] {
+                    let mut outcome = VoidTickOutcome::Waiting;
+                    let mut msgs = VoidBytes::empty();
+                    assert_eq!(
+                        void_engine_tick(engine, t_ms, &mut outcome, &mut msgs),
+                        VoidStatus::Ok
+                    );
+                    void_free_bytes(msgs);
+                }
+                let events = void_engine_take_contact_events(bob);
+                if events.len > 0 {
+                    added =
+                        decode_contact_events(std::slice::from_raw_parts(events.data, events.len));
+                }
+                void_free_bytes(events);
+                if !added.is_empty() {
+                    break;
+                }
+                t_ms += 5000;
+            }
+            assert_eq!(added.len(), 1, "bob must report exactly one new contact");
+            let (kind, id, alice_fp, name, first) = added.remove(0);
+            assert_eq!(kind, 1);
+            assert_eq!(id, invite_id);
+            assert_eq!(alice_fp, (*alice).inner.lock().unwrap().fingerprint());
+            assert_eq!(bob_fp, inviter_fp);
+            assert_eq!(name, "Alice");
+            assert_eq!(first, "hello across the boundary");
 
             let contacts = void_engine_contacts(bob);
             assert!(contacts.len > 0, "bob must now have alice as a contact");
             void_free_bytes(contacts);
 
-            void_queue_secret_free(queue);
+            // Consumed: cancelling it now finds nothing.
+            assert_eq!(
+                void_engine_cancel_invite(bob, invite_id.as_ptr()),
+                VoidStatus::Failed
+            );
+
             void_engine_free(alice);
             void_engine_free(bob);
+        }
+    }
+
+    #[test]
+    fn an_invitations_status_and_link_cross_the_boundary() {
+        let relay = b"relay.onion:9443";
+        let mut engine: *mut VoidEngine = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(void_engine_new(&mut engine), VoidStatus::Ok);
+            let mut link = VoidBytes::empty();
+            let mut id = [0u8; 16];
+            assert_eq!(
+                void_engine_create_invite(
+                    engine,
+                    relay.as_ptr(),
+                    relay.len(),
+                    b"Bob".as_ptr(),
+                    3,
+                    std::ptr::null(),
+                    0,
+                    1_000,
+                    86_400,
+                    &mut link,
+                    id.as_mut_ptr(),
+                ),
+                VoidStatus::Ok
+            );
+            let made = std::slice::from_raw_parts(link.data, link.len).to_vec();
+            void_free_bytes(link);
+            // Nothing is parked yet: this engine has no transport, so every
+            // record of the invitation is still waiting to go out.
+            assert!(void_engine_invite_status(engine, id.as_ptr()) > 0);
+            let shown = void_engine_invite_link(engine, id.as_ptr());
+            assert_eq!(std::slice::from_raw_parts(shown.data, shown.len), &made[..]);
+            void_free_bytes(shown);
+
+            assert_eq!(
+                void_engine_cancel_invite(engine, id.as_ptr()),
+                VoidStatus::Ok
+            );
+            assert_eq!(void_engine_invite_status(engine, id.as_ptr()), -1);
+            assert!(void_engine_invite_link(engine, id.as_ptr()).data.is_null());
+
+            // The name on invitations is stored with the rest of the settings.
+            let name = std::ffi::CString::new("Bob").unwrap();
+            assert_eq!(
+                void_engine_set_invite_name(engine, name.as_ptr()),
+                VoidStatus::Ok
+            );
+            let got = void_engine_invite_name(engine);
+            assert_eq!(std::slice::from_raw_parts(got.data, got.len), b"Bob");
+            void_free_bytes(got);
+            assert!(!void_engine_protection_acknowledged(engine));
+            assert_eq!(void_engine_acknowledge_protection(engine), VoidStatus::Ok);
+            assert!(void_engine_protection_acknowledged(engine));
+            void_engine_free(engine);
+        }
+    }
+
+    #[test]
+    fn call_handles_survive_being_freed_mid_call_and_refuse_null() {
+        unsafe {
+            // Null handles produce errors, never crashes, on every call entry.
+            let mut out = VoidBytes::empty();
+            assert_eq!(
+                void_call_media_recv(std::ptr::null_mut(), &mut out),
+                VoidMediaRecv::Closed
+            );
+            assert_eq!(
+                void_call_media_send(std::ptr::null_mut(), std::ptr::null(), 0),
+                VoidStatus::BadArgument
+            );
+            void_call_media_close(std::ptr::null());
+            void_call_media_free(std::ptr::null_mut());
+            void_call_host_cancel(std::ptr::null());
+            void_call_host_free(std::ptr::null_mut());
+            let mut media: *mut VoidCallMedia = std::ptr::null_mut();
+            assert_eq!(
+                void_call_host_accept(
+                    std::ptr::null_mut(),
+                    [0u8; 32].as_ptr(),
+                    [0u8; 16].as_ptr(),
+                    &mut media
+                ),
+                VoidStatus::BadArgument
+            );
+            assert_eq!(
+                void_engine_mark_call_connected(std::ptr::null_mut(), [0u8; 32].as_ptr()),
+                VoidStatus::BadArgument
+            );
+        }
+
+        // The reference-counting contract, without a network: a handle freed
+        // by one thread while another still holds a reference keeps the object
+        // alive for the holder. `retain` is what every media entry point does
+        // first.
+        let host = std::sync::Arc::new(VoidCallHost {
+            host: Mutex::new(None),
+            address: String::from("x.onion"),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let raw = std::sync::Arc::into_raw(host) as *mut VoidCallHost;
+        unsafe {
+            let held = retain(raw as *const VoidCallHost);
+            void_call_host_cancel(raw);
+            assert!(held.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+            void_call_host_free(raw);
+            // Freed by the platform — still alive for the call in flight.
+            assert_eq!(held.address, "x.onion");
+            assert_eq!(std::sync::Arc::strong_count(&held), 1);
+        }
+    }
+
+    #[test]
+    fn a_call_handle_freed_while_many_threads_use_it_lives_until_the_last_one_is_done() {
+        // What a call does to its handles: a sending thread, a receiving
+        // thread, and the UI thread hanging up and freeing, all at once. Each
+        // entry point takes its own reference first (`retain`), so the
+        // platform's free must leave every in-flight use a live object, and the
+        // object must be released exactly once, after the last of them.
+        // Fewer under Miri, which checks every access and runs far slower.
+        const THREADS: usize = if cfg!(miri) { 4 } else { 16 };
+        const ROUNDS: usize = if cfg!(miri) { 10 } else { 2_000 };
+        let host = std::sync::Arc::new(VoidCallHost {
+            host: Mutex::new(None),
+            address: String::from("x.onion"),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let watch = std::sync::Arc::downgrade(&host);
+        /// The handle as the platform holds it, carried to other threads the
+        /// way a platform does — as a pointer, not an integer, so Miri can
+        /// follow it.
+        #[derive(Clone, Copy)]
+        struct Handle(*const VoidCallHost);
+        // Safety: the object behind it is shared by reference counting, which
+        // is exactly what this test checks.
+        unsafe impl Send for Handle {}
+        let raw = Handle(std::sync::Arc::into_raw(host));
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(THREADS + 1));
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let ready = std::sync::Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    let raw = raw;
+                    // In flight before the platform frees: this is the
+                    // reference the entry point it is inside of would hold.
+                    let held = unsafe { retain(raw.0) };
+                    ready.wait();
+                    for _ in 0..ROUNDS {
+                        let again = std::sync::Arc::clone(&held);
+                        assert_eq!(again.address, "x.onion");
+                        again
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        // An accept on a host whose service is already taken
+                        // refuses, and never blocks.
+                        assert!(again.host.lock().unwrap().is_none());
+                    }
+                })
+            })
+            .collect();
+
+        ready.wait();
+        // The UI thread hangs up while every worker is mid-call.
+        unsafe { void_call_host_free(raw.0.cast_mut()) };
+        assert!(
+            watch.upgrade().is_some() || workers.iter().all(|w| w.is_finished()),
+            "freed while in use"
+        );
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            watch.upgrade().is_none(),
+            "released once the last user was done, and not leaked"
+        );
+    }
+
+    #[test]
+    fn call_events_encode_to_their_documented_layout() {
+        use void_client::engine::CallEvent;
+        let encoded = encode_call_events(&[
+            CallEvent::Missed {
+                contact_fingerprint: [7u8; 32],
+                call_id: [9u8; 16],
+            },
+            CallEvent::Ended {
+                contact_fingerprint: [1u8; 32],
+                call_id: [2u8; 16],
+                reason: void_proto::call::EndReason::Busy,
+            },
+        ]);
+        // Every event without an address is exactly the fixed 56 bytes Swift
+        // and Kotlin parse: kind, fingerprint, call id, reason, u32 address
+        // length, u16 port.
+        assert_eq!(encoded.len(), 2 * 56);
+        let (missed, ended) = encoded.split_at(56);
+        assert_eq!(missed[0], 4);
+        assert_eq!(&missed[1..33], &[7u8; 32]);
+        assert_eq!(&missed[33..49], &[9u8; 16]);
+        assert_eq!(missed[49], 0);
+        assert_eq!(ended[0], 3);
+        assert_eq!(ended[49], 5, "busy");
+        assert_eq!(&ended[50..56], &[0u8; 6]);
+    }
+
+    #[test]
+    fn a_millisecond_timestamp_is_rejected_not_misread() {
+        // The Android app passed milliseconds where seconds belong, and its
+        // invitations expired 3.6 seconds after they were made. A value that
+        // large is now refused at the boundary instead of misread.
+        let now_ms = 1_759_000_000_000u64;
+        let relay = b"relay.onion:9443";
+        let mut engine: *mut VoidEngine = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(void_engine_new(&mut engine), VoidStatus::Ok);
+            let mut link = VoidBytes::empty();
+            let mut id = [0u8; 16];
+            assert_eq!(
+                void_engine_create_invite(
+                    engine,
+                    relay.as_ptr(),
+                    relay.len(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    now_ms,
+                    86_400,
+                    &mut link,
+                    id.as_mut_ptr(),
+                ),
+                VoidStatus::BadArgument
+            );
+            assert!(link.data.is_null());
+
+            // The same instant in seconds is fine.
+            assert_eq!(
+                void_engine_create_invite(
+                    engine,
+                    relay.as_ptr(),
+                    relay.len(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    now_ms / 1000,
+                    86_400,
+                    &mut link,
+                    id.as_mut_ptr(),
+                ),
+                VoidStatus::Ok
+            );
+            void_free_bytes(link);
+
+            let fp = [0u8; 32];
+            let text = std::ffi::CString::new("x").unwrap();
+            let mut message_id = 0u64;
+            assert_eq!(
+                void_engine_send(engine, fp.as_ptr(), text.as_ptr(), now_ms, &mut message_id),
+                VoidStatus::BadArgument
+            );
+            void_engine_free(engine);
         }
     }
 

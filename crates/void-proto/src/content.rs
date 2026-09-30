@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn call_signals_roundtrip() {
-        let offer = CallOffer::new("abc.onion", 9999).unwrap();
+        let offer = CallOffer::new("abc.onion", 9999, 1_700_000_000).unwrap();
         let c = Content::Call(CallSignal::Offer(offer));
         assert_eq!(Content::decode(&c.encode()).unwrap(), c);
 
@@ -116,7 +116,7 @@ mod tests {
     fn a_call_signal_is_never_mistaken_for_text() {
         // The failure this framing exists to prevent: signalling bytes shown
         // to a user as a message from their contact.
-        let offer = CallOffer::new("abc.onion", 1).unwrap();
+        let offer = CallOffer::new("abc.onion", 1, 1_700_000_000).unwrap();
         let encoded = Content::Call(CallSignal::Offer(offer)).encode();
         match Content::decode(&encoded).unwrap() {
             Content::Call(_) => {}

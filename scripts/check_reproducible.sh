@@ -34,9 +34,30 @@ if [ "$FIRST" != "$SECOND" ]; then
   exit 1
 fi
 
+# The apps link the core built with the `mobile` profile (it unwinds on panic;
+# see Cargo.toml), so that is the artifact that actually ships and the one
+# that has to reproduce.
+echo "Building the core twice with the mobile profile…"
+cargo build --profile mobile -p void-crypto -p void-proto -p void-store -p void-client >/dev/null 2>&1
+MOBILE_FIRST=$(find target/mobile -maxdepth 1 -name 'libvoid_*.rlib' -print0 \
+  | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+touch crates/void-crypto/src/lib.rs
+cargo build --profile mobile -p void-crypto -p void-proto -p void-store -p void-client >/dev/null 2>&1
+MOBILE_SECOND=$(find target/mobile -maxdepth 1 -name 'libvoid_*.rlib' -print0 \
+  | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+
+echo "  first:  $MOBILE_FIRST"
+echo "  second: $MOBILE_SECOND"
+
+if [ "$MOBILE_FIRST" != "$MOBILE_SECOND" ]; then
+  echo "FAIL: the core did not build reproducibly with the mobile profile."
+  exit 1
+fi
+
 echo "  ok — reproducible"
 echo
-echo "Core artifact hash: $FIRST"
+echo "Core artifact hash (release): $FIRST"
+echo "Core artifact hash (mobile):  $MOBILE_FIRST"
 echo "NFR-SEC-05: this hash must be logged to the public transparency log."
 echo "NOTE: this covers the Rust core only. The App Store binary is re-signed"
 echo "      and re-encrypted by Apple and provably will not match. See PRD §8.1."

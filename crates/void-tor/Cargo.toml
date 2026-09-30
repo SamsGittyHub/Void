@@ -24,6 +24,10 @@ arti-client = { version = "0.45", default-features = false, features = ["tokio",
 tor-rtcompat = { version = "0.45", features = ["tokio"] }
 tor-hsservice = "0.45"
 tor-cell = "0.45"
+# Already in the graph through arti-client, at this version. Named directly
+# only for `IncomingStreamRequest`, so a call's onion service can accept its
+# one port and refuse the rest the way every other service does.
+tor-proto = "0.45"
 safelog = "0.9"
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"] }

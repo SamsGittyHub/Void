@@ -5275,6 +5275,7 @@ dependencies = [
  "tokio",
  "tor-cell",
  "tor-hsservice",
+ "tor-proto",
  "tor-rtcompat",
  "void-client",
  "void-crypto",

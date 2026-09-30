@@ -198,6 +198,21 @@ impl Scheduler {
         }
     }
 
+    /// Make the next emission slot a retrieval, instead of waiting out the
+    /// jittered delay.
+    ///
+    /// For collecting a short invitation the user just opened. The slot is
+    /// still a slot: nothing is emitted off the grid (D-014), only the choice
+    /// of which frame fills the next one changes. The jitter exists so a relay
+    /// cannot pair a deposit with the collection that followed it; this
+    /// collection follows the user's own tap, and the deposit it collects was
+    /// made by someone else at some earlier time, so there is no pairing for
+    /// jitter to hide. Retrievals after this one go back to the jittered
+    /// schedule.
+    pub fn request_retrieval_next_slot(&mut self) {
+        self.next_retrieve_ms = 0;
+    }
+
     /// How many payload records have been emitted.
     #[must_use]
     pub fn payload_count(&self) -> u64 {
@@ -262,6 +277,38 @@ mod tests {
             busy.len() >= 11,
             "expected ~12 frames in 60s, got {}",
             busy.len()
+        );
+    }
+
+    #[test]
+    fn an_expedited_retrieval_still_lands_on_the_grid() {
+        let mut s = Scheduler::new(0).unwrap();
+        s.set_connected(true, 0);
+        // Run until a retrieval has happened, so the next one is a full jitter
+        // away, then ask for it early.
+        let mut t = 0u64;
+        while s.poll(t, false).unwrap() != Action::Retrieve {
+            t += PAD_INTERVAL_MS;
+        }
+        t += PAD_INTERVAL_MS;
+        s.request_retrieval_next_slot();
+        let mut first_frame = None;
+        while first_frame.is_none() {
+            match s.poll(t, true).unwrap() {
+                Action::Wait(_) => t += 1,
+                action => first_frame = Some((t, action)),
+            }
+        }
+        let (at, action) = first_frame.unwrap();
+        assert_eq!(
+            action,
+            Action::Retrieve,
+            "the very next frame is the retrieval"
+        );
+        assert_eq!(
+            at % PAD_INTERVAL_MS,
+            0,
+            "and it occupies a slot, not its own moment"
         );
     }
 

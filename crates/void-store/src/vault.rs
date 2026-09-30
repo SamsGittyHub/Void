@@ -118,9 +118,13 @@ impl VaultBacking {
                 "Your keys are held in this phone's secure area. This phone does not have a \
                  separate security chip, so the protection is weaker than on devices that do."
             }
+            // True for every software case: an emulator, an iPhone with no
+            // passcode (its Secure Enclave then refuses presence-gated keys),
+            // the Simulator, and the reference CLI's passphrase vault. It used
+            // to name a passphrase, which the apps never ask for.
             VaultBacking::Software => {
-                "Your keys are protected by your passphrase only. This device has no hardware \
-                 key storage."
+                "Your keys are protected by software only. This device gave Void no hardware \
+                 key storage to use, so the protection is weaker than on devices that have it."
             }
         }
     }
@@ -159,13 +163,78 @@ impl SoftwareVault {
         })
     }
 
-    /// Build from raw key material. Tests only.
+    /// Build from raw key material. Tests use this directly; [`PlatformVault`]
+    /// uses it with a key the platform's hardware keystore released.
     #[must_use]
     pub fn from_raw(kek: [u8; 32]) -> Self {
         SoftwareVault {
             kek: Mutex::new(Some(kek)),
             destroyed: AtomicBool::new(false),
         }
+    }
+}
+
+impl Drop for SoftwareVault {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.kek.lock() {
+            if let Some(ref mut k) = *guard {
+                k.zeroize();
+            }
+        }
+    }
+}
+
+/// A vault whose key-encryption key the platform's hardware keystore holds at
+/// rest and releases to the core for one open.
+///
+/// The Secure Enclave and Android Keystore cannot operate on the core's keys
+/// directly (see the module docs), and D-017 already puts the hardware key's
+/// lifecycle on the platform side of the FFI boundary. So the platform keeps a
+/// random 32-byte KEK wrapped by its hardware key, unwraps it at launch —
+/// behind user presence where the platform supports it — and passes it here.
+/// Wrapping the database's DEK is exactly [`SoftwareVault`]'s construction;
+/// what differs is where the KEK lives at rest, and what [`KeyVault::backing`]
+/// truthfully reports.
+///
+/// [`KeyVault::destroy`] wipes this in-memory copy. Deleting the hardware key —
+/// the step that makes destruction irreversible — stays the platform's job
+/// (D-017).
+pub struct PlatformVault {
+    inner: SoftwareVault,
+    backing: VaultBacking,
+}
+
+impl PlatformVault {
+    /// Wrap a KEK the platform's keystore released, reporting `backing` — what
+    /// actually protects that KEK at rest on this device (NFR-COMP-02).
+    #[must_use]
+    pub fn new(kek: [u8; 32], backing: VaultBacking) -> Self {
+        PlatformVault {
+            inner: SoftwareVault::from_raw(kek),
+            backing,
+        }
+    }
+}
+
+impl KeyVault for PlatformVault {
+    fn wrap(&self, dek: &[u8; 32]) -> StoreResult<Vec<u8>> {
+        self.inner.wrap(dek)
+    }
+
+    fn unwrap_key(&self, wrapped: &[u8]) -> StoreResult<[u8; 32]> {
+        self.inner.unwrap_key(wrapped)
+    }
+
+    fn destroy(&self) -> StoreResult<()> {
+        self.inner.destroy()
+    }
+
+    fn is_destroyed(&self) -> bool {
+        self.inner.is_destroyed()
+    }
+
+    fn backing(&self) -> VaultBacking {
+        self.backing
     }
 }
 
@@ -501,5 +570,34 @@ mod tests {
             .user_description()
             .contains("weaker"));
         assert!(VaultBacking::SecureEnclave.is_hardware_backed());
+    }
+
+    #[test]
+    fn a_platform_vault_reports_the_backing_it_was_given() {
+        // The backing is the platform's claim about where the KEK lives at
+        // rest. The vault must pass it through, not upgrade it: a TEE-only
+        // Android device must not be described as having a security chip.
+        for backing in [
+            VaultBacking::SecureEnclave,
+            VaultBacking::StrongBox,
+            VaultBacking::TrustedExecutionEnvironment,
+            VaultBacking::Software,
+        ] {
+            assert_eq!(PlatformVault::new([4u8; 32], backing).backing(), backing);
+        }
+    }
+
+    #[test]
+    fn a_platform_vault_unwraps_only_under_the_key_it_was_given() {
+        let right = PlatformVault::new([5u8; 32], VaultBacking::StrongBox);
+        let wrong = PlatformVault::new([6u8; 32], VaultBacking::StrongBox);
+        let dek = [7u8; 32];
+        let wrapped = right.wrap(&dek).unwrap();
+        assert_eq!(right.unwrap_key(&wrapped).unwrap(), dek);
+        assert!(wrong.unwrap_key(&wrapped).is_err());
+
+        right.destroy().unwrap();
+        assert!(right.is_destroyed());
+        assert!(right.unwrap_key(&wrapped).is_err());
     }
 }

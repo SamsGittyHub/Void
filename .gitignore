@@ -19,6 +19,14 @@ ios/DerivedData/
 android/local.properties
 android/app/src/main/jniLibs/
 android/.gradle/
+android/.kotlin/
 android/app/build/
 android/build/
 
+# Claude Code's local scheduler lock: machine state, not source.
+.claude/scheduled_tasks.lock
+
+# The bindings check's Gradle build (scripts/check_android_bindings.sh).
+tools/app-bindings/kotlin/.gradle/
+tools/app-bindings/kotlin/.kotlin/
+tools/app-bindings/kotlin/build/

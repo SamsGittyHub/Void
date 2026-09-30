@@ -17,7 +17,9 @@ echo "Building void-ffi for iOS device and simulator…"
 TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios)
 for t in "${TARGETS[@]}"; do
   rustup target add "$t" >/dev/null 2>&1 || true
-  cargo build -p void-ffi --release --target "$t"
+  # `mobile`, not `release`: it unwinds on panic, so void-ffi's catch_unwind
+  # guards turn a core panic into an error code (Cargo.toml has the why).
+  cargo build -p void-ffi --profile mobile --target "$t"
 done
 
 echo "Generating VoidFFI.h…"
@@ -30,14 +32,14 @@ echo "Building the simulator fat library (arm64 + x86_64)…"
 SIM_LIB_DIR=target/ios-sim-universal
 mkdir -p "$SIM_LIB_DIR"
 lipo -create \
-  "target/aarch64-apple-ios-sim/release/libvoid_ffi.a" \
-  "target/x86_64-apple-ios/release/libvoid_ffi.a" \
+  "target/aarch64-apple-ios-sim/mobile/libvoid_ffi.a" \
+  "target/x86_64-apple-ios/mobile/libvoid_ffi.a" \
   -output "$SIM_LIB_DIR/libvoid_ffi.a"
 
 echo "Packaging Void.xcframework…"
 rm -rf ios/VoidFFI.xcframework
 xcodebuild -create-xcframework \
-  -library "target/aarch64-apple-ios/release/libvoid_ffi.a" -headers "$HEADER_DIR" \
+  -library "target/aarch64-apple-ios/mobile/libvoid_ffi.a" -headers "$HEADER_DIR" \
   -library "$SIM_LIB_DIR/libvoid_ffi.a" -headers "$HEADER_DIR" \
   -output ios/VoidFFI.xcframework
 

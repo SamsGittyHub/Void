@@ -56,7 +56,7 @@ else
   [ "$FAIL" -eq 0 ] && echo "  ok — void-crypto depends on exactly ml-kem and ml-dsa, both pinned"
 fi
 
-echo "Checking that only void-ffi permits unsafe code…"
+echo "Checking that only void-ffi and void-jni permit unsafe code…"
 # Match the actual crate attribute, not prose about it: an earlier version of
 # this check failed on void-ffi's own module documentation, which explains that
 # it is the one crate lacking the attribute.

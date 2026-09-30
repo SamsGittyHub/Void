@@ -13,24 +13,6 @@
 
 import SwiftUI
 
-// MARK: - Models the UI renders
-
-struct ConversationSummary: Identifiable {
-    let id: Data          // the contact fingerprint
-    var name: String
-    var trust: TrustState
-    var lastMessage: String
-    var unread: Int
-}
-
-struct MessageItem: Identifiable {
-    let id: UInt64
-    var text: String
-    var isOutgoing: Bool
-    var delivery: DeliveryState
-    var timestamp: Date
-}
-
 // MARK: - Conversation list
 
 struct ConversationListView: View {
@@ -41,6 +23,11 @@ struct ConversationListView: View {
     var onNewContact: () -> Void
     var onSend: (Data, String) -> Void = { _, _ in }
     var onVerificationResult: (Data, Bool) -> Void = { _, _ in }
+    var onAcknowledgeKeyChange: (Data) -> Void = { _ in }
+    var onRename: (Data, String) -> Void = { _, _ in }
+    var onCall: (Data) -> Void = { _ in }
+    var onOpen: (Data) -> Void = { _ in }
+    var onClose: (Data) -> Void = { _ in }
 
     private var emptyStateDescription: String {
         "Void has no directory and no way to look people up. You start a conversation by "
@@ -84,14 +71,16 @@ struct ConversationListView: View {
                 if let index = conversations.firstIndex(where: { $0.id == id }) {
                     ConversationView(
                         conversation: $conversations[index],
-                        messages: Binding(
-                            get: { messagesByFingerprint[id] ?? [] },
-                            set: { messagesByFingerprint[id] = $0 }
-                        ),
+                        messages: messagesByFingerprint[id] ?? [],
                         onSend: { text in onSend(id, text) },
                         myWords: myWords,
-                        onVerificationResult: { matched in onVerificationResult(id, matched) }
+                        onVerificationResult: { matched in onVerificationResult(id, matched) },
+                        onAcknowledgeKeyChange: { onAcknowledgeKeyChange(id) },
+                        onRename: { name in onRename(id, name) },
+                        onCall: { onCall(id) }
                     )
+                    .onAppear { onOpen(id) }
+                    .onDisappear { onClose(id) }
                 }
             }
             .toolbar {
@@ -203,19 +192,25 @@ private struct ConversationRow: View {
 
 struct ConversationView: View {
     @Binding var conversation: ConversationSummary
-    @Binding var messages: [MessageItem]
+    /// The stored history, oldest first, refreshed from the engine.
+    var messages: [MessageItem]
     /// Called with the drafted text when the user taps send. The engine
     /// queues it — see `VoidCore.send` — it does not transmit immediately
-    /// (FR-MSG-06), so this view's optimistic local append and the eventual
-    /// delivery-state update it receives back are two different moments.
+    /// (FR-MSG-06): the message shows as "Waiting to send" until the scheduler
+    /// has actually deposited it.
     var onSend: (String) -> Void = { _ in }
     /// My own security code, for the verification sheet. The engine only
     /// exposes this via an instance call (`VoidCore.fingerprintWords`), so
     /// unlike the contact's code below it cannot be computed inline here.
     var myWords = ""
     var onVerificationResult: (Bool) -> Void = { _ in }
+    var onAcknowledgeKeyChange: () -> Void = {}
+    var onRename: (String) -> Void = { _ in }
+    var onCall: () -> Void = {}
     @State private var draft = ""
     @State private var showingVerification = false
+    @State private var renaming = false
+    @State private var newName = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -247,9 +242,30 @@ struct ConversationView: View {
         .navigationTitle(conversation.name.isEmpty ? "Unnamed contact" : conversation.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button("Verify") { showingVerification = true }
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button(action: onCall) {
+                    Label("Call", systemImage: "phone")
+                }
+                .disabled(!conversation.trust.canSend)
+                .accessibilityIdentifier("callButton")
+                Menu {
+                    Button("Compare security codes") { showingVerification = true }
+                    Button("Rename") {
+                        newName = conversation.name
+                        renaming = true
+                    }
+                } label: {
+                    Label("More", systemImage: "ellipsis.circle")
+                }
             }
+        }
+        // The name is only ever this device's: renaming tells nobody.
+        .alert("Rename", isPresented: $renaming) {
+            TextField("Name", text: $newName)
+            Button("Save") { onRename(newName) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only you see this name.")
         }
         .sheet(isPresented: $showingVerification) {
             NavigationStack {
@@ -277,9 +293,10 @@ struct ConversationView: View {
                         .controlSize(.small)
                     // Acknowledging drops to "not verified", never straight to
                     // "verified" — dismissing a banner is not the same as
-                    // comparing codes with a person.
+                    // comparing codes with a person. It goes to the engine,
+                    // which is what actually blocks sending.
                     Button("I've checked, continue") {
-                        conversation.trust = .unverified
+                        onAcknowledgeKeyChange()
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -304,18 +321,9 @@ struct ConversationView: View {
             Button {
                 let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { return }
-                messages.append(
-                    MessageItem(
-                        id: UInt64(messages.count + 1),
-                        text: text,
-                        isOutgoing: true,
-                        // Queued, not sent: the engine holds it until the next
-                        // scheduled slot so that send timing does not reveal
-                        // typing timing (FR-MSG-06).
-                        delivery: .queued,
-                        timestamp: Date()
-                    )
-                )
+                // Queued, not sent: the engine holds it until the next
+                // scheduled slot so that send timing does not reveal typing
+                // timing (FR-MSG-06).
                 onSend(text)
                 draft = ""
             } label: {

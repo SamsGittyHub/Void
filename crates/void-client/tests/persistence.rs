@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use void_client::engine::{Engine, SecurityMode, TickOutcome};
+use void_client::engine::{ContactEvent, Engine, SecurityMode, TickOutcome};
 use void_client::transport::MemoryTransport;
 use void_crypto::argon2;
 use void_proto::identity::Identity;
@@ -300,5 +300,283 @@ fn message_history_and_delivery_state_survive_a_restart() {
         "delivery state must have advanced past Queued once the handshake left the outbox"
     );
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A persisted engine for Bob, created fresh at `path`.
+fn persisted_bob(
+    path: &std::path::Path,
+    vault: &SoftwareVault,
+    relay: &Arc<Relay>,
+    clock: &Arc<Mutex<u64>>,
+) -> Engine {
+    let db = Database::create(
+        FileBackend::new(path),
+        vault,
+        argon2::Params::TEST_ONLY_WEAK,
+    )
+    .unwrap();
+    let (identity, seeds) = Identity::generate_with_seeds().unwrap();
+    Engine::new_persisted(
+        identity,
+        &seeds,
+        Settings::default(),
+        Box::new(MemoryTransport::new(Arc::clone(relay), Arc::clone(clock))),
+        SecurityMode::InsecureForTesting,
+        0,
+        Box::new(db),
+    )
+    .unwrap()
+}
+
+/// Bob's engine again, rebuilt from nothing but the file.
+fn restored(
+    path: &std::path::Path,
+    vault: &SoftwareVault,
+    relay: &Arc<Relay>,
+    clock: &Arc<Mutex<u64>>,
+    now_ms: u64,
+) -> Engine {
+    let db = Database::open(FileBackend::new(path), vault).unwrap();
+    Engine::restore(
+        Box::new(db),
+        Box::new(MemoryTransport::new(Arc::clone(relay), Arc::clone(clock))),
+        SecurityMode::InsecureForTesting,
+        now_ms,
+    )
+    .unwrap()
+}
+
+/// Tick `inviter` and `invitee` in turn until the inviter reports a contact.
+fn until_added(inviter: &mut Engine, invitee: &mut Engine, start_ms: u64) -> Option<[u8; 32]> {
+    let mut t = start_ms;
+    for _ in 0..400 {
+        let _ = invitee.tick(t);
+        let _ = inviter.tick(t);
+        for event in inviter.take_contact_events() {
+            if let ContactEvent::Added {
+                contact_fingerprint,
+                ..
+            } = event
+            {
+                return Some(contact_fingerprint);
+            }
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    None
+}
+
+#[test]
+fn a_pending_invite_survives_a_restart() {
+    // The person an invitation was sent to may accept it hours later, long
+    // after the app that made it was killed. The prekey secrets have to be on
+    // disk, or the handshake arrives to an inviter who can no longer answer.
+    let path = temp_db_path("invite-survives");
+    let vault = SoftwareVault::from_raw([21u8; 32]);
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+
+    let mut bob_engine = persisted_bob(&path, &vault, &relay, &clock);
+    let invite = bob_engine
+        .create_invite(b"relay.onion", "Bob", "Alice", 1_000, 86_400)
+        .unwrap();
+    // Killed before it had parked a single record of the invitation.
+    drop(bob_engine);
+
+    let mut bob_engine = restored(&path, &vault, &relay, &clock, 0);
+    assert!(bob_engine.has_pending_invite(&invite.id));
+    assert_eq!(
+        bob_engine.invite_link(&invite.id),
+        Some(invite.link.as_str())
+    );
+    assert!(
+        bob_engine.invite_upload_remaining(&invite.id).unwrap() > 0,
+        "the unfinished upload survives with the invitation"
+    );
+
+    let mut alice = bob_like_alice(&relay, &clock);
+    let fetch = alice.open_invite(&invite.link, 0).unwrap();
+    let mut t = 0u64;
+    let mut confirmed = false;
+    for _ in 0..200 {
+        let _ = bob_engine.tick(t);
+        let _ = alice.tick(t);
+        if alice
+            .take_contact_events()
+            .iter()
+            .any(|e| matches!(e, ContactEvent::InviteReady { .. }))
+        {
+            alice
+                .confirm_invite(&fetch, "", "sent after bob restarted", t / 1000)
+                .unwrap();
+            confirmed = true;
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    assert!(
+        confirmed,
+        "the restored engine must finish parking the invitation"
+    );
+    let added = until_added(&mut bob_engine, &mut alice, t);
+    assert_eq!(added, Some(alice.fingerprint()));
+    assert_eq!(
+        bob_engine.contact(&alice.fingerprint()).unwrap().local_name,
+        "Alice",
+        "the invitation's contact label survives the restart too"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_handshake_half_received_before_a_restart_still_completes() {
+    // The relay deletes each record as it hands it over. A handshake spans
+    // about thirteen records uploaded one per slot, so an inviter that
+    // collects mid-upload and is then killed held the only copy of what it
+    // had collected — in RAM. It has to be on disk.
+    let path = temp_db_path("half-handshake");
+    let vault = SoftwareVault::from_raw([22u8; 32]);
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+
+    let mut bob_engine = persisted_bob(&path, &vault, &relay, &clock);
+    let (bundle, _) = bob_engine.create_bundle(b"relay.onion").unwrap();
+    let mut alice = bob_like_alice(&relay, &clock);
+    alice
+        .start_conversation(&bundle, "Bob", "split across a restart", 1_000)
+        .unwrap();
+    let total = alice.outbox_len();
+    assert!(total > 4);
+
+    // Alice uploads about half of the handshake.
+    let mut t = 0u64;
+    while alice.outbox_len() > total / 2 {
+        alice.tick(t).unwrap();
+        t += PAD_INTERVAL_MS;
+    }
+    assert!(relay.metrics().unwrap().records > 0);
+
+    // Bob collects what is there — and so empties the relay of it.
+    let mut collected = false;
+    for _ in 0..20 {
+        if let TickOutcome::Retrieved(_) = bob_engine.tick(t).unwrap() {
+            collected = true;
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    assert!(collected);
+    assert_eq!(
+        relay.metrics().unwrap().records,
+        0,
+        "the relay no longer holds the half bob collected"
+    );
+    assert!(bob_engine.take_contact_events().is_empty());
+
+    // Bob's process dies with half a handshake. A new one starts from disk.
+    drop(bob_engine);
+    let mut bob_engine = restored(&path, &vault, &relay, &clock, t);
+
+    // Alice uploads the rest; the restored Bob must finish the handshake.
+    let added = until_added(&mut bob_engine, &mut alice, t);
+    assert_eq!(
+        added,
+        Some(alice.fingerprint()),
+        "the restored engine must complete the handshake from the fragments it kept"
+    );
+    let history = bob_engine.messages(&alice.fingerprint()).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].body, "split across a restart");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_message_queued_before_a_restart_is_marked_sent_after_it() {
+    // The outbox survives a restart; so must the link from each queued
+    // fragment back to the stored message it carries, or the history shows
+    // "Waiting to send" forever for a message that went out.
+    let path = temp_db_path("queued-then-sent");
+    let vault = SoftwareVault::from_raw([23u8; 32]);
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+
+    let mut alice = persisted_bob(&path, &vault, &relay, &clock);
+    let mut bob_engine = bob(Arc::clone(&relay), Arc::clone(&clock));
+    let (bundle, bob_queue) = bob_engine.create_bundle(b"relay.onion").unwrap();
+    let bob_fp = alice
+        .start_conversation(&bundle, "Bob", "hello", 1_000)
+        .unwrap();
+    let t = drain(&mut alice, 0, 40);
+    let initial = collect_raw(&relay, &bob_queue).unwrap();
+    bob_engine
+        .accept_conversation(bundle.queue.queue_id, &initial, 1_000)
+        .unwrap();
+
+    // Offline: the message queues, and is stored as waiting to send.
+    alice
+        .set_transport(Box::new(void_client::transport::NullTransport::new()))
+        .unwrap();
+    alice.send(&bob_fp, "sent while offline", 1_100).unwrap();
+    assert!(alice.outbox_len() > 0);
+    drop(alice);
+
+    let mut alice = restored(&path, &vault, &relay, &clock, t);
+    let queued = alice.messages(&bob_fp).unwrap();
+    assert_eq!(queued.last().unwrap().body, "sent while offline");
+    assert_eq!(queued.last().unwrap().delivery, DeliveryState::Queued);
+
+    drain(&mut alice, t, 60);
+    assert_eq!(alice.outbox_len(), 0);
+    let history = alice.messages(&bob_fp).unwrap();
+    assert_eq!(
+        history.last().unwrap().delivery,
+        DeliveryState::Deposited,
+        "a message that left the outbox after a restart must read as sent"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An unpersisted engine standing in for the other person.
+fn bob_like_alice(relay: &Arc<Relay>, clock: &Arc<Mutex<u64>>) -> Engine {
+    let identity = Identity::from_seeds(&[31u8; 32], &[32u8; 32], &[33u8; 32]);
+    Engine::new(
+        identity,
+        Settings::default(),
+        Box::new(MemoryTransport::new(Arc::clone(relay), Arc::clone(clock))),
+        SecurityMode::InsecureForTesting,
+        0,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_renamed_contact_keeps_its_name_after_a_restart() {
+    let path = temp_db_path("rename-persists");
+    let vault = SoftwareVault::from_raw([24u8; 32]);
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+
+    let mut alice = persisted_bob(&path, &vault, &relay, &clock);
+    let mut bob_engine = bob(Arc::clone(&relay), Arc::clone(&clock));
+    let (bundle, _) = bob_engine.create_bundle(b"relay.onion").unwrap();
+    let bob_fp = alice.start_conversation(&bundle, "", "", 1_000).unwrap();
+    alice
+        .rename_contact(&bob_fp, "  Bob from the café  ")
+        .unwrap();
+    alice.set_invite_name("Alice");
+    drop(alice);
+
+    let alice = restored(&path, &vault, &relay, &clock, 0);
+    assert_eq!(
+        alice.contact(&bob_fp).unwrap().local_name,
+        "Bob from the café",
+        "a rename is stored, trimmed, and survives a restart"
+    );
+    assert_eq!(alice.settings().invite_name, "Alice");
+    assert!(
+        alice.messages(&bob_fp).unwrap().is_empty(),
+        "connecting without a first message stores nothing to show"
+    );
     let _ = std::fs::remove_file(&path);
 }

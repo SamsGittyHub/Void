@@ -16,12 +16,11 @@
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-use void_client::engine::{Engine, SecurityMode, TickOutcome};
+use void_client::engine::{ContactEvent, Engine, SecurityMode, TickOutcome};
 use void_client::transport::{TcpTransport, Transport};
 use void_proto::fingerprint;
 use void_proto::identity::Identity;
-use void_proto::invite::{self, Invite};
-use void_proto::queue::QueueSecret;
+use void_proto::invite;
 use void_proto::record::PAD_INTERVAL_MS;
 use void_store::model::Settings;
 
@@ -131,123 +130,77 @@ fn cmd_invite(addr: &str) {
     )
     .expect("engine");
 
-    let (bundle, intro_queue) = engine.create_bundle(addr.as_bytes()).expect("bundle");
-    let inv = invite::create(
-        &bundle,
-        now_secs(),
-        invite::DEFAULT_INVITE_TTL_SECONDS,
-        "void-cli",
-    )
-    .expect("invite");
+    let invite = engine
+        .create_invite(
+            addr.as_bytes(),
+            "void-cli",
+            "",
+            now_secs(),
+            invite::DEFAULT_INVITE_TTL_SECONDS,
+        )
+        .expect("invite");
 
     println!("Send this link to the person you want to talk to.");
     println!("It works once, and expires in 24 hours.\n");
-    println!("{}\n", inv.to_link());
+    println!("{}\n", invite.link);
     println!(
         "Your security code:\n{}\n",
         fingerprint::to_words(&engine.fingerprint())
     );
     println!("Waiting for them to accept…");
 
-    wait_for_handshake(&mut engine, &bundle, &intro_queue, addr);
+    wait_for_contact(&mut engine);
 }
 
-fn wait_for_handshake(
-    engine: &mut Engine,
-    bundle: &void_proto::handshake::PrekeyBundle,
-    intro_queue: &QueueSecret,
-    addr: &str,
-) {
-    // Poll the introduction queue directly: the handshake arrives before any
-    // session exists, so the engine's per-session retrieval does not cover it.
-    let mut transport = connect(addr);
+/// Tick until someone accepts the invitation.
+///
+/// The engine polls its own intro queues inside the scheduler's retrieval
+/// slot and keeps a partly arrived handshake between polls, so there is
+/// nothing to do here but keep ticking and watch for the contact.
+fn wait_for_contact(engine: &mut Engine) {
     loop {
-        if let Some(initial) = poll_intro_queue(&mut *transport, intro_queue) {
-            match engine.accept_conversation(bundle.queue.queue_id, &initial, now_secs()) {
-                Ok((fp, first)) => {
+        match engine.tick(now_ms()) {
+            Ok(TickOutcome::Waiting(d)) => std::thread::sleep(d),
+            Ok(TickOutcome::Offline) | Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(PAD_INTERVAL_MS));
+            }
+            Ok(_) => {}
+        }
+        // The CLI makes exactly one invitation, so the first event is the only
+        // one there can be.
+        if let Some(event) = engine.take_contact_events().into_iter().next() {
+            match event {
+                ContactEvent::Added {
+                    contact_fingerprint,
+                    first_message,
+                    ..
+                } => {
                     println!("\nConnected.");
-                    println!("Their security code:\n{}\n", fingerprint::to_words(&fp));
+                    println!(
+                        "Their security code:\n{}\n",
+                        fingerprint::to_words(&contact_fingerprint)
+                    );
                     println!("Compare it with them out of band before trusting it.\n");
-                    println!("< {first}");
-                    chat_loop(engine, fp);
+                    if !first_message.is_empty() {
+                        println!("< {first_message}");
+                    }
+                    chat_loop(engine, contact_fingerprint);
                     return;
                 }
-                Err(e) => {
-                    eprintln!("Handshake failed: {e}");
-                    return;
+                ContactEvent::InviteExpired { .. } => {
+                    eprintln!("The invitation expired before anyone accepted it.");
+                    std::process::exit(1);
                 }
+                // Only an invitation this side opens produces these, and the
+                // inviting side opens none.
+                ContactEvent::InviteReady { .. } | ContactEvent::InviteFailed { .. } => {}
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(PAD_INTERVAL_MS));
     }
-}
-
-fn poll_intro_queue(transport: &mut dyn Transport, queue: &QueueSecret) -> Option<Vec<u8>> {
-    use void_relay::protocol::{Delivery, Frame, FrameType, Retrieve};
-
-    let queue_id = queue.queue_id();
-    let deposit_key = queue.deposit_key();
-    let mut reassembler = void_proto::record::Reassembler::new(16);
-    for _ in 0..64 {
-        let ch = transport
-            .exchange(&Frame::new(FrameType::Challenge, queue_id.to_vec()))
-            .ok()?;
-        if ch.kind != FrameType::ChallengeReply || ch.body.len() != 32 {
-            return None;
-        }
-        let mut challenge = [0u8; 32];
-        challenge.copy_from_slice(&ch.body);
-        let resp = transport
-            .exchange(&Frame::new(
-                FrameType::Retrieve,
-                Retrieve {
-                    queue_id,
-                    challenge,
-                    retrieval_public: queue.retrieval_public(),
-                    proof: queue.prove_retrieval(&challenge),
-                }
-                .encode(),
-            ))
-            .ok()?;
-        if resp.kind != FrameType::Delivery {
-            return None;
-        }
-        let d = Delivery::decode(&resp.body).ok()?;
-        if d.sealed.is_empty() {
-            return None;
-        }
-        let record = void_proto::envelope::open(
-            &deposit_key,
-            &void_proto::envelope::Deposit {
-                queue_id,
-                sealed: d.sealed,
-            },
-        )
-        .ok()?;
-        if let Ok(Some(payload)) = reassembler.push(&record) {
-            return Some(payload);
-        }
-    }
-    None
 }
 
 fn cmd_accept(addr: &str, link: &str) {
     let id = identity_from_env();
-    let inv = match Invite::from_link(link) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("That does not look like a Void invitation: {e}");
-            std::process::exit(1);
-        }
-    };
-    let body = match invite::open(&inv, now_secs()) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("The invitation could not be opened: {e}");
-            std::process::exit(1);
-        }
-    };
-
     let mut engine = Engine::new(
         id,
         Settings::default(),
@@ -256,16 +209,53 @@ fn cmd_accept(addr: &str, link: &str) {
         now_ms(),
     )
     .expect("engine");
+    engine.set_relay(addr);
 
-    println!(
-        "Their security code:\n{}\n",
-        fingerprint::to_words(&body.bundle.identity.fingerprint())
-    );
-    println!("Compare it with them out of band before trusting it.\n");
+    let fetch = match engine.open_invite(link, now_secs()) {
+        Ok(fetch) => fetch,
+        Err(e) => {
+            eprintln!("The invitation could not be opened: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("Collecting the invitation from the relay…");
 
-    let fp = engine
-        .start_conversation(&body.bundle, &body.label, "hello", now_secs())
-        .expect("handshake");
+    let fp = 'collect: loop {
+        match engine.tick(now_ms()) {
+            Ok(TickOutcome::Waiting(d)) => std::thread::sleep(d),
+            Ok(TickOutcome::Offline) | Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(PAD_INTERVAL_MS));
+            }
+            Ok(_) => {}
+        }
+        for event in engine.take_contact_events() {
+            match event {
+                ContactEvent::InviteReady {
+                    inviter_label,
+                    inviter_fingerprint,
+                    ..
+                } => {
+                    println!(
+                        "Their security code:\n{}\n",
+                        fingerprint::to_words(&inviter_fingerprint)
+                    );
+                    println!("Compare it with them out of band before trusting it.\n");
+                    match engine.confirm_invite(&fetch, &inviter_label, "hello", now_secs()) {
+                        Ok(fp) => break 'collect fp,
+                        Err(e) => {
+                            eprintln!("Could not connect: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ContactEvent::InviteFailed { reason, .. } => {
+                    eprintln!("The invitation could not be used: {reason:?}");
+                    std::process::exit(1);
+                }
+                _ => {}
+            }
+        }
+    };
     println!(
         "Your security code:\n{}\n",
         fingerprint::to_words(&engine.fingerprint())
@@ -315,6 +305,7 @@ fn chat_loop(engine: &mut Engine, peer: [u8; 32]) {
             }
             Ok(TickOutcome::Offline) => {
                 eprintln!("! offline — messages are queued, nothing is being sent in the clear");
+                std::thread::sleep(std::time::Duration::from_millis(PAD_INTERVAL_MS));
             }
             Ok(TickOutcome::Waiting(d)) => std::thread::sleep(d),
             Ok(_) => {}

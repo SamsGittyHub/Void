@@ -1,4 +1,4 @@
-//! Push-to-talk calls: signalling over the queue, media over a direct circuit.
+//! Calls: signalling over the queue, media over a direct circuit.
 //!
 //! ## The shape, and why it is this shape
 //!
@@ -14,11 +14,20 @@
 //! - **Media** is a direct connection between the two clients over paired
 //!   ephemeral onion services. It never touches the relay at all.
 //!
-//! The retrieval schedule (`FR-MSG-07`) means an offer takes one polling slot
-//! to arrive — a few seconds. That delay is not a defect here: it *is* the
-//! ring, and a phone that rings for five seconds before connecting is a phone
-//! behaving normally. The slow, metadata-safe path is used for the one part of
-//! a call that can afford it.
+//! The retrieval schedule (`FR-MSG-07`) means an offer reaches the callee on
+//! their next retrieval: usually within half a minute of being sent, and
+//! sometimes over a minute when the offer is four records long (a ratchet step
+//! carrying ML-KEM material, D-005). That delay is the ring, and the interface
+//! says so. The
+//! slow, metadata-safe path carries the one part of a call that can afford it.
+//! The answer does not have to take it back: the caller treats the callee's
+//! first authenticated media frame as the answer, so connecting costs one
+//! mailbox delay, not two.
+//!
+//! An offer carries the time it was sent, inside the ciphertext. Offers wait in
+//! a mailbox like any message, so one can arrive long after its caller gave up;
+//! the receiving engine reports a stale one as a missed call instead of
+//! ringing.
 //!
 //! ## Who hosts
 //!
@@ -136,6 +145,8 @@ pub enum EndReason {
     Missed,
     /// The media connection could not be established or was lost.
     Failed,
+    /// The callee was already on another call, so this one never rang.
+    Busy,
 }
 
 impl EndReason {
@@ -145,6 +156,7 @@ impl EndReason {
             EndReason::Declined => 2,
             EndReason::Missed => 3,
             EndReason::Failed => 4,
+            EndReason::Busy => 5,
         }
     }
 
@@ -154,6 +166,7 @@ impl EndReason {
             2 => EndReason::Declined,
             3 => EndReason::Missed,
             4 => EndReason::Failed,
+            5 => EndReason::Busy,
             _ => return Err(ProtoError::Malformed),
         })
     }
@@ -171,6 +184,11 @@ pub struct CallOffer {
     /// Fresh randomness both sides derive media keys from. Confidential: this
     /// offer only ever travels inside the ratchet.
     pub media_secret: [u8; 32],
+    /// Unix seconds when the caller sent it, by the caller's clock. Inside the
+    /// ciphertext, so the relay learns nothing from it; the callee uses it to
+    /// tell a live call from one that waited in the mailbox until its caller
+    /// had long since given up.
+    pub sent_at: u64,
 }
 
 impl Drop for CallOffer {
@@ -185,14 +203,16 @@ impl core::fmt::Debug for CallOffer {
             .field("call_id", &self.call_id)
             .field("onion_address", &self.onion_address)
             .field("port", &self.port)
+            .field("sent_at", &self.sent_at)
             .field("media_secret", &"<redacted>")
             .finish()
     }
 }
 
 impl CallOffer {
-    /// Build an offer for a service already publishing at `onion_address`.
-    pub fn new(onion_address: &str, port: u16) -> Result<CallOffer> {
+    /// Build an offer for a service already publishing at `onion_address`,
+    /// sent at `now` (Unix seconds).
+    pub fn new(onion_address: &str, port: u16, now: u64) -> Result<CallOffer> {
         if onion_address.is_empty() || onion_address.len() > MAX_ONION_LEN {
             return Err(ProtoError::Malformed);
         }
@@ -201,6 +221,7 @@ impl CallOffer {
             onion_address: String::from(onion_address),
             port,
             media_secret: rand::bytes32().map_err(|_| ProtoError::Crypto)?,
+            sent_at: now,
         })
     }
 }
@@ -257,7 +278,8 @@ impl CallSignal {
                     .raw(&o.call_id)
                     .bytes16(o.onion_address.as_bytes())
                     .u16(o.port)
-                    .raw(&o.media_secret);
+                    .raw(&o.media_secret)
+                    .u64(o.sent_at);
             }
             CallSignal::Answer(a) => {
                 w.u8(2).raw(&a.call_id).u8(a.accepted as u8);
@@ -284,11 +306,13 @@ impl CallSignal {
                     core::str::from_utf8(addr).map_err(|_| ProtoError::Malformed)?;
                 let port = r.u16()?;
                 let media_secret = r.array::<32>()?;
+                let sent_at = r.u64()?;
                 CallSignal::Offer(CallOffer {
                     call_id,
                     onion_address: String::from(onion_address),
                     port,
                     media_secret,
+                    sent_at,
                 })
             }
             2 => CallSignal::Answer(CallAnswer {
@@ -350,30 +374,94 @@ impl MediaKeys {
 /// Encrypts and decrypts one call's media stream.
 ///
 /// Sequence numbers are the nonce, so they must never repeat under one key.
-/// [`MediaStream::seal`] refuses rather than wrapping — a call that somehow
+/// [`MediaSealer::seal`] refuses rather than wrapping — a call that somehow
 /// ran past 2^32 frames (over two years of continuous audio) ends instead of
 /// reusing a nonce.
+///
+/// A call sends and receives at the same time, from two threads, so the
+/// stream [`split`](MediaStream::split)s into a sealer and an opener that share
+/// nothing: each owns its own key and its own counter.
 pub struct MediaStream {
-    keys: MediaKeys,
+    sealer: MediaSealer,
+    opener: MediaOpener,
+}
+
+/// The sending half of one call's media: seals frames under this end's key.
+pub struct MediaSealer {
+    key: [u8; 32],
     call_id: CallId,
     next_send: u32,
+}
+
+/// The receiving half of one call's media: opens the other end's frames.
+pub struct MediaOpener {
+    key: [u8; 32],
+    call_id: CallId,
     highest_recv: u32,
     started: bool,
+}
+
+impl Drop for MediaSealer {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl Drop for MediaOpener {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl MediaStream {
     /// Begin a media stream for `call_id`.
     #[must_use]
     pub fn new(media_secret: &[u8; 32], role: Role, call_id: CallId) -> MediaStream {
+        let keys = MediaKeys::derive(media_secret, role);
         MediaStream {
-            keys: MediaKeys::derive(media_secret, role),
-            call_id,
-            next_send: 0,
-            highest_recv: 0,
-            started: false,
+            sealer: MediaSealer {
+                key: keys.send,
+                call_id,
+                next_send: 0,
+            },
+            opener: MediaOpener {
+                key: keys.recv,
+                call_id,
+                highest_recv: 0,
+                started: false,
+            },
         }
     }
 
+    /// Separate the halves, for a sending thread and a receiving thread.
+    #[must_use]
+    pub fn split(self) -> (MediaSealer, MediaOpener) {
+        (self.sealer, self.opener)
+    }
+
+    /// See [`MediaSealer::seal`].
+    pub fn seal(&mut self, audio: &[u8]) -> Result<Vec<u8>> {
+        self.sealer.seal(audio)
+    }
+
+    /// See [`MediaOpener::open`].
+    pub fn open(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
+        self.opener.open(frame)
+    }
+
+    /// How many frames this end has sent.
+    #[must_use]
+    pub fn frames_sent(&self) -> u32 {
+        self.sealer.frames_sent()
+    }
+
+    /// See [`MediaSealer::seal_silence`].
+    pub fn seal_silence(&mut self) -> Result<Vec<u8>> {
+        self.sealer.seal_silence()
+    }
+}
+
+impl MediaSealer {
     /// Seal one audio frame into a wire frame of exactly [`MEDIA_FRAME_LEN`].
     ///
     /// `audio` is whatever the platform's encoder produced; this layer does
@@ -393,7 +481,7 @@ impl MediaStream {
         plaintext.resize(2 + MEDIA_PAYLOAD_LEN, 0);
 
         let nonce = aead::nonce_from_counter(seq as u64);
-        let sealed = aead::seal(&self.keys.send, &nonce, &self.call_id, &plaintext);
+        let sealed = aead::seal(&self.key, &nonce, &self.call_id, &plaintext);
         plaintext.zeroize();
 
         let mut out = Vec::with_capacity(MEDIA_FRAME_LEN);
@@ -403,7 +491,22 @@ impl MediaStream {
         Ok(out)
     }
 
-    /// Open one wire frame, returning the audio it carried.
+    /// A frame of silence, for the cadence to keep running while nobody is
+    /// speaking. Constant bitrate is the point; see the module docs.
+    pub fn seal_silence(&mut self) -> Result<Vec<u8>> {
+        self.seal(&[])
+    }
+
+    /// How many frames this end has sent.
+    #[must_use]
+    pub fn frames_sent(&self) -> u32 {
+        self.next_send
+    }
+}
+
+impl MediaOpener {
+    /// Open one wire frame, returning the audio it carried — empty for an
+    /// authenticated frame of silence.
     ///
     /// Frames that do not authenticate are an error and must be dropped by the
     /// caller, not played. Late and duplicate frames are rejected here rather
@@ -420,7 +523,7 @@ impl MediaStream {
         }
 
         let nonce = aead::nonce_from_counter(seq as u64);
-        let mut plaintext = aead::open(&self.keys.recv, &nonce, &self.call_id, &frame[4..])
+        let mut plaintext = aead::open(&self.key, &nonce, &self.call_id, &frame[4..])
             .map_err(|_| ProtoError::DecryptionFailed)?;
         if plaintext.len() != 2 + MEDIA_PAYLOAD_LEN {
             plaintext.zeroize();
@@ -440,18 +543,6 @@ impl MediaStream {
         plaintext.zeroize();
         Ok(audio)
     }
-
-    /// How many frames this end has sent.
-    #[must_use]
-    pub fn frames_sent(&self) -> u32 {
-        self.next_send
-    }
-
-    /// A frame of silence, for the cadence to keep running while nobody is
-    /// speaking. Constant bitrate is the point; see the module docs.
-    pub fn seal_silence(&mut self) -> Result<Vec<u8>> {
-        self.seal(&[])
-    }
 }
 
 /// Fill `buf` with a full media frame read from a stream, for callers doing
@@ -469,6 +560,7 @@ mod tests {
         CallOffer::new(
             "5rnxosw3zlrt5dppafbkw4f2kpdp7gdliaghf5uo5l2rvd24hm5pwtqd.onion",
             9999,
+            1_700_000_000,
         )
         .unwrap()
     }
@@ -484,6 +576,7 @@ mod tests {
                 assert_eq!(d.onion_address, o.onion_address);
                 assert_eq!(d.port, o.port);
                 assert_eq!(d.media_secret, o.media_secret);
+                assert_eq!(d.sent_at, 1_700_000_000);
             }
             _ => panic!("wrong variant"),
         }
@@ -504,6 +597,10 @@ mod tests {
             CallSignal::End(CallEnd {
                 call_id: id,
                 reason: EndReason::Failed,
+            }),
+            CallSignal::End(CallEnd {
+                call_id: id,
+                reason: EndReason::Busy,
             }),
         ] {
             assert_eq!(CallSignal::decode(&signal.encode()).unwrap(), signal);
@@ -535,8 +632,31 @@ mod tests {
 
     #[test]
     fn an_offer_with_no_address_is_refused() {
-        assert!(CallOffer::new("", 1).is_err());
-        assert!(CallOffer::new(&"a".repeat(MAX_ONION_LEN + 1), 1).is_err());
+        assert!(CallOffer::new("", 1, 0).is_err());
+        assert!(CallOffer::new(&"a".repeat(MAX_ONION_LEN + 1), 1, 0).is_err());
+    }
+
+    #[test]
+    fn the_split_halves_talk_to_the_other_end_independently() {
+        // Two threads — one sending, one receiving — each own one half. The
+        // halves must interoperate with a whole stream on the other end, and
+        // neither may depend on the other's counter.
+        let o = offer();
+        let (mut caller_send, mut caller_recv) =
+            MediaStream::new(&o.media_secret, Role::Caller, o.call_id).split();
+        let mut callee = MediaStream::new(&o.media_secret, Role::Callee, o.call_id);
+
+        for i in 0..3u8 {
+            let frame = caller_send.seal(&[i]).unwrap();
+            assert_eq!(callee.open(&frame).unwrap(), vec![i]);
+        }
+        let back = callee.seal_silence().unwrap();
+        assert_eq!(
+            caller_recv.open(&back).unwrap(),
+            Vec::<u8>::new(),
+            "authenticated silence"
+        );
+        assert_eq!(caller_send.frames_sent(), 3);
     }
 
     #[test]
