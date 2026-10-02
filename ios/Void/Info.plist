@@ -58,11 +58,24 @@
 		<string>audio</string>
 	</array>
 
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- iPad: all four orientations. An app that takes part in iPad
+	     multitasking (UIRequiresFullScreen false, below) must declare all of
+	     them, or App Store Connect refuses the upload. The phone list above
+	     leaves out upside-down, as phones do. -->
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>

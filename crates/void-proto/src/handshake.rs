@@ -66,7 +66,12 @@ use crate::{ProtoError, Result};
 /// Bumped to `v3` when call offers gained the time they were sent and calls
 /// gained a busy signal (`crate::call`). A v2 client would fail to decode a v3
 /// offer and silently never ring — the same reasoning again.
-pub const PROTOCOL_ID: &[u8] = b"void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
+///
+/// Bumped to `v4` when files joined the content kinds (`crate::content`). A
+/// v3 client cannot read a file: it would drop the message as malformed and
+/// the sender would still see "Sent". Failing the handshake instead is what
+/// the content framing's own documentation promises for an unknown kind.
+pub const PROTOCOL_ID: &[u8] = b"void/v4/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
 
 /// Domain separator for the prekey signature.
 const PREKEY_SIG_CONTEXT: &[u8] = b"void/v1/prekey-bundle";

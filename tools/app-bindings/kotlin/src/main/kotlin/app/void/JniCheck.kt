@@ -36,7 +36,7 @@ fun main() {
     check(engine.takeCallEvents().isEmpty(), "no call events")
     check(engine.tick(now * 1000) == Engine.TickResult.Offline, "tick without a transport reports offline")
     check(!engine.protectionAcknowledged, "protection not yet acknowledged")
-    check(VoidCore.protocolId().startsWith("void/v3/"), "protocol id: ${VoidCore.protocolId()}")
+    check(VoidCore.protocolId().startsWith("void/v4/"), "protocol id: ${VoidCore.protocolId()}")
     check(VoidCore.callPort() == 9999 && VoidCore.callFrameMs() == 20L, "call constants")
     check(VoidCore.textCallDisclosure().isNotEmpty(), "call disclosure text")
 
@@ -65,6 +65,24 @@ fun main() {
     expectStatus(VoidStatus.FAILED, "confirming a fetch that never arrived fails") {
         engine.confirmInvite(fetchId, "", "", now)
     }
+
+    println("files")
+    check(VoidCore.fileMaxBytes() == 512_000, "the file bound is the protocol's: ${VoidCore.fileMaxBytes()}")
+    check(VoidCore.padIntervalMs() == 5_000L, "one record every five seconds")
+    check(VoidCore.fileRecordCount(0) in 4..5, "an empty file is a few records: ${VoidCore.fileRecordCount(0)}")
+    check(VoidCore.fileRecordCount(512_000) == 512, "the largest file is every fragment slot")
+    check(VoidCore.fileRecordCount(-1) == 0, "a negative length is nothing, not a crash")
+    expectStatus(VoidStatus.FAILED, "a file to a stranger fails like a message does") {
+        engine.sendFile(ByteArray(32), "a.txt", "text/plain", byteArrayOf(1, 2, 3), now)
+    }
+    expectStatus(VoidStatus.TOO_LARGE, "a file over the bound is refused with its own status") {
+        engine.sendFile(ByteArray(32), "big", "", ByteArray(512_001), now)
+    }
+    expectStatus(VoidStatus.BAD_ARGUMENT, "milliseconds refused for files too") {
+        engine.sendFile(ByteArray(32), "", "", ByteArray(0), now * 1000)
+    }
+    check(engine.attachment(1L) == null, "no attachment for an id the engine never gave")
+    check(StoredMessage.parseAll(ByteArray(5)).isEmpty(), "a truncated history parses to nothing")
 
     println("settings")
     engine.setInviteName("Sam Ü")

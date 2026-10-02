@@ -580,3 +580,194 @@ fn a_renamed_contact_keeps_its_name_after_a_restart() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_file_survives_a_restart_mid_upload_and_its_bytes_come_back() {
+    // A photo is hundreds of records, so a restart while it is leaving is the
+    // ordinary case, not an edge. The rest of it must go out after the
+    // restart, behind nothing it was not already behind, the history must
+    // say how much is left, and the bytes must still be there to show.
+    let path = temp_db_path("file-mid-upload");
+    let vault = SoftwareVault::from_raw([29u8; 32]);
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+
+    let mut alice = persisted_bob(&path, &vault, &relay, &clock);
+    let mut bob_engine = bob(Arc::clone(&relay), Arc::clone(&clock));
+    let (bundle, bob_queue) = bob_engine.create_bundle(b"relay.onion").unwrap();
+    let bob_fp = alice
+        .start_conversation(&bundle, "Bob", "hello", 1_000)
+        .unwrap();
+    let t = drain(&mut alice, 0, 40);
+    let initial = collect_raw(&relay, &bob_queue).unwrap();
+    let (alice_fp, _) = bob_engine
+        .accept_conversation(bundle.queue.queue_id, &initial, 1_000)
+        .unwrap();
+
+    let photo: Vec<u8> = (0..30_000u32).map(|i| (i % 241) as u8).collect();
+    alice
+        .send_file(&bob_fp, "photo.jpg", "image/jpeg", photo.clone(), t / 1000)
+        .unwrap();
+    let queued = alice.outbox_len();
+    assert!(queued >= 30);
+
+    // A few records leave, then a reply is typed, then the app is killed.
+    let mut now = t;
+    let mut out = 0;
+    while out < 3 {
+        if let TickOutcome::Deposited(_) = alice.tick(now).unwrap() {
+            out += 1;
+        }
+        now += PAD_INTERVAL_MS;
+    }
+    let before_reply = alice.outbox_len();
+    alice
+        .send(&bob_fp, "sent while the photo was leaving", now / 1000)
+        .unwrap();
+    // A reply early in a chain carries the ML-KEM step in its header (D-005),
+    // so it can be several records; count rather than assume.
+    let reply_records = alice.outbox_len() - before_reply;
+    let history = alice.history(&bob_fp).unwrap();
+    let file_entry = history
+        .iter()
+        .find(|e| e.message.attachment.is_some())
+        .expect("the file is in the history");
+    assert_eq!(file_entry.fragments_remaining as usize, queued - 3);
+    assert!(
+        file_entry
+            .message
+            .attachment
+            .as_ref()
+            .unwrap()
+            .data
+            .is_empty(),
+        "listed without its bytes"
+    );
+    assert_eq!(
+        file_entry.message.attachment.as_ref().unwrap().len as usize,
+        photo.len()
+    );
+    assert_eq!(file_entry.message.delivery, DeliveryState::Queued);
+    drop(alice);
+
+    let mut alice = restored(&path, &vault, &relay, &clock, now);
+    assert_eq!(alice.outbox_len(), queued - 3 + reply_records);
+    let history = alice.history(&bob_fp).unwrap();
+    let file_entry = history
+        .iter()
+        .find(|e| e.message.attachment.is_some())
+        .unwrap();
+    assert_eq!(
+        file_entry.fragments_remaining as usize,
+        queued - 3,
+        "progress survives the restart"
+    );
+    // The bytes are there, from the id the history gave.
+    let stored = alice
+        .attachment(file_entry.id)
+        .unwrap()
+        .expect("the file's bytes");
+    assert_eq!(stored.data, photo);
+    assert_eq!(stored.name, "photo.jpg");
+    // And an id that is not a message yields nothing, not someone else's record.
+    assert!(alice.attachment(u64::MAX).unwrap().is_none());
+
+    // The reply still goes out first after the restart, then the photo.
+    let reply_first = loop {
+        if let TickOutcome::Deposited(id) = alice.tick(now).unwrap() {
+            break id;
+        }
+        now += PAD_INTERVAL_MS;
+    };
+    let text_entry = history
+        .iter()
+        .find(|e| e.message.body.starts_with("sent while"))
+        .unwrap();
+    assert_eq!(text_entry.fragments_remaining as usize, reply_records);
+    assert_ne!(reply_first, 0);
+
+    let mut received = Vec::new();
+    for _ in 0..400 {
+        alice.tick(now).unwrap();
+        if let TickOutcome::Retrieved(msgs) = bob_engine.tick(now).unwrap() {
+            received.extend(msgs);
+        }
+        if received.len() >= 2 {
+            break;
+        }
+        now += PAD_INTERVAL_MS;
+    }
+    assert_eq!(received.len(), 2, "both arrive after the restart");
+    assert_eq!(received[0].text, "sent while the photo was leaving");
+    assert_eq!(
+        received[1].attachment.as_ref().unwrap().len as usize,
+        photo.len()
+    );
+    assert_eq!(received[1].contact_fingerprint, alice_fp);
+
+    let history = alice.history(&bob_fp).unwrap();
+    for entry in &history {
+        assert_eq!(entry.fragments_remaining, 0);
+        if entry.message.direction == void_store::model::Direction::Outgoing {
+            assert_eq!(
+                entry.message.delivery,
+                DeliveryState::Deposited,
+                "{:?}",
+                entry.message.body
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_received_file_is_stored_with_its_bytes_and_survives_a_restart() {
+    let path = temp_db_path("file-received");
+    let vault = SoftwareVault::from_raw([31u8; 32]);
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+
+    let mut bob_persisted = persisted_bob(&path, &vault, &relay, &clock);
+    let mut alice = bob_like_alice(&relay, &clock);
+    let (bundle, bob_queue) = bob_persisted.create_bundle(b"relay.onion").unwrap();
+    let bob_fp = alice
+        .start_conversation(&bundle, "Bob", "hello", 1_000)
+        .unwrap();
+    let t = drain(&mut alice, 0, 40);
+    let initial = collect_raw(&relay, &bob_queue).unwrap();
+    let (alice_fp, _) = bob_persisted
+        .accept_conversation(bundle.queue.queue_id, &initial, 1_000)
+        .unwrap();
+
+    let doc = vec![42u8; 5_000];
+    alice
+        .send_file(&bob_fp, "notes.txt", "text/plain", doc.clone(), t / 1000)
+        .unwrap();
+    let mut now = t;
+    let mut got = 0;
+    for _ in 0..200 {
+        alice.tick(now).unwrap();
+        if let TickOutcome::Retrieved(msgs) = bob_persisted.tick(now).unwrap() {
+            got += msgs.len();
+        }
+        if got > 0 {
+            break;
+        }
+        now += PAD_INTERVAL_MS;
+    }
+    assert_eq!(got, 1);
+    drop(bob_persisted);
+
+    let bob_again = restored(&path, &vault, &relay, &clock, now);
+    let history = bob_again.history(&alice_fp).unwrap();
+    let entry = history
+        .iter()
+        .find(|e| e.message.attachment.is_some())
+        .expect("the file came back");
+    assert_eq!(entry.message.delivery, DeliveryState::Received);
+    let file = bob_again.attachment(entry.id).unwrap().unwrap();
+    assert_eq!(file.name, "notes.txt");
+    assert_eq!(file.mime, "text/plain");
+    assert_eq!(file.data, doc);
+    let _ = std::fs::remove_file(&path);
+}

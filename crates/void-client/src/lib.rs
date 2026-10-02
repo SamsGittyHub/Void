@@ -71,6 +71,10 @@ pub enum ClientError {
     NoSuchCall,
     /// System entropy was unavailable.
     Entropy,
+    /// A file is larger than one message can carry
+    /// (`void_proto::content::MAX_FILE_BYTES`), or its name or type is too
+    /// long. Refused before any ratchet state is spent on it.
+    TooLarge,
     /// The local encrypted store failed to read, write, or authenticate a
     /// record — including a persisted record that failed to decode, which
     /// means the same thing corruption at the store layer does.
@@ -100,6 +104,7 @@ impl core::fmt::Display for ClientError {
             ClientError::CallInProgress => "already on a call with this contact",
             ClientError::NoSuchCall => "no call in progress with this contact",
             ClientError::Entropy => "system entropy unavailable",
+            ClientError::TooLarge => "this file is too large to send in one message",
             ClientError::Storage => "local storage failed to read, write, or authenticate",
         };
         f.write_str(s)

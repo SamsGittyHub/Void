@@ -18,10 +18,11 @@ protocol and infrastructure**, not a shippable product — see
 | `void-relay` — mailbox relay | Working: queues, TTL, rate limiting, stateless retrieval auth, content-free push |
 | `void-client` — engine | Working: transport abstraction, constant-rate scheduler, sessions, contacts, restart-survival persistence, duress destruction wired end to end |
 | `void-tor` — Tor bootstrap | Working: bootstraps Arti, opens circuits, hands `TorTransport` a live stream. Also publishes and dials the ephemeral onion services calls use. Proven against the real Tor network — see below |
-| Calls | Protocol, engine, FFI, JNI, and both platform layers built. Run between two Android emulators over the live Tor network: rings in about 8 s, connects in about 6 s, ends from either side. **Never run on iOS or on a physical device, and nobody has heard a voice through it** — D-024, D-028, D-029 |
+| Calls | Protocol, engine, FFI, JNI, and both platform layers built. Run between two Android emulators over the live Tor network: rings in about 8 s, connects in about 6 s, ends from either side. On iOS, the Opus codec path runs in CI on the Simulator (D-033); **no call has run on iOS or on a physical device, and nobody has heard a voice through it** — D-024, D-028, D-029 |
+| Files | A file is a message: kind 3 inside the ratchet, up to 500 KiB, the same records at the same rate, so the relay cannot tell a photo from messages. Core, FFI, JNI and both apps built (pickers, shrunk photos, a time estimate before sending, progress while it leaves, save). Proven end to end through a relay in the core's tests; **never sent between two running apps** — D-032 |
 | `void-cli` — reference client | Working. Plain TCP, loudly insecure, development only |
 | `void-ffi` — C ABI | Working: opening the persistent engine, short invitations (create, open, confirm, contact events), send, tick, history, contacts, Tor bootstrap/attach, calls, and duress |
-| `ios/` | Builds with Xcode and passes its unit and UI tests on the Simulator. Ran on two Simulators over the live Tor network: launch, Tor, an invitation made and read back off the screen, adding a contact, messages both ways, a restart. **Never run on a physical device, so the Secure Enclave key, the QR camera and calls are untested on iOS** — D-019, D-029, D-031 |
+| `ios/` | Builds with Xcode and passes its unit and UI tests on the Simulator. Ran on two Simulators over the live Tor network: launch, Tor, an invitation made and read back off the screen, adding a contact, messages both ways, a restart. Has an app icon, iPad orientations and a two-column iPad layout, pinned by `AppStoreReadinessTests`, so App Store Connect accepts the upload (D-034); the listing, screenshots, export questionnaire and a production relay address are submission-time steps. **Never run on a physical device, so the Secure Enclave key, the QR camera and calls are untested on iOS** — D-019, D-029, D-031 |
 | `void-jni` — JNI ABI | Cross-compiled for Android (arm64-v8a, x86_64) and run inside the app on emulators; run in a desktop JVM against the real core in CI — D-023, D-029 |
 | `android/` | Runs end to end on two emulators over the live Tor network: onboarding, a Keystore-held key, adding a contact, messages, calls, restarts. **Never run on a physical device; the QR camera is untested** (emulators have none) — D-020, D-029 |
 
@@ -39,6 +40,10 @@ Two things are **not** done:
    not the Secure Enclave, so that path has not run either. Emulators have no
    camera and a silent microphone, so scanning a QR code and what a call
    sounds like are both unverified.
+3. **No file has been sent between two running apps.** See D-032. The
+   protocol and engine carry a file end to end through a relay in tests, and
+   both apps' pickers, image shrinking, confirmation and save paths are built,
+   but the apps' side has only been built and type-checked, not run.
 
 **Closed since the table above was last wrong:**
 
@@ -119,6 +124,12 @@ Claims are cheap. Each of these is enforced by a test whose name is given, and
   `a_failed_decrypt_leaves_no_trace_in_the_state`
 - **A relay cannot tell a call from a message** —
   `call_signalling_is_indistinguishable_from_a_message_to_the_relay`
+- **A relay cannot tell a file from messages** —
+  `a_relay_cannot_tell_a_file_from_messages`
+- **A file too large to travel is refused before the ratchet steps** —
+  `a_file_too_large_is_refused_before_the_ratchet_steps`
+- **A reply does not wait behind a photo** —
+  `a_message_sent_during_a_file_upload_goes_ahead_of_it`
 - **Both directions of call audio use different keys** —
   `the_two_directions_use_different_keys`
 - **A relay holds no key material, even for retrieval auth** —
@@ -249,7 +260,7 @@ should require to pass.
 
 ## What was decided while building this
 
-[`docs/DECISIONS.md`](docs/DECISIONS.md) has all thirty entries. The ones worth
+[`docs/DECISIONS.md`](docs/DECISIONS.md) has all thirty-four entries. The ones worth
 knowing about before reading the code:
 
 - **D-005** — the ML-KEM ratchet runs every 4 DH steps, not every step. Doing it
@@ -313,6 +324,12 @@ knowing about before reading the code:
 - **D-030** — a deposit the relay refuses waits its turn instead of holding
   up every contact, and duress drops the identity's keys from memory as well
   as destroying the store.
+- **D-032** — a file is a message: one content kind inside the ratchet, up to
+  500 KiB because that is what one message carries under the worst-case
+  header, sent as the same records at the same one-per-slot rate. The relay
+  cannot tell a photo from a few texts; what a photo costs is minutes, and the
+  apps say how many before sending. Files queue behind every message, so a
+  reply never waits behind a photo.
 - **D-024** — calls run over paired ephemeral onion services, so media never
   touches the relay. Signal/Discord-style calling is WebRTC over UDP, and Tor
   carries no UDP at all; running it outside Tor would put both IP addresses on

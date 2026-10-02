@@ -105,6 +105,15 @@ object VoidCore {
     /** The fixed record size (FR-MSG-02). */
     @JvmStatic external fun recordSize(): Int
 
+    /** The largest file [sendFile] accepts, in bytes (`MAX_FILE_BYTES`). */
+    @JvmStatic external fun fileMaxBytes(): Int
+
+    /** How many records a file of this many bytes takes to send, at most. */
+    @JvmStatic external fun fileRecordCount(dataLen: Int): Int
+
+    /** How often one record leaves, in milliseconds. A protocol constant. */
+    @JvmStatic external fun padIntervalMs(): Long
+
     // --- duress and the lock screen -------------------------------------------
 
     /** Opaque handle to a PIN verifier, or 0 on failure. `duressPin` may be empty. */
@@ -181,6 +190,25 @@ object VoidCore {
     // --- messages and contacts -------------------------------------------------
 
     @JvmStatic external fun send(engineHandle: Long, fingerprint: ByteArray, text: String, now: Long): NativeSendResult?
+
+    /**
+     * Queue a file. A file is a message — same ratchet, same fixed-size
+     * records, one per slot — so it costs time, not shape; [fileRecordCount]
+     * times [padIntervalMs] is the estimate to show first. Refused as
+     * [VoidStatus.TOO_LARGE] before any ratchet state is spent on one over
+     * [fileMaxBytes].
+     */
+    @JvmStatic external fun sendFile(
+        engineHandle: Long,
+        fingerprint: ByteArray,
+        name: String,
+        mime: String,
+        data: ByteArray,
+        now: Long,
+    ): NativeSendResult?
+
+    /** The bytes of a stored file, by the id [messages] listed it under; empty if there is none. */
+    @JvmStatic external fun attachment(engineHandle: Long, id: Long): ByteArray
 
     @JvmStatic external fun tick(engineHandle: Long, nowMs: Long): NativeTickResult?
 
@@ -391,12 +419,28 @@ sealed class ContactEvent {
     }
 }
 
+/** What a file in a conversation is, without its bytes. */
+data class AttachmentInfo(val name: String, val mime: String, val size: Int) {
+    /** Whether to show it as a picture rather than a file card. */
+    val isImage: Boolean get() = mime.lowercase().startsWith("image/")
+
+    /** What the conversation list shows for it. */
+    val summary: String get() = if (isImage) "Photo" else name.ifBlank { "File" }
+}
+
 /** One message from the stored history. */
 data class StoredMessage(
+    /** The store record that holds it; what [Engine.attachment] takes. */
+    val id: Long,
     val isOutgoing: Boolean,
     val delivery: DeliveryState,
     val timestampSeconds: Long,
+    /** Empty for a file. */
     val text: String,
+    /** The file it is, if it is one, without its bytes. */
+    val attachment: AttachmentInfo? = null,
+    /** Records of it still to leave. Zero once sent, and for anything received. */
+    val fragmentsRemaining: Int = 0,
 ) {
     companion object {
         /** Layout documented on `void_ffi::void_engine_messages`. */
@@ -404,11 +448,21 @@ data class StoredMessage(
             val reader = ByteReader(buf)
             val out = mutableListOf<StoredMessage>()
             while (!reader.isAtEnd) {
+                val id = reader.u64() ?: break
                 val direction = reader.u8() ?: break
                 val delivery = reader.u8() ?: break
                 val timestamp = reader.u64() ?: break
+                val remaining = reader.u16() ?: break
                 val text = reader.u32()?.asLength()?.let { reader.string(it) } ?: break
-                out.add(StoredMessage(direction == 1, DeliveryState.fromCode(delivery), timestamp, text))
+                val hasFile = reader.u8() ?: break
+                var attachment: AttachmentInfo? = null
+                if (hasFile == 1) {
+                    val name = reader.u16()?.let { reader.string(it) } ?: break
+                    val mime = reader.u16()?.let { reader.string(it) } ?: break
+                    val size = reader.u32()?.asLength() ?: break
+                    attachment = AttachmentInfo(name, mime, size)
+                }
+                out.add(StoredMessage(id, direction == 1, DeliveryState.fromCode(delivery), timestamp, text, attachment, remaining))
             }
             return out
         }
@@ -539,7 +593,7 @@ class NativeTickResult(val outcome: Int, val messages: ByteArray)
 /** Mirrors `void_ffi::VoidStatus`. */
 enum class VoidStatus {
     OK, BAD_ARGUMENT, FAILED, OFFLINE, KEY_CHANGED, LOCKED, INTERNAL, EXPIRED, ALREADY_CONNECTED, OWN_INVITE,
-    WRONG_RELAY;
+    WRONG_RELAY, TOO_LARGE;
 
     companion object {
         fun from(ordinal: Int): VoidStatus = entries.getOrElse(ordinal) { FAILED }

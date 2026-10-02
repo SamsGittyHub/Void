@@ -155,6 +155,8 @@ private struct MainView: View {
                     myWords: state.fingerprintWords,
                     onNewContact: { state.showingNewContact = true },
                     onSend: { fingerprint, text in state.send(to: fingerprint, text: text) },
+                    onSendFile: { fingerprint, pending in state.sendFile(to: fingerprint, pending) },
+                    loadAttachment: { recordId in await state.attachmentData(recordId: recordId) },
                     onVerificationResult: { fingerprint, matched in
                         state.handleVerificationResult(fingerprint: fingerprint, matched: matched)
                     },

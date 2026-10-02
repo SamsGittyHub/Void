@@ -118,6 +118,7 @@ enum VoidError: Error, LocalizedError, Equatable {
     case alreadyConnected
     case ownInvite
     case wrongRelay
+    case tooLarge
 
     init(_ status: VoidStatus) {
         switch status.rawValue {
@@ -130,6 +131,7 @@ enum VoidError: Error, LocalizedError, Equatable {
         case 8: self = .alreadyConnected
         case 9: self = .ownInvite
         case 10: self = .wrongRelay
+        case 11: self = .tooLarge
         default: self = .failed
         }
     }
@@ -155,6 +157,9 @@ enum VoidError: Error, LocalizedError, Equatable {
         case .wrongRelay:
             return "This invitation uses a different Void server from this app, so it can't be "
                 + "opened here."
+        case .tooLarge:
+            return "This file is too large to send. Void sends files of up to "
+                + "\(VoidCore.fileMaxBytes / 1024) KB; photos are shrunk to fit."
         case .badArgument, .failed, .internalError:
             return "Something went wrong. Nothing was sent."
         }
@@ -520,6 +525,64 @@ final class VoidCore: @unchecked Sendable {
         return messageId
     }
 
+    /// Queue a file: a photo, a document, anything up to `fileMaxBytes`. A
+    /// file is a message — same ratchet, same fixed-size records, one per
+    /// emission slot — so what it costs is time, not shape; `fileRecordCount`
+    /// times `padIntervalMs` is the estimate to show before sending. Its
+    /// records go out behind every queued message, so a reply typed while a
+    /// photo is leaving does not wait for it. Throws `.tooLarge` before any
+    /// ratchet state is spent on a file that cannot travel.
+    @discardableResult
+    func sendFile(to fingerprint: Data, name: String, mime: String, data: Data, now: UInt64) throws
+        -> UInt64
+    {
+        var messageId: UInt64 = 0
+        let nameBytes = Array(name.utf8)
+        let mimeBytes = Array(mime.utf8)
+        let status = fingerprint.withUnsafeBytes { fp in
+            nameBytes.withUnsafeBufferPointer { n in
+                mimeBytes.withUnsafeBufferPointer { m in
+                    data.withUnsafeBytes { d in
+                        void_engine_send_file(
+                            handle,
+                            fp.bindMemory(to: UInt8.self).baseAddress,
+                            n.baseAddress, UInt(n.count),
+                            m.baseAddress, UInt(m.count),
+                            d.bindMemory(to: UInt8.self).baseAddress, UInt(d.count),
+                            now,
+                            &messageId
+                        )
+                    }
+                }
+            }
+        }
+        try check(status)
+        return messageId
+    }
+
+    /// The largest file `sendFile` accepts, in bytes.
+    static var fileMaxBytes: Int { Int(void_file_max_bytes()) }
+
+    /// How many records a file of `bytes` takes to send, at most.
+    static func fileRecordCount(bytes: Int) -> Int {
+        Int(void_file_record_count(UInt(max(bytes, 0))))
+    }
+
+    /// How often one record leaves, in milliseconds. A protocol constant.
+    static var padIntervalMs: UInt64 { void_pad_interval_ms() }
+
+    /// How long a file of `bytes` takes to send, in seconds, at most.
+    static func fileSendSeconds(bytes: Int) -> Int {
+        fileRecordCount(bytes: bytes) * Int(padIntervalMs / 1000)
+    }
+
+    /// The bytes of a stored file, by the id `messages` listed it under.
+    /// `nil` if that message is not a file, or is gone.
+    func attachment(id: UInt64) -> Data? {
+        let bytes = CoreBuffer(void_engine_attachment(handle, id)).array
+        return bytes.isEmpty ? nil : Data(bytes)
+    }
+
     /// What one `tick` did, and any messages it collected.
     enum TickResult: Equatable {
         case waiting
@@ -532,7 +595,11 @@ final class VoidCore: @unchecked Sendable {
 
     struct ReceivedMessage: Equatable {
         let fingerprint: Data
+        /// The text; empty for a file.
         let text: String
+        /// The file it was, if it was one — name, type and size. Its bytes
+        /// are in the history.
+        let attachment: AttachmentInfo?
     }
 
     /// Advance the scheduler by one tick (FR-MSG-06). Call on a repeating
@@ -554,10 +621,19 @@ final class VoidCore: @unchecked Sendable {
             var out: [ReceivedMessage] = []
             while !reader.isAtEnd {
                 guard let fingerprint = reader.data(32),
+                    let kind = reader.u8(),
+                    let size = reader.u32(),
                     let length = reader.u32(),
                     let text = reader.string(Int(length))
                 else { break }
-                out.append(ReceivedMessage(fingerprint: fingerprint, text: text))
+                if kind == 3 {
+                    out.append(
+                        ReceivedMessage(
+                            fingerprint: fingerprint, text: "",
+                            attachment: AttachmentInfo(name: text, mime: "", size: Int(size))))
+                } else {
+                    out.append(ReceivedMessage(fingerprint: fingerprint, text: text, attachment: nil))
+                }
             }
             return .retrieved(out)
         default: return .offline
@@ -573,18 +649,34 @@ final class VoidCore: @unchecked Sendable {
         var reader = ByteReader(CoreBuffer(bytes).array)
         var out: [StoredMessage] = []
         while !reader.isAtEnd {
-            guard let direction = reader.u8(),
+            guard let id = reader.u64(),
+                let direction = reader.u8(),
                 let delivery = reader.u8(),
                 let timestamp = reader.u64(),
+                let remaining = reader.u16(),
                 let length = reader.u32(),
-                let text = reader.string(Int(length))
+                let text = reader.string(Int(length)),
+                let hasFile = reader.u8()
             else { break }
+            var attachment: AttachmentInfo?
+            if hasFile == 1 {
+                guard let nameLength = reader.u16(),
+                    let name = reader.string(Int(nameLength)),
+                    let mimeLength = reader.u16(),
+                    let mime = reader.string(Int(mimeLength)),
+                    let size = reader.u32()
+                else { break }
+                attachment = AttachmentInfo(name: name, mime: mime, size: Int(size))
+            }
             out.append(
                 StoredMessage(
+                    id: id,
                     isOutgoing: direction == 1,
                     delivery: DeliveryState(code: delivery),
                     timestamp: Date(timeIntervalSince1970: TimeInterval(timestamp)),
-                    text: text
+                    text: text,
+                    attachment: attachment,
+                    fragmentsRemaining: Int(remaining)
                 )
             )
         }
@@ -696,12 +788,39 @@ enum InviteFailure: Equatable {
 
 // MARK: - Stored messages
 
+/// What a file in a conversation is, without its bytes. Lives here rather
+/// than in `Models.swift` because the core wrapper parses it off the
+/// boundary, and the Linux bindings check type-checks this file without the
+/// models.
+struct AttachmentInfo: Equatable {
+    let name: String
+    let mime: String
+    /// Size in bytes.
+    let size: Int
+
+    /// Whether to show it as a picture rather than a file card.
+    var isImage: Bool { mime.lowercased().hasPrefix("image/") }
+
+    /// What the conversation list shows for it.
+    var summary: String {
+        if isImage { return "Photo" }
+        return name.isEmpty ? "File" : name
+    }
+}
+
 /// One message from the stored history.
 struct StoredMessage: Equatable {
+    /// The store record that holds it; what `VoidCore.attachment(id:)` takes.
+    let id: UInt64
     let isOutgoing: Bool
     let delivery: DeliveryState
     let timestamp: Date
+    /// Empty for a file.
     let text: String
+    /// The file it is, if it is one, without its bytes.
+    let attachment: AttachmentInfo?
+    /// Records of it still to leave. Zero once sent, and for anything received.
+    let fragmentsRemaining: Int
 }
 
 // MARK: - Trust state
