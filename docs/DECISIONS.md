@@ -1284,7 +1284,8 @@ available.
   and the user calls again.
 - The iOS app has not run, and no build of either app has run on physical
   hardware. D-024's rule — treat calls as unproven until someone has held a
-  conversation — stands for iOS, and for real audio on both.
+  conversation — stands for iOS, and for real audio on both. *(The iOS app
+  has since run on the Simulator: D-031.)*
 
 **Enforced by.** `QRCodeRenderTests` (a real short link from the core renders
 as a code that CoreImage's detector reads back as the same link),
@@ -1323,6 +1324,65 @@ the platform still destroys its hardware key first.
 `void-client/tests/end_to_end.rs`; `duress_destroy_wipes_memory_and_leaves_the_database_unopenable`,
 which now also requires the identity and the name to be gone, in
 `void-client/tests/duress.rs`.
+
+---
+
+## D-031 — The iOS app runs: the core gets the stack it needs, and Tor a private directory
+
+**Found, not planned,** the first time the iOS app was built with Xcode since
+D-029, on a Mac with Xcode 26.6 and the iOS 26.5 Simulator. CI's iOS job had
+failed on every run since D-029 because of the first of these.
+
+1. **It crashed at launch, before any screen.** SIGBUS, "Thread stack size
+   exceeded", inside `ml_dsa::VerifyingKey::new`: opening the engine generates
+   the identity, and that ran on a dispatch queue, whose threads have 512 KiB
+   of stack on iOS. The core's own end-to-end tests, built with the profile
+   the app links, overflow at 512 KiB and pass at 576. In CI the unit tests'
+   host app crashed the same way before a test began ("Early unexpected exit,
+   operation never finished bootstrapping"). Android is spared by margin, not
+   by design: its threads default to about 1 MiB.
+2. **Once it launched, it was offline for good.** Arti refused to bootstrap,
+   "problem with filesystem permissions", in well under a second, and the app
+   retried with backoff indefinitely with nothing on screen to say why.
+   `FileManager` creates directories 0755, and Arti wants its state and cache
+   readable by their owner only.
+
+**Decided.**
+
+- **Every thread that calls the core is the app's own, with 8 MiB of stack.**
+  `CoreQueue` is now a thread rather than a dispatch queue, with its own
+  repeating timer, and keeps D-029's rules: an engine call never overlaps
+  another, and a slow tick delays the next rather than piling up. Unlocking,
+  Tor bootstrap, the relay attach, and call setup run on `CoreThread.detach`;
+  the call audio threads set the same stack size. The stack is address space
+  reserved up front; only the pages a call touches are ever backed.
+- **Every directory the app makes is 0700,** and one an earlier build left
+  0755 is closed again at the next launch.
+
+**How this was checked.** `xcodebuild test` on the Simulator: the unit tests
+and the QR code UI test pass. Then the app ran on two Simulators over the live
+Tor network, against a local `void-relayd` published as an onion service by
+C-tor, driven by a UI test on each phone. In order: Tor bootstrapped and the
+relay attached inside the app; an invitation was made, its link read back off
+the screen's QR code with CoreImage's detector, and parked on the relay in
+about a minute; the other phone pasted the link, collected the invitation in
+ten seconds, showed "Connect with Ada?" with the name it carried, and
+connected; the inviter showed "Bea joined" ninety seconds later. Both apps
+were then relaunched: each contact came back from the encrypted database, a
+message went from the inviter ("Sent" ten seconds after sending) and arrived
+thirty-four seconds after it was sent, and was still there after the
+receiver's own restart; and the reply was "Sent" eight seconds after sending
+and arrived sixteen seconds after it was sent.
+
+What this did not check: the Secure Enclave key (the Simulator has none, so
+the app used the Keychain and said Software), the QR camera, calls, and any
+physical device. D-024's rule on calls stands for iOS.
+
+**Enforced by.** `AppDirectoriesTests` (both fail against the old code, which
+left the directories 0755); the bindings check, which now requires the core
+queue's thread to have `CoreThread.stackSize` of stack, a cancelled timer to
+stop, and an identity to be made on it; and CI's iOS job, whose host app no
+longer crashes.
 
 ---
 

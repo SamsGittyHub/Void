@@ -21,7 +21,7 @@ protocol and infrastructure**, not a shippable product — see
 | Calls | Protocol, engine, FFI, JNI, and both platform layers built. Run between two Android emulators over the live Tor network: rings in about 8 s, connects in about 6 s, ends from either side. **Never run on iOS or on a physical device, and nobody has heard a voice through it** — D-024, D-028, D-029 |
 | `void-cli` — reference client | Working. Plain TCP, loudly insecure, development only |
 | `void-ffi` — C ABI | Working: opening the persistent engine, short invitations (create, open, confirm, contact events), send, tick, history, contacts, Tor bootstrap/attach, calls, and duress |
-| `ios/` | Moved onto the current core: persistence behind a Secure Enclave key, Tor, one-QR invitations, calls. **Not rebuilt with Xcode since** — the Swift that calls the core was type-checked and run against it on Linux; the SwiftUI was not compiled — D-019, D-029 |
+| `ios/` | Builds with Xcode and passes its unit and UI tests on the Simulator. Ran on two Simulators over the live Tor network: launch, Tor, an invitation made and read back off the screen, adding a contact, messages both ways, a restart. **Never run on a physical device, so the Secure Enclave key, the QR camera and calls are untested on iOS** — D-019, D-029, D-031 |
 | `void-jni` — JNI ABI | Cross-compiled for Android (arm64-v8a, x86_64) and run inside the app on emulators; run in a desktop JVM against the real core in CI — D-023, D-029 |
 | `android/` | Runs end to end on two emulators over the live Tor network: onboarding, a Keystore-held key, adding a contact, messages, calls, restarts. **Never run on a physical device; the QR camera is untested** (emulators have none) — D-020, D-029 |
 
@@ -33,12 +33,12 @@ Two things are **not** done:
    Nothing below substitutes for it, including the differential tests
    mentioned next — those catch disagreement between two implementations,
    not a flaw both share, and they are not an ACVP run.
-2. **Neither app has run on a phone, and the iOS app has not run at all
-   since it moved onto the current core.** See D-029. The Android app ran end
-   to end on two emulators over the live Tor network. The iOS app's Swift
-   that calls the core was checked against it on Linux, but the app has not
-   been rebuilt with Xcode. Emulators have no camera and a silent microphone,
-   so scanning a QR code and what a call sounds like are both unverified.
+2. **Neither app has run on a phone.** See D-029 and D-031. Both ran end to
+   end on two emulators or Simulators over the live Tor network, Android with
+   calls and iOS without. On the Simulator iOS keeps its key in the Keychain,
+   not the Secure Enclave, so that path has not run either. Emulators have no
+   camera and a silent microphone, so scanning a QR code and what a call
+   sounds like are both unverified.
 
 **Closed since the table above was last wrong:**
 
@@ -78,16 +78,16 @@ Two things are **not** done:
   (via `xcodegen`) produces a real `.xcodeproj` linking it. The engine's
   conversation surface is wired into `AppState.swift`, which drives the
   `ConversationViews`/`OnboardingViews`/`SecuritySettingsViews` — not mock
-  data. `xcodebuild build` and `xcodebuild test` both succeeded for
-  `iphonesimulator` before the move onto the current core (D-029), and the
-  app was installed and launched on a booted Simulator. See D-019 for the
-  pipeline and the two build-time gotchas it needed. It now opens a persistent
-  engine behind a Secure Enclave key, bootstraps Tor, and adds contacts with
-  one QR code; that version has not been rebuilt with Xcode yet.
+  data. See D-019 for the pipeline and the two build-time gotchas it needed.
+  It opens a persistent engine behind a Secure Enclave key, bootstraps Tor,
+  and adds contacts with one QR code (D-029). Its first run with Xcode after
+  that move crashed at launch and then could not bootstrap Tor; both are
+  fixed, and it has since run on two Simulators against a relay over the live
+  Tor network (D-031).
 
 **What "Tor is real" does not yet mean.** Both apps bootstrap Arti at launch
-and attach the relay. The Android app has done so on emulators, over the live
-network; neither has done so on a phone. The onion services in these tests are
+and attach the relay. The Android app has done so on emulators and the iOS
+app on Simulators, over the live network; neither has done so on a phone. The onion services in these tests are
 host-side C-tor fronting a local relay, for the tests' own convenience, not a
 deployed relay — standing up the *production* relay as a long-running onion
 service is a deployment task, not a code gap.

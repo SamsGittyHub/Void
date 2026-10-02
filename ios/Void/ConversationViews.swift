@@ -329,6 +329,7 @@ struct ConversationView: View {
             } label: {
                 Image(systemName: "arrow.up.circle.fill").font(.title2)
             }
+            .accessibilityLabel("Send")
             .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(12)
