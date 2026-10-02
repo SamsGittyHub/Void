@@ -15,6 +15,14 @@
 //! tenth of samples is discarded first: on a shared machine those are
 //! interruptions, not the operation.
 //!
+//! Every sample's input is copied into one working buffer before it is timed,
+//! so the two classes differ only in content. Read from two buffers, they also
+//! differ in address, and an address can cost time on its own. When each forged
+//! tag was read where it lay, `aead::open` showed |t| of 20 to 160 at about one
+//! stack offset in ten (measured with ASLR off), so about one ordinary run in
+//! ten failed with no leak in the code. Copied into one buffer, no offset went
+//! above 4.5, and an early-exit `ct::eq` still showed |t| in the thousands.
+//!
 //! ## What a pass does and does not mean
 //!
 //! A pass means this machine, with this compiler, showed no difference at this
@@ -72,16 +80,25 @@ fn welch(a: &Stats, b: &Stats) -> f64 {
 }
 
 /// Time `batch` runs of `op` per sample, `samples` times, each sample's class
-/// drawn at random; print and return |t|.
-fn check(name: &str, samples: usize, batch: usize, mut op: impl FnMut(usize)) -> f64 {
+/// drawn at random and its input copied into the one buffer `op` is given;
+/// print and return |t|.
+fn check(
+    name: &str,
+    samples: usize,
+    batch: usize,
+    inputs: [&[u8]; 2],
+    mut op: impl FnMut(&[u8]),
+) -> f64 {
     let mut classes = vec![0u8; samples];
     rand::fill(&mut classes).expect("entropy");
+    let mut work = inputs[0].to_vec();
     let mut timings = Vec::with_capacity(samples);
     for c in classes {
         let class = usize::from(c & 1);
+        work.copy_from_slice(inputs[class]);
         let start = Instant::now();
         for _ in 0..batch {
-            op(class);
+            op(&work);
         }
         timings.push((class, start.elapsed().as_nanos() as f64));
     }
@@ -121,8 +138,8 @@ fn main() {
         "ct::eq — equal vs differing at once",
         200_000,
         64,
-        |class| {
-            let other = if class == 0 { &secret } else { &differs };
+        [&secret, &differs],
+        |other| {
             black_box(ct::eq(black_box(&secret), black_box(other)));
         },
     ));
@@ -141,12 +158,8 @@ fn main() {
         "aead::open — tag wrong in its first vs last byte",
         100_000,
         8,
-        |class| {
-            let forged = if class == 0 {
-                &wrong_first
-            } else {
-                &wrong_last
-            };
+        [&wrong_first, &wrong_last],
+        |forged| {
             black_box(aead::open(&key, &nonce, b"", black_box(forged)).is_err());
         },
     ));
@@ -161,8 +174,8 @@ fn main() {
         "mlkem::decaps — valid vs random ciphertext",
         10_000,
         1,
-        |class| {
-            let ciphertext = if class == 0 { &valid } else { &random };
+        [&valid, &random],
+        |ciphertext| {
             black_box(mlkem::decaps(&pair.decaps_key, black_box(ciphertext)).ok());
         },
     ));
