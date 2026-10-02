@@ -1,10 +1,10 @@
-# Void Protocol Specification v3
+# Void Protocol Specification v4
 
 **Status:** Draft, for review before implementation freeze (PRD §11 Phase 1
 deliverable)
-**Protocol identifier:** `void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87` —
+**Protocol identifier:** `void/v4/pqxdh/x25519+mlkem1024/ed25519+mldsa87` —
 `v2` added message content framing (§13a); `v3` added call offer timestamps and
-the busy signal (§13b).
+the busy signal (§13b); `v4` added files (§13a, kind 3).
 
 This document specifies the bytes on the wire. It is written so that an
 independent implementation could be built from it, and so that a reviewer can
@@ -628,10 +628,30 @@ Every ratchet plaintext carries a kind byte before its body:
 plaintext = u8(kind) || body
 kind 1 = Text   body = UTF-8
 kind 2 = Call   body = CallSignal (§13b)
+kind 3 = File   body = bytes16(name) || bytes16(mime) || bytes32(data)
 ```
 
 An unknown kind is an error, never a silent drop — a message a client cannot
-read must not look to the sender like delivery.
+read must not look to the sender like delivery. That is also why adding kind 3
+moved the identifier to `v4`: a `v3` client would drop every file as malformed
+while the sender saw "Sent".
+
+**Files (kind 3).** A file is one message. It rides the ratchet, fragments
+into records and crosses the relay exactly as text does; the relay learns only
+that more records went by. `name` is UTF-8 of at most `MAX_FILE_NAME_LEN`
+(255) bytes and `mime` of at most `MAX_FILE_MIME_LEN` (127); either may be
+empty. `data` is at most `MAX_FILE_BYTES` (512,000), which is what fits in the
+largest message a reassembler accepts — `MAX_FRAGMENTS × RECORD_BODY_CAPACITY`
+= 516,608 bytes — once the worst-case ratchet message overhead (3,216 bytes:
+two `bytes32` prefixes, a header carrying an ML-KEM step, the AEAD tag) and
+this framing at its longest (391 bytes) are taken out. A file past any of these
+bounds is refused by the sender before encryption and by the receiver on
+decode; `the_largest_file_fits_one_message_under_the_worst_case_header` checks
+the arithmetic against the real encoder.
+
+What a file costs is time, not shape: a `MAX_FILE_BYTES` file is
+`MAX_FRAGMENTS` records, one per `PAD_INTERVAL_MS`, so about 43 minutes. The
+sender's interface quotes that before sending (`file_record_count`).
 
 The kind is **inside** the ratchet ciphertext, not in the record header. Putting
 a content type where fragmentation could see it would tell the relay which of
@@ -763,6 +783,9 @@ asserted against in `the_call_disclosure_says_what_is_true_and_not_what_is_not`.
 | `MAX_SKIP` | 1,000 |
 | `MAX_SKIPPED_STORED` | 2,000 |
 | `MAX_FRAGMENTS` | 512 |
+| `MAX_FILE_BYTES` | 512,000 |
+| `MAX_FILE_NAME_LEN` | 255 |
+| `MAX_FILE_MIME_LEN` | 127 |
 | Queue TTL | 14 days |
 | Deposit rate limit | 600/queue/hour |
 | Wake epoch | 6 hours |
@@ -785,6 +808,8 @@ asserted against in `the_call_disclosure_says_what_is_true_and_not_what_is_not`.
 | Relay cannot forge messages | ratchet authentication | `a_relay_returning_forged_records_cannot_inject_messages` |
 | Relay cannot destroy a session by replay | receive commits after the tag (§6.5.1) | `a_relay_redelivering_an_old_record_cannot_kill_a_conversation` |
 | Relay cannot tell a call from a message | content kind is inside the ciphertext | `call_signalling_is_indistinguishable_from_a_message_to_the_relay` |
+| Relay cannot tell a file from messages | content kind is inside the ciphertext; same records, same rate | `a_relay_cannot_tell_a_file_from_messages` |
+| A file too large for one message is refused before the ratchet steps | `FileContent::new` bounds every field before encryption | `a_file_too_large_is_refused_before_the_ratchet_steps` |
 | Call media is confidential to the two ends | keys derive from a secret sent inside the ratchet | `the_two_directions_use_different_keys` |
 | Relay cannot stall delivery with partial messages | reassembly evicts, never fails | `a_flood_of_stalled_messages_does_not_block_a_real_one` |
 | Relay holds no key material | intrinsic proof verification | `a_key_that_does_not_address_the_queue_is_refused` |

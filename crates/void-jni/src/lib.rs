@@ -368,6 +368,28 @@ pub extern "system" fn Java_app_void_VoidCore_recordSize(_env: JNIEnv, _class: J
     void_ffi::void_record_size() as jint
 }
 
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_fileMaxBytes(_env: JNIEnv, _class: JClass) -> jint {
+    void_ffi::void_file_max_bytes() as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_fileRecordCount(
+    _env: JNIEnv,
+    _class: JClass,
+    data_len: jint,
+) -> jint {
+    if data_len < 0 {
+        return 0;
+    }
+    jint::from(void_ffi::void_file_record_count(data_len as usize))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_padIntervalMs(_env: JNIEnv, _class: JClass) -> jlong {
+    void_ffi::void_pad_interval_ms() as jlong
+}
+
 // --- duress and the lock screen ---------------------------------------------
 
 #[no_mangle]
@@ -971,6 +993,75 @@ pub extern "system" fn Java_app_void_VoidCore_send<'a>(
             "(IJ)V",
             &[JValue::Int(status as jint), JValue::Long(out_id as jlong)],
         )
+    })
+}
+
+/// `app.void.NativeSendResult(status: Int, messageId: Long)`, as `send`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_sendFile<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    engine_handle: jlong,
+    fingerprint: JByteArray<'a>,
+    name: JString<'a>,
+    mime: JString<'a>,
+    data: JByteArray<'a>,
+    now: jlong,
+) -> JObject<'a> {
+    let env = &mut env;
+    guard(JObject::null(), || {
+        let fp = read_bytes(env, &fingerprint);
+        if fp.len() != 32 {
+            return find_and_new_object(
+                env,
+                "app/void/NativeSendResult",
+                "(IJ)V",
+                &[
+                    JValue::Int(VoidStatus::BadArgument as jint),
+                    JValue::Long(0),
+                ],
+            );
+        }
+        let name = read_string(env, &name);
+        let mime = read_string(env, &mime);
+        let data = read_bytes(env, &data);
+        let mut out_id: u64 = 0;
+        let status = unsafe {
+            void_ffi::void_engine_send_file(
+                engine_handle as *mut VoidEngine,
+                fp.as_ptr(),
+                name.as_ptr(),
+                name.len(),
+                mime.as_ptr(),
+                mime.len(),
+                data.as_ptr(),
+                data.len(),
+                now as u64,
+                &mut out_id,
+            )
+        };
+        find_and_new_object(
+            env,
+            "app/void/NativeSendResult",
+            "(IJ)V",
+            &[JValue::Int(status as jint), JValue::Long(out_id as jlong)],
+        )
+    })
+}
+
+/// The bytes of a stored file, by the id `messages` listed it under; empty
+/// if there is no such file.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachment(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_handle: jlong,
+    id: jlong,
+) -> jbyteArray {
+    let env = &mut env;
+    guard(std::ptr::null_mut(), || unsafe {
+        let bytes = void_ffi::void_engine_attachment(engine_handle as *const VoidEngine, id as u64);
+        bytes_to_jbytearray(env, bytes)
     })
 }
 

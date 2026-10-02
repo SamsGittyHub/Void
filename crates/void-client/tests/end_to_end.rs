@@ -1802,3 +1802,259 @@ fn set_transport_is_the_hook_the_platform_layer_uses_after_bootstrapping_tor() {
     // `TorHandle::connect`'s `TorTransport` takes.
     assert!(engine.set_transport(Box::new(NullTransport::new())).is_ok());
 }
+
+// --- files -------------------------------------------------------------------
+//
+// A file is a message: the same ratchet, the same records, the same slots.
+// These check that it arrives whole, that the relay sees nothing different,
+// that a reply does not wait behind it, and that one too large is refused
+// before anything is spent on it.
+
+/// Tick `sender` then `receiver` one slot at a time until the receiver gets
+/// `count` messages or the budget runs out. Returns the time reached and what
+/// arrived, files included.
+fn until_received(
+    sender: &mut Engine,
+    receiver: &mut Engine,
+    start_ms: u64,
+    slots: u64,
+    count: usize,
+) -> (u64, Vec<void_client::engine::ReceivedMessage>) {
+    let mut t = start_ms;
+    let mut got = Vec::new();
+    for _ in 0..slots {
+        sender.tick(t).unwrap();
+        if let TickOutcome::Retrieved(received) = receiver.tick(t).unwrap() {
+            got.extend(received);
+        }
+        if got.len() >= count {
+            break;
+        }
+        t += PAD_INTERVAL_MS;
+    }
+    (t, got)
+}
+
+#[test]
+fn a_file_travels_as_a_message_and_arrives_whole() {
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 90);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 91);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    // Tens of records: a small photo.
+    let photo: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    alice
+        .send_file(&bob_fp, "photo.jpg", "image/jpeg", photo.clone(), t / 1000)
+        .unwrap();
+    let records_before = relay.metrics().unwrap().records;
+    assert!(
+        alice.outbox_len() >= 40,
+        "{} records queued",
+        alice.outbox_len()
+    );
+
+    let (_, got) = until_received(&mut alice, &mut bob, t, 400, 1);
+    assert_eq!(got.len(), 1, "the file arrives as one message");
+    let file = got[0].attachment.as_ref().expect("a file, not text");
+    assert_eq!(file.name, "photo.jpg");
+    assert_eq!(file.mime, "image/jpeg");
+    assert_eq!(file.len as usize, photo.len());
+    assert!(got[0].text.is_empty());
+    // The relay saw records go by, and nothing else: no size, no type, no
+    // name. Its view is counted in the next test.
+    assert!(relay.metrics().unwrap().records >= records_before);
+}
+
+#[test]
+fn a_relay_cannot_tell_a_file_from_messages() {
+    // FR-MSG-02 for files: every deposit is SEALED_RECORD_SIZE, so a photo
+    // is indistinguishable from the same number of text messages. The
+    // sender's deposits are counted straight off the transport.
+    use void_proto::envelope::SEALED_RECORD_SIZE;
+
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 92);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 93);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let recording = Arc::new(Mutex::new(Vec::new()));
+    alice
+        .set_transport(Box::new(RecordingTransport {
+            inner: MemoryTransport::new(Arc::clone(&relay), Arc::clone(&clock)),
+            sizes: Arc::clone(&recording),
+        }))
+        .unwrap();
+    alice
+        .send_file(
+            &bob_fp,
+            "notes.pdf",
+            "application/pdf",
+            vec![9u8; 12_345],
+            t / 1000,
+        )
+        .unwrap();
+    alice.send(&bob_fp, "and a reply", t / 1000).unwrap();
+    drain(&mut alice, t, 200);
+
+    let sizes = recording.lock().unwrap();
+    assert!(sizes.len() > 12, "{} deposits", sizes.len());
+    assert!(
+        sizes.iter().all(|&s| s == SEALED_RECORD_SIZE),
+        "every deposit the same size: {sizes:?}"
+    );
+}
+
+/// A transport that records the size of every deposit before passing it on.
+struct RecordingTransport {
+    inner: MemoryTransport,
+    sizes: Arc<Mutex<Vec<usize>>>,
+}
+
+impl void_client::transport::Transport for RecordingTransport {
+    fn kind(&self) -> void_client::transport::TransportKind {
+        self.inner.kind()
+    }
+
+    fn exchange(&mut self, request: &Frame) -> void_client::ClientResult<Frame> {
+        if request.kind == FrameType::Deposit {
+            // A deposit frame is the sealed record plus the queue id.
+            let deposit = void_proto::envelope::Deposit::decode(&request.body).unwrap();
+            self.sizes.lock().unwrap().push(deposit.sealed.len());
+        }
+        self.inner.exchange(request)
+    }
+
+    fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    fn disconnect(&mut self) {
+        self.inner.disconnect()
+    }
+}
+
+#[test]
+fn a_message_sent_during_a_file_upload_goes_ahead_of_it() {
+    // One record per slot either way; but the reply takes the next slot
+    // rather than waiting for a hundred records of photo.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 94);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 95);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let file_id = alice
+        .send_file(&bob_fp, "big.bin", "", vec![1u8; 100_000], t / 1000)
+        .unwrap();
+    // A few records have left before the reply is typed.
+    let mut now = t;
+    let mut file_records_out = 0;
+    while file_records_out < 3 {
+        if let TickOutcome::Deposited(id) = alice.tick(now).unwrap() {
+            assert_eq!(id, file_id);
+            file_records_out += 1;
+        }
+        now += PAD_INTERVAL_MS;
+    }
+    let text_id = alice.send(&bob_fp, "still there?", now / 1000).unwrap();
+    let next = loop {
+        if let TickOutcome::Deposited(id) = alice.tick(now).unwrap() {
+            break id;
+        }
+        now += PAD_INTERVAL_MS;
+    };
+    assert_eq!(
+        next, text_id,
+        "the reply went out before the rest of the file"
+    );
+
+    // Both arrive, the reply well before the file finishes.
+    let (_, got) = until_received(&mut alice, &mut bob, now, 400, 2);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].text, "still there?");
+    assert_eq!(got[1].attachment.as_ref().unwrap().len, 100_000);
+}
+
+#[test]
+fn a_file_too_large_is_refused_before_the_ratchet_steps() {
+    use void_proto::content::MAX_FILE_BYTES;
+
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 96);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 97);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    assert_eq!(
+        alice.send_file(
+            &bob_fp,
+            "huge.bin",
+            "",
+            vec![0u8; MAX_FILE_BYTES + 1],
+            t / 1000
+        ),
+        Err(ClientError::TooLarge)
+    );
+    assert_eq!(
+        alice.send_file(&bob_fp, &"n".repeat(300), "", Vec::new(), t / 1000),
+        Err(ClientError::TooLarge)
+    );
+    assert_eq!(alice.outbox_len(), 0, "nothing was queued");
+
+    // The refusal spent no ratchet state: the next message still decrypts
+    // at the other end.
+    alice.send(&bob_fp, "a normal message", t / 1000).unwrap();
+    let (_, got) = until_received(&mut alice, &mut bob, t, 100, 1);
+    assert_eq!(got[0].text, "a normal message");
+}
+
+#[test]
+fn the_largest_file_arrives() {
+    // Every fragment slot of one message, end to end through the relay. Slow
+    // by construction: 512 records is 512 emission slots.
+    use void_proto::content::MAX_FILE_BYTES;
+
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 98);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 99);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let data: Vec<u8> = (0..MAX_FILE_BYTES as u32)
+        .map(|i| (i % 253) as u8)
+        .collect();
+    alice
+        .send_file(
+            &bob_fp,
+            &"n".repeat(255),
+            &"m".repeat(127),
+            data.clone(),
+            t / 1000,
+        )
+        .unwrap();
+    let (_, got) = until_received(&mut alice, &mut bob, t, 2_000, 1);
+    assert_eq!(got.len(), 1, "the largest file must still arrive");
+    assert_eq!(got[0].attachment.as_ref().unwrap().len as usize, data.len());
+}
+
+#[test]
+fn a_file_cannot_be_sent_to_a_contact_whose_key_changed() {
+    // FR-DISC-05 covers every way to send, not only `send`.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 100);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 101);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let other = Identity::from_seeds(&[200u8; 32], &[201u8; 32], &[202u8; 32]);
+    alice
+        .note_key_change(&bob_fp, other.public.clone())
+        .unwrap();
+    assert_eq!(
+        alice.send_file(&bob_fp, "x", "", vec![1], t / 1000),
+        Err(ClientError::ContactKeyChanged)
+    );
+}

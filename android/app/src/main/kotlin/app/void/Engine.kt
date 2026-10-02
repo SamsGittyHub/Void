@@ -121,12 +121,32 @@ class Engine private constructor(private var handle: Long) {
         return result.messageId
     }
 
+    /**
+     * Queue a file: a photo, a document, anything up to [VoidCore.fileMaxBytes].
+     * A file is a message, in records that leave one per slot behind every
+     * queued text; [VoidCore.fileRecordCount] times [VoidCore.padIntervalMs]
+     * is the time to show before sending. Throws [VoidStatus.TOO_LARGE]
+     * before any ratchet state is spent on a file that cannot travel.
+     */
+    fun sendFile(fingerprint: ByteArray, name: String, mime: String, data: ByteArray, now: Long): Long {
+        val result = VoidCore.sendFile(handle, fingerprint, name, mime, data, now) ?: throw VoidException(VoidStatus.FAILED)
+        val status = VoidStatus.from(result.status)
+        if (status != VoidStatus.OK) throw VoidException(status)
+        return result.messageId
+    }
+
+    /** The bytes of a stored file, by the id [messages] listed it under; null if there is none. */
+    fun attachment(id: Long): ByteArray? = VoidCore.attachment(handle, id).takeIf { it.isNotEmpty() }
+
+    /** A message a tick collected: text, or a file by name and size. */
+    class ReceivedMessage(val fingerprint: ByteArray, val text: String, val attachment: AttachmentInfo?)
+
     sealed class TickResult {
         data object Waiting : TickResult()
         data object SentPadding : TickResult()
         data object Deposited : TickResult()
         data object Refused : TickResult()
-        class Retrieved(val messages: List<Pair<ByteArray, String>>) : TickResult()
+        class Retrieved(val messages: List<ReceivedMessage>) : TickResult()
         data object Offline : TickResult()
     }
 
@@ -147,15 +167,24 @@ class Engine private constructor(private var handle: Long) {
         }
     }
 
-    private fun decodeReceivedMessages(bytes: ByteArray): List<Pair<ByteArray, String>> {
+    /** Layout documented on `void_ffi::void_engine_tick`: fingerprint, kind, size, length, bytes. */
+    private fun decodeReceivedMessages(bytes: ByteArray): List<ReceivedMessage> {
         val reader = ByteReader(bytes)
-        val out = mutableListOf<Pair<ByteArray, String>>()
+        val out = mutableListOf<ReceivedMessage>()
         while (!reader.isAtEnd) {
             val fp = reader.bytes(32) ?: break
+            val kind = reader.u8() ?: break
+            val size = reader.u32() ?: break
             val length = reader.u32() ?: break
-            if (length > Int.MAX_VALUE) break
+            if (length > Int.MAX_VALUE || size > Int.MAX_VALUE) break
             val text = reader.string(length.toInt()) ?: break
-            out.add(fp to text)
+            out.add(
+                if (kind == 3) {
+                    ReceivedMessage(fp, "", AttachmentInfo(text, "", size.toInt()))
+                } else {
+                    ReceivedMessage(fp, text, null)
+                },
+            )
         }
         return out
     }
@@ -445,6 +474,9 @@ class VoidException(val status: VoidStatus) : Exception() {
             VoidStatus.WRONG_RELAY ->
                 "This invitation uses a different Void server from this app, so it can't be " +
                     "opened here."
+            VoidStatus.TOO_LARGE ->
+                "This file is too large to send. Void sends files of up to " +
+                    "${VoidCore.fileMaxBytes() / 1024} KB; photos are shrunk to fit."
             else -> "Something went wrong. Nothing was sent."
         }
 }

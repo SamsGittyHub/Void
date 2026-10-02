@@ -123,4 +123,4 @@ pub type Result<T> = core::result::Result<T, ProtoError>;
 /// The protocol version this build speaks — the `v` in
 /// [`handshake::PROTOCOL_ID`], which is the value that actually keeps
 /// incompatible clients from talking.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;

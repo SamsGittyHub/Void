@@ -53,6 +53,24 @@ expectError(.failed, "confirming a fetch that never arrived fails") {
     _ = try core.confirmInvite(fetchId: fetchId, localName: "", firstMessage: "", now: now)
 }
 
+print("files")
+check(VoidCore.fileMaxBytes == 512_000, "the file bound is the protocol's: \(VoidCore.fileMaxBytes)")
+check(VoidCore.padIntervalMs == 5_000, "one record every five seconds")
+check(VoidCore.fileRecordCount(bytes: 0) >= 4 && VoidCore.fileRecordCount(bytes: 0) <= 5, "an empty file is a few records: \(VoidCore.fileRecordCount(bytes: 0))")
+check(VoidCore.fileRecordCount(bytes: 512_000) == 512, "the largest file is every fragment slot")
+check(VoidCore.fileSendSeconds(bytes: 100_000) > 60, "a 100 KB file takes minutes, and says so: \(VoidCore.fileSendSeconds(bytes: 100_000)) s")
+expectError(.failed, "a file to a stranger fails like a message does") {
+    _ = try core.sendFile(to: Data(count: 32), name: "a.txt", mime: "text/plain", data: Data([1, 2, 3]), now: now)
+}
+expectError(.tooLarge, "a file over the bound is refused with its own error") {
+    _ = try core.sendFile(to: Data(count: 32), name: "big", mime: "", data: Data(count: 512_001), now: now)
+}
+expectError(.badArgument, "milliseconds refused for files too") {
+    _ = try core.sendFile(to: Data(count: 32), name: "", mime: "", data: Data(), now: now * 1000)
+}
+check(core.attachment(id: 1) == nil, "no attachment for an id the engine never gave")
+check(core.messages(with: Data(count: 32)).isEmpty, "no history with a stranger")
+
 print("settings")
 try core.setInviteName("Sam Ü")
 check(core.inviteName == "Sam Ü", "invite name round-trips UTF-8: \(core.inviteName)")

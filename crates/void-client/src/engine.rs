@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use void_crypto::{rand, Zeroize};
 use void_proto::call::{CallAnswer, CallEnd, CallOffer, CallSignal, EndReason, Role};
-use void_proto::content::Content;
+use void_proto::content::{Content, FileContent};
 use void_proto::envelope::{self, Deposit};
 use void_proto::handshake::{self, Established, InitialMessage, PrekeyBundle, PrekeySecrets};
 use void_proto::identity::{Identity, IdentityPublic, IdentitySeeds};
@@ -27,7 +27,9 @@ use void_proto::record::{self, Reassembler, Record, RecordKind, RECORD_SIZE};
 use void_proto::wire::{Reader, Writer};
 use void_relay::protocol::{Delivery, Frame, FrameType, Retrieve};
 use void_store::db::{Kind, Store};
-use void_store::model::{Contact, DeliveryState, Direction, Settings, StoredMessage, TrustState};
+use void_store::model::{
+    Attachment, Contact, DeliveryState, Direction, Settings, StoredMessage, TrustState,
+};
 use void_store::retention::{effective_expiry, RetentionPolicy};
 
 use crate::scheduler::{Action, Scheduler};
@@ -72,6 +74,45 @@ pub struct OutboxItem {
     /// message fragments and are never written to disk: a call does not
     /// survive a restart, so neither does its ringing.
     signal: bool,
+    /// Whether this is a fragment of a file. Files go out behind every
+    /// queued message: a photo is hundreds of records and a reply typed while
+    /// it is leaving should not wait half an hour behind it.
+    bulk: bool,
+}
+
+/// Where in the outbox a new item goes. Still one record per slot whichever
+/// class it is — the class changes which record fills the next slot, never
+/// when a slot happens.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum OutboxClass {
+    /// A call signal: ahead of everything but other signals.
+    Signal,
+    /// A message, an invitation upload, a handshake: behind the signals,
+    /// ahead of any file.
+    Message,
+    /// A fragment of a file: behind everything.
+    Bulk,
+}
+
+impl OutboxItem {
+    fn class(&self) -> OutboxClass {
+        if self.signal {
+            OutboxClass::Signal
+        } else if self.bulk {
+            OutboxClass::Bulk
+        } else {
+            OutboxClass::Message
+        }
+    }
+}
+
+/// Where an item of `class` goes in `outbox`: at the back of its own class,
+/// which is just ahead of the first item of a later class.
+fn outbox_position(outbox: &[OutboxItem], class: OutboxClass) -> usize {
+    outbox
+        .iter()
+        .position(|i| i.class() > class)
+        .unwrap_or(outbox.len())
 }
 
 /// Bookkeeping for an attached store: which record id backs which in-memory
@@ -199,14 +240,17 @@ fn decode_queue_record(bytes: &[u8]) -> ClientResult<([u8; 32], QueueSecret, Que
 
 /// Encode a `Kind::Outbox` record. `persisted_id` is not part of the
 /// encoding — it *is* the id of the record the encoding lives in. A
-/// `stored_message_id` of zero means the item carries no stored message.
+/// `stored_message_id` of zero means the item carries no stored message. The
+/// class byte came later and is read only when present, so an outbox written
+/// before files existed still restores, as message fragments.
 fn encode_outbox_item(item: &OutboxItem) -> Vec<u8> {
     let mut w = Writer::new();
     w.raw(&item.contact_fingerprint)
         .u64(item.message_id)
         .u32(item.attempts)
         .bytes32(&item.deposit.encode())
-        .u64(item.stored_message_id.unwrap_or(0));
+        .u64(item.stored_message_id.unwrap_or(0))
+        .u8(u8::from(item.bulk));
     w.finish()
 }
 
@@ -218,6 +262,11 @@ fn decode_outbox_item(bytes: &[u8]) -> ClientResult<OutboxItem> {
     let deposit = Deposit::decode(r.bytes32_max(4096).map_err(|_| ClientError::Storage)?)
         .map_err(|_| ClientError::Storage)?;
     let stored_message_id = r.u64().map_err(|_| ClientError::Storage)?;
+    let bulk = if r.remaining() == 0 {
+        false
+    } else {
+        r.u8().map_err(|_| ClientError::Storage)? != 0
+    };
     r.finish().map_err(|_| ClientError::Storage)?;
     Ok(OutboxItem {
         contact_fingerprint,
@@ -227,6 +276,7 @@ fn decode_outbox_item(bytes: &[u8]) -> ClientResult<OutboxItem> {
         persisted_id: None,
         stored_message_id: (stored_message_id != 0).then_some(stored_message_id),
         signal: false,
+        bulk,
     })
 }
 
@@ -766,7 +816,7 @@ impl Engine {
             );
         }
 
-        let mut outbox = Vec::new();
+        let mut outbox: Vec<OutboxItem> = Vec::new();
         let mut outgoing_messages = BTreeMap::new();
         for r in store.list(Kind::Outbox).map_err(|_| ClientError::Storage)? {
             let mut item = decode_outbox_item(&r.payload)?;
@@ -774,7 +824,11 @@ impl Engine {
             if let Some(stored) = item.stored_message_id {
                 outgoing_messages.insert(item.message_id, stored);
             }
-            outbox.push(item);
+            // Record ids are in insertion order, so a stable insert by class
+            // puts a message queued during a file upload back ahead of the
+            // file, where it was.
+            let at = outbox_position(&outbox, item.class());
+            outbox.insert(at, item);
         }
 
         let mut invite_ids = BTreeMap::new();
@@ -1284,7 +1338,7 @@ impl Engine {
                 &parked.ciphertext,
                 message_id,
                 None,
-                false,
+                OutboxClass::Message,
             )
         });
         if let Err(e) = uploaded {
@@ -1628,7 +1682,7 @@ impl Engine {
         let stored = if first_message.is_empty() {
             None
         } else {
-            self.store_outgoing_message(fingerprint, first_message, now, message_id)
+            self.store_outgoing_message(fingerprint, first_message, None, now, message_id)
         };
         self.enqueue(
             fingerprint,
@@ -1636,7 +1690,7 @@ impl Engine {
             &initial.encode(),
             message_id,
             stored,
-            false,
+            OutboxClass::Message,
         )?;
         Ok(fingerprint)
     }
@@ -1678,7 +1732,8 @@ impl Engine {
         // exceptions to remember, is the point.
         let text = match Content::decode(&plaintext).map_err(|_| ClientError::Protocol)? {
             Content::Text(t) => t,
-            Content::Call(_) => return Err(ClientError::Protocol),
+            // A first message is text, by construction, on both sides.
+            Content::Call(_) | Content::File(_) => return Err(ClientError::Protocol),
         };
 
         // Everything verified. Only now does anything change.
@@ -1699,7 +1754,7 @@ impl Engine {
         // An empty first message is how someone connects without saying
         // anything yet. It is not a message, so it is neither stored nor shown.
         if !text.is_empty() {
-            self.store_incoming_message(fingerprint, &text, now);
+            self.store_incoming_message(fingerprint, &text, None, now);
         }
         Ok((fingerprint, text))
     }
@@ -1892,14 +1947,80 @@ impl Engine {
         self.persist_session(*fingerprint)?;
 
         let message_id = new_message_id()?;
-        let stored = self.store_outgoing_message(*fingerprint, text, now, message_id);
+        let stored = self.store_outgoing_message(*fingerprint, text, None, now, message_id);
         self.enqueue(
             *fingerprint,
             &deposit_key,
             &payload,
             message_id,
             stored,
-            false,
+            OutboxClass::Message,
+        )?;
+        Ok(message_id)
+    }
+
+    /// Send a file.
+    ///
+    /// A file is a message (`void_proto::content`): the same ratchet, the
+    /// same records, the same one-record-per-slot scheduler. It differs from
+    /// [`Engine::send`] in two ways. Its size is checked first — against
+    /// `MAX_FILE_BYTES` and the name and type bounds — so a file that cannot
+    /// travel is refused with [`ClientError::TooLarge`] before the ratchet
+    /// steps for it. And its fragments go to the back of the outbox, behind
+    /// every queued message, so a reply typed while a photo is leaving does
+    /// not wait behind it.
+    ///
+    /// Returns the local message id. [`Engine::history`] reports how many of
+    /// its records are still to go.
+    pub fn send_file(
+        &mut self,
+        fingerprint: &[u8; 32],
+        name: &str,
+        mime: &str,
+        data: Vec<u8>,
+        now: u64,
+    ) -> ClientResult<u64> {
+        let len = data.len() as u32;
+        let file = FileContent::new(name, mime, data).map_err(|_| ClientError::TooLarge)?;
+        let session = self
+            .sessions
+            .get_mut(fingerprint)
+            .ok_or(ClientError::NoSuchContact)?;
+        // FR-DISC-05, enforced once, in `send` — and here, because this is a
+        // second way to send.
+        if !session.contact.can_send() {
+            return Err(ClientError::ContactKeyChanged);
+        }
+        let content = Content::File(file);
+        let ratchet_message = session
+            .established
+            .ratchet
+            .encrypt(&content.encode())
+            .map_err(|_| ClientError::Protocol)?;
+        let payload = ratchet_message.encode();
+        let deposit_key = session.established.send_queue.deposit_key();
+        self.persist_session(*fingerprint)?;
+
+        let Content::File(file) = content else {
+            unreachable!("built as a file above")
+        };
+        let attachment = Attachment {
+            name: file.name.clone(),
+            mime: file.mime.clone(),
+            len,
+            data: file.data.clone(),
+        };
+        drop(file);
+        let message_id = new_message_id()?;
+        let stored =
+            self.store_outgoing_message(*fingerprint, "", Some(attachment), now, message_id);
+        self.enqueue(
+            *fingerprint,
+            &deposit_key,
+            &payload,
+            message_id,
+            stored,
+            OutboxClass::Bulk,
         )?;
         Ok(message_id)
     }
@@ -1927,7 +2048,14 @@ impl Engine {
         let deposit_key = session.established.send_queue.deposit_key();
         self.persist_session(*fingerprint)?;
         let message_id = new_message_id()?;
-        self.enqueue(*fingerprint, &deposit_key, &payload, message_id, None, true)?;
+        self.enqueue(
+            *fingerprint,
+            &deposit_key,
+            &payload,
+            message_id,
+            None,
+            OutboxClass::Signal,
+        )?;
         Ok(message_id)
     }
 
@@ -2089,21 +2217,17 @@ impl Engine {
         payload: &[u8],
         message_id: u64,
         stored_message_id: Option<u64>,
-        signal: bool,
+        class: OutboxClass,
     ) -> ClientResult<()> {
         let records = record::fragment(message_id, payload).map_err(|_| ClientError::Protocol)?;
-        // A call signal goes ahead of every queued message fragment, behind any
-        // signal already waiting. Still one record per slot — this changes
-        // which record fills the next slot, never when a slot happens — but a
-        // ring no longer waits behind a long message or a parked invitation.
-        let start = if signal {
-            self.outbox
-                .iter()
-                .position(|i| !i.signal)
-                .unwrap_or(self.outbox.len())
-        } else {
-            self.outbox.len()
-        };
+        // Each class goes behind its own kind and ahead of every later one: a
+        // call signal ahead of every queued message fragment, a message ahead
+        // of every file. Still one record per slot — this changes which record
+        // fills the next slot, never when a slot happens — but a ring no
+        // longer waits behind a long message or a parked invitation, and a
+        // reply no longer waits behind a photo.
+        let signal = class == OutboxClass::Signal;
+        let start = outbox_position(&self.outbox, class);
         for (position, rec) in (start..).zip(&records) {
             let deposit = envelope::seal(deposit_key, rec).map_err(|_| ClientError::Protocol)?;
             let mut item = OutboxItem {
@@ -2114,6 +2238,7 @@ impl Engine {
                 persisted_id: None,
                 stored_message_id,
                 signal,
+                bulk: class == OutboxClass::Bulk,
             };
             if !signal {
                 if let Some(persisted) = &mut self.persisted {
@@ -2139,12 +2264,13 @@ impl Engine {
         &mut self,
         fingerprint: [u8; 32],
         text: &str,
+        attachment: Option<Attachment>,
         now: u64,
         message_id: u64,
     ) -> Option<u64> {
         self.persisted.as_ref()?;
         let expiry = self.message_expiry(&fingerprint, now);
-        let msg = self.stored_message(fingerprint, text, Direction::Outgoing, now);
+        let msg = self.stored_message(fingerprint, text, attachment, Direction::Outgoing, now);
         let payload = msg.encode();
         let persisted = self.persisted.as_mut()?;
         let id = persisted
@@ -2158,12 +2284,18 @@ impl Engine {
 
     /// Store an incoming message (NFR-REL-04). A no-op if no store is
     /// attached.
-    fn store_incoming_message(&mut self, fingerprint: [u8; 32], text: &str, now: u64) {
+    fn store_incoming_message(
+        &mut self,
+        fingerprint: [u8; 32],
+        text: &str,
+        attachment: Option<Attachment>,
+        now: u64,
+    ) {
         if self.persisted.is_none() {
             return;
         }
         let expiry = self.message_expiry(&fingerprint, now);
-        let msg = self.stored_message(fingerprint, text, Direction::Incoming, now);
+        let msg = self.stored_message(fingerprint, text, attachment, Direction::Incoming, now);
         let payload = msg.encode();
         let persisted = self.persisted.as_mut().expect("checked above");
         let _ = persisted.store.insert(Kind::Message, expiry, &payload);
@@ -2251,14 +2383,7 @@ impl Engine {
                         // frame either way.
                         let mut refused = self.outbox.remove(0);
                         refused.attempts += 1;
-                        let back = if refused.signal {
-                            self.outbox
-                                .iter()
-                                .position(|i| !i.signal)
-                                .unwrap_or(self.outbox.len())
-                        } else {
-                            self.outbox.len()
-                        };
+                        let back = outbox_position(&self.outbox, refused.class());
                         self.outbox.insert(back, refused);
                         Ok(TickOutcome::Refused(item.message_id))
                     }
@@ -2411,10 +2536,31 @@ impl Engine {
         self.persist_session(*fingerprint)?;
         match decrypted {
             Some(Content::Text(text)) => {
-                self.store_incoming_message(*fingerprint, &text, now_ms / 1000);
+                self.store_incoming_message(*fingerprint, &text, None, now_ms / 1000);
                 Ok(Some(ReceivedMessage {
                     contact_fingerprint: *fingerprint,
                     text,
+                    attachment: None,
+                }))
+            }
+            Some(Content::File(file)) => {
+                let received = ReceivedAttachment {
+                    name: file.name.clone(),
+                    mime: file.mime.clone(),
+                    len: file.data.len() as u32,
+                };
+                let attachment = Attachment {
+                    name: file.name.clone(),
+                    mime: file.mime.clone(),
+                    len: file.data.len() as u32,
+                    data: file.data.clone(),
+                };
+                drop(file);
+                self.store_incoming_message(*fingerprint, "", Some(attachment), now_ms / 1000);
+                Ok(Some(ReceivedMessage {
+                    contact_fingerprint: *fingerprint,
+                    text: String::new(),
+                    attachment: Some(received),
                 }))
             }
             Some(Content::Call(signal)) => {
@@ -2646,6 +2792,64 @@ impl Engine {
             .collect())
     }
 
+    /// The stored history with one contact, oldest first, as a conversation
+    /// screen needs it: each message with the id that names it, its file's
+    /// name, type and size but not its bytes, and how many of its records are
+    /// still waiting to leave. Empty when no store is attached.
+    ///
+    /// This is what the apps list from. The bytes of one file come from
+    /// [`Engine::attachment`] when that message is on screen, so drawing a
+    /// conversation never copies every photo in it.
+    pub fn history(&self, fingerprint: &[u8; 32]) -> ClientResult<Vec<HistoryEntry>> {
+        let Some(persisted) = &self.persisted else {
+            return Ok(Vec::new());
+        };
+        let records = persisted
+            .store
+            .list(Kind::Message)
+            .map_err(|_| ClientError::Storage)?;
+        Ok(records
+            .iter()
+            .filter_map(|r| {
+                StoredMessage::decode_meta(&r.payload)
+                    .ok()
+                    .map(|m| (r.id, m))
+            })
+            .filter(|(_, m)| &m.contact_fingerprint == fingerprint)
+            .map(|(id, message)| {
+                let fragments_remaining = self
+                    .outbox
+                    .iter()
+                    .filter(|i| i.stored_message_id == Some(id))
+                    .count()
+                    .min(u16::MAX as usize) as u16;
+                HistoryEntry {
+                    id,
+                    message,
+                    fragments_remaining,
+                }
+            })
+            .collect())
+    }
+
+    /// The file a stored message carries, bytes included, by the id
+    /// [`Engine::history`] gave it. `None` for a message that is not a file,
+    /// one that has since been deleted by retention, or an id that names
+    /// something other than a message.
+    pub fn attachment(&self, id: u64) -> ClientResult<Option<Attachment>> {
+        let Some(persisted) = &self.persisted else {
+            return Ok(None);
+        };
+        let Some(record) = persisted.store.get(id).map_err(|_| ClientError::Storage)? else {
+            return Ok(None);
+        };
+        if record.kind != Kind::Message {
+            return Ok(None);
+        }
+        let message = StoredMessage::decode(&record.payload).map_err(|_| ClientError::Storage)?;
+        Ok(message.attachment.clone())
+    }
+
     /// How many messages are waiting to be sent.
     #[must_use]
     pub fn outbox_len(&self) -> usize {
@@ -2658,6 +2862,7 @@ impl Engine {
         &self,
         fingerprint: [u8; 32],
         text: &str,
+        attachment: Option<Attachment>,
         direction: Direction,
         now: u64,
     ) -> StoredMessage {
@@ -2676,6 +2881,7 @@ impl Engine {
                 Direction::Outgoing => DeliveryState::Queued,
                 Direction::Incoming => DeliveryState::Received,
             },
+            attachment,
         }
     }
 
@@ -2736,8 +2942,38 @@ pub enum TickOutcome {
 pub struct ReceivedMessage {
     /// Who sent it.
     pub contact_fingerprint: [u8; 32],
-    /// The text.
+    /// The text. Empty for a file.
     pub text: String,
+    /// The file it carried, if it was one. Name, type and size only: the
+    /// bytes are in the store, under the id [`Engine::history`] reports.
+    pub attachment: Option<ReceivedAttachment>,
+}
+
+/// What a received file is, without its bytes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ReceivedAttachment {
+    /// The name the sender gave it.
+    pub name: String,
+    /// Its media type.
+    pub mime: String,
+    /// Its size in bytes.
+    pub len: u32,
+}
+
+/// One message of a conversation's stored history, as [`Engine::history`]
+/// lists it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct HistoryEntry {
+    /// The store record that holds it: stable for the message's life, and
+    /// what [`Engine::attachment`] takes.
+    pub id: u64,
+    /// The message, with any file's bytes left out (`decode_meta`).
+    pub message: StoredMessage,
+    /// For an outgoing message still leaving: how many of its records are
+    /// in the outbox. Zero once it has been deposited, and for everything
+    /// incoming. One record leaves per `PAD_INTERVAL_MS`, so this times that
+    /// is the time left.
+    pub fragments_remaining: u16,
 }
 
 /// A call this engine is party to.

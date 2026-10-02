@@ -1386,6 +1386,179 @@ longer crashes.
 
 ---
 
+## D-032 — A file is a message, sent at the message rate
+
+**New scope.** Files appear nowhere in PRD v2.0 and nowhere in the code
+before this: a ratchet plaintext was text or a call signal, and that was all.
+This entry is the whole argument.
+
+### What was ruled out first
+
+**A second channel.** Calls got one (D-024) because audio cannot tolerate the
+retrieval schedule. A file can. A direct onion connection for files would tell
+the recipient the sender is online, which the mailbox model otherwise hides,
+and would need both people online at once to transfer anything — a photo sent
+to someone whose phone is off would wait for them, not for the relay.
+
+**Splitting a file across messages.** Each part would be its own ratchet
+message, deliverable without the others; the receiver would hold partial files
+in a second reassembly layer with its own eviction and expiry; and a file's
+parts would be visible to the relay as a run of messages with the same shape.
+The record reassembler already does all of this for one message, bounded, with
+an eviction policy that cost a decision to get right (D-022).
+
+**Thumbnails, captions, previews.** Each is a thing the UI might want and a
+thing the protocol would then have to carry for ever. A file is a name, a type,
+and bytes.
+
+### What was built
+
+A third content kind (`void_proto::content`, kind 3): `bytes16(name) ||
+bytes16(mime) || bytes32(data)`, inside the ratchet ciphertext like the other
+two, so the relay sees records and nothing else — `a_relay_cannot_tell_a_file_from_messages`
+counts the sender's deposits off the transport and finds every one the same
+size as a text's. `PROTOCOL_ID` is `v4`: a `v3` client would drop a file as
+malformed while the sender saw "Sent", which is exactly the failure the
+framing's documentation says an unknown kind must not become.
+
+**The size bound is derived, not chosen.** `MAX_FILE_BYTES` is 500 KiB because
+that is what fits one message: `MAX_FRAGMENTS × RECORD_BODY_CAPACITY` is
+516,608 bytes, the worst-case ratchet message overhead (a header carrying an
+ML-KEM step, D-005) is 3,216, and this framing at its longest is 391. A
+compile-time assertion fails the build if any of those constants moves so that
+the bound no longer holds, and `the_largest_file_fits_one_message_under_the_worst_case_header`
+checks the arithmetic against the real encoder. A file over the bound is
+refused by `FileContent::new`, which runs *before* the ratchet encrypts —
+encrypting first and failing to fragment afterwards would step the chain for a
+message that never left, and the peer would skip a key for nothing.
+
+**Files go to the back of the outbox.** `OutboxItem` gained a class — signal,
+message, bulk — and `enqueue` places each at the back of its own class. A
+reply typed while a photo is leaving goes out in the next slot, not after two
+hundred records of photo; a call offer still goes ahead of both (D-028). The
+class is persisted with the item, read only when present, so an outbox from an
+earlier build restores. Still one record per slot: the class changes which
+record fills the next slot, never when a slot happens.
+
+**The store keeps the bytes in the message's own record.** `StoredMessage`
+gained an optional attachment, encoded after the body only when present, so a
+database written before files existed opens unchanged and a message without a
+file still encodes byte for byte as before. A file on disk beside the database
+under its own name would be the plaintext column `void-store`'s documentation
+promises there is none of.
+
+**The apps list without copying.** `Engine::history` returns each message with
+its record id, its file's name, type and size, and how many of its records are
+still in the outbox — not the bytes. `Engine::attachment(id)` returns one file's
+bytes when its bubble is on screen. Before this the FFI's history listing would
+have copied every photo in a conversation across the boundary on every tick
+that deposited a record.
+
+**The apps say what it costs, first.** A photo is hundreds of records at one
+every five seconds. Before anything is queued, both apps show the file's size
+and the time it will take — from `file_record_count`, a deliberate upper
+bound — and why: *"Void sends everything at one fixed pace, in pieces that all
+look the same, so nobody watching can tell a photo from a few messages."*
+While it leaves, the bubble reads *"Sending — about 4 minutes left"*, from the
+outbox count, not a timer. Non-negotiable #8, applied to the one feature where
+the privacy is most visibly the cost.
+
+**Photos are shrunk, and that strips their metadata.** Both apps re-encode a
+picked picture as JPEG with its longest side at 1,280 pixels, lowering
+quality and then size until it fits, which lands a camera photo at roughly
+100–250 KB: a few minutes to send. Re-encoding drops the camera's location,
+device and time tags, which a messenger built around not leaking who and where
+should not forward by accident. Other files are sent as they are, or refused
+with their size and the bound.
+
+**Saving goes through the system's own picker.** iOS writes a protected
+temporary file for the share sheet and deletes it when the sheet closes;
+Android hands the bytes straight to the document the user chose. Neither app
+writes a file under its own name into app storage.
+
+### What it costs
+
+- **Time.** The largest file is 512 records: about 43 minutes. That is the
+  protocol working as designed, and the interface says so rather than hiding
+  it.
+- **The relay's limits are now reachable by one person.** A queue accepts 600
+  deposits an hour (`DEFAULT_DEPOSIT_RATE_PER_HOUR`) and emission is 720; one
+  largest file stays under the hour's budget but two back to back do not, and
+  a queue holds 1,000 records, so two largest files to someone whose phone is
+  off overrun it. Both read to the sender as refusals, which D-030 already
+  retries in turn without giving up or holding other contacts up. The cost is
+  a slower file, not a lost one.
+- **A bigger database.** The store rewrites its whole file on every flush
+  (D-007), and that file now holds every photo in every conversation until
+  retention removes it. A hundred photos is tens of megabytes rewritten once
+  per deposited record while something is sending. It works; it is not free,
+  and an append-only store would be the fix if it ever matters.
+- **A new content kind is a new parser facing the peer.** It is bounded on
+  every field and refuses anything the sender could not have made.
+
+**Reversal.** Remove kind 3 and `FileContent`, `Engine::send_file`,
+`Engine::history`/`attachment`, the bulk class, the three FFI functions and
+their JNI mirrors, and `Attachments.swift`/`Attachments.kt`. The store's
+attachment field can stay: it costs nothing when absent.
+
+**Enforced by.** `a_file_travels_as_a_message_and_arrives_whole`,
+`a_relay_cannot_tell_a_file_from_messages`,
+`a_message_sent_during_a_file_upload_goes_ahead_of_it`,
+`a_file_too_large_is_refused_before_the_ratchet_steps`,
+`the_largest_file_arrives`, and
+`a_file_cannot_be_sent_to_a_contact_whose_key_changed` in
+`void-client/tests/end_to_end.rs`;
+`a_file_survives_a_restart_mid_upload_and_its_bytes_come_back` and
+`a_received_file_is_stored_with_its_bytes_and_survives_a_restart` in
+`void-client/tests/persistence.rs`;
+`the_largest_file_fits_one_message_under_the_worst_case_header` and
+`the_record_count_estimate_never_undercounts` in `void-proto`;
+`a_message_written_before_files_existed_still_decodes` in `void-store`;
+`a_file_sent_through_the_boundary_is_listed_and_fetched_by_id` and the two
+layout tests in `void-ffi`; and the files section of both bindings checks.
+
+**How this was checked, and what was not.** The core's suites, including the
+new ones, pass; the Kotlin wrapper ran against the real core on a desktop JVM.
+This environment has no Swift toolchain, no Android SDK, no Mac and no device,
+so the Swift wrapper's check, the iOS build and tests, and the Android build
+and lint run in CI only. **No file has been sent between two running apps.**
+The protocol and engine path has, end to end through a relay, in tests; the
+pickers, the image shrinking and the save paths have been built and not run.
+Treat "files work in the apps" as unproven until someone has sent a photo from
+one phone and opened it on another.
+
+---
+
+## D-033 — The iOS call codec is checked in CI, because no iPhone has made a call
+
+**Relates to:** D-024, D-029, D-031. Every call that has been made ran on
+Android emulators. The iOS call path was type-checked on Linux and built with
+Xcode, and that is all: no Simulator has rung, and nothing had ever run Apple's
+Opus encoder and decoder at the configuration `CallAudio` assumes — 16 kHz
+mono, one packet per 20 ms frame, a constant 16 kbit/s — because that code
+lived inside the audio loop, which needs a call to run.
+
+**Decided.** The codec is its own class, `OpusCodec`, with `encode` and
+`decode` and nothing else, and `CallAudio` uses it. `OpusCodecTests` runs it on
+the Simulator in CI's iOS job: a second of a 440 Hz tone goes in as 20 ms
+frames; every frame after the encoder's lookahead must come out as one packet
+that fits a media frame (`MEDIA_PAYLOAD_LEN`) and is no larger than a constant
+16 kbit/s allows; every packet must decode to exactly one frame of audio; and
+the decoded audio must carry the tone (an RMS near a half-amplitude sine's),
+not silence. The Linux bindings check still type-checks the whole file against
+the AVFoundation stand-ins.
+
+**What it does not prove.** That a call connects, that echo cancellation
+works, that the microphone or the speaker route correctly, or what a voice
+sounds like through 750 ms of Tor. It proves the one piece of the iOS path that
+is Apple's rather than Void's behaves as the loop assumes, and it would have
+failed on a configuration Apple's codec rejects. D-024's rule stands: treat
+calls on iOS as unproven until someone has held a conversation.
+
+**Enforced by.** `OpusCodecTests` in CI's iOS job.
+
+---
+
 ## Open, and deliberately so
 
 **PRD §13.3 — who runs the relays.** Not resolved. The code supports any

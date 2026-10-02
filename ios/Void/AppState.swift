@@ -274,28 +274,58 @@ final class AppState: ObservableObject {
                 id: contact.fingerprint,
                 name: contact.name,
                 trust: mismatched.contains(contact.fingerprint) ? .keyChanged : contact.trust,
-                lastMessage: messagesByFingerprint[contact.fingerprint]?.last?.text
+                lastMessage: messagesByFingerprint[contact.fingerprint]?.last.map(Self.summary)
                     ?? existing?.lastMessage ?? "",
                 unread: existing?.unread ?? 0
             )
         }
     }
 
+    /// What the conversation list shows for a message: its text, or what
+    /// kind of file it is.
+    private static func summary(_ message: MessageItem) -> String {
+        message.attachment?.summary ?? message.text
+    }
+
     private func applyHistory(_ history: [StoredMessage], for fingerprint: Data) {
         messagesByFingerprint[fingerprint] = history.enumerated().map { index, message in
             MessageItem(
                 id: UInt64(index),
+                recordId: message.id,
                 text: message.text,
                 isOutgoing: message.isOutgoing,
                 delivery: message.delivery,
-                timestamp: message.timestamp
+                timestamp: message.timestamp,
+                attachment: message.attachment,
+                fragmentsRemaining: message.fragmentsRemaining
             )
         }
         if let index = conversations.firstIndex(where: { $0.id == fingerprint }),
-            let last = history.last
+            let last = messagesByFingerprint[fingerprint]?.last
         {
-            conversations[index].lastMessage = last.text
+            conversations[index].lastMessage = Self.summary(last)
         }
+        // A photo still leaving reports its progress on every tick that
+        // deposits a record, so the history is re-read then; the bytes it
+        // refers to do not change, so the cache keeps them.
+    }
+
+    /// Files whose bytes a conversation on screen has asked for, by record
+    /// id. Bounded by use: cleared when the conversation closes.
+    private var attachmentCache: [UInt64: Data] = [:]
+
+    /// The bytes of a file in a conversation, fetched from the engine the
+    /// first time a bubble needs them and kept while the conversation is
+    /// open. `nil` if the message is not a file or has since expired.
+    func attachmentData(recordId: UInt64) async -> Data? {
+        if let cached = attachmentCache[recordId] {
+            return cached
+        }
+        let data = await worker.run { $0.attachment(id: recordId) }
+        if let data {
+            attachmentCache[recordId] = data
+        }
+        return data
     }
 
     private func refreshContacts() async {
@@ -312,6 +342,7 @@ final class AppState: ObservableObject {
     func closeConversation(_ fingerprint: Data) {
         if visibleConversation == fingerprint {
             visibleConversation = nil
+            attachmentCache.removeAll()
         }
     }
 
@@ -560,6 +591,40 @@ final class AppState: ObservableObject {
             do {
                 let history = try await worker.attempt { core -> [StoredMessage] in
                     try core.send(to: fingerprint, text: text, now: Clock.nowSeconds)
+                    return core.messages(with: fingerprint)
+                }
+                applyHistory(history, for: fingerprint)
+            } catch {
+                lastError = error.localizedDescription
+                applyHistory(await worker.run { $0.messages(with: fingerprint) }, for: fingerprint)
+            }
+        }
+    }
+
+    /// Send a file. Shown at once as "Waiting to send" like a message; the
+    /// stored copy, with its progress, replaces it once the engine has it.
+    /// The size and time estimate were shown and agreed to before this is
+    /// called (`AttachmentConfirmView`), so a refusal here is unexpected and
+    /// is reported as such.
+    func sendFile(to fingerprint: Data, _ pending: PendingAttachment) {
+        var items = messagesByFingerprint[fingerprint] ?? []
+        items.append(
+            MessageItem(
+                id: UInt64.max - UInt64(items.count),
+                text: "",
+                isOutgoing: true,
+                delivery: .queued,
+                timestamp: Date(),
+                attachment: AttachmentInfo(name: pending.name, mime: pending.mime, size: pending.data.count),
+                fragmentsRemaining: VoidCore.fileRecordCount(bytes: pending.data.count)
+            ))
+        messagesByFingerprint[fingerprint] = items
+        Task {
+            do {
+                let history = try await worker.attempt { core -> [StoredMessage] in
+                    try core.sendFile(
+                        to: fingerprint, name: pending.name, mime: pending.mime, data: pending.data,
+                        now: Clock.nowSeconds)
                     return core.messages(with: fingerprint)
                 }
                 applyHistory(history, for: fingerprint)

@@ -22,6 +22,11 @@ struct ConversationListView: View {
     var myWords: String = ""
     var onNewContact: () -> Void
     var onSend: (Data, String) -> Void = { _, _ in }
+    /// A file the user picked and confirmed, to send to that contact.
+    var onSendFile: (Data, PendingAttachment) -> Void = { _, _ in }
+    /// The bytes of a file in the history, by its record id, for the bubble
+    /// that shows it. Async: the engine reads it on its own thread.
+    var loadAttachment: (UInt64) async -> Data? = { _ in nil }
     var onVerificationResult: (Data, Bool) -> Void = { _, _ in }
     var onAcknowledgeKeyChange: (Data) -> Void = { _ in }
     var onRename: (Data, String) -> Void = { _, _ in }
@@ -73,6 +78,8 @@ struct ConversationListView: View {
                         conversation: $conversations[index],
                         messages: messagesByFingerprint[id] ?? [],
                         onSend: { text in onSend(id, text) },
+                        onSendFile: { pending in onSendFile(id, pending) },
+                        loadAttachment: loadAttachment,
                         myWords: myWords,
                         onVerificationResult: { matched in onVerificationResult(id, matched) },
                         onAcknowledgeKeyChange: { onAcknowledgeKeyChange(id) },
@@ -199,6 +206,12 @@ struct ConversationView: View {
     /// (FR-MSG-06): the message shows as "Waiting to send" until the scheduler
     /// has actually deposited it.
     var onSend: (String) -> Void = { _ in }
+    /// Called with a file the user picked and, having seen its size and how
+    /// long it will take, chose to send. Queued like a message: a file *is* a
+    /// message, in records that leave one per slot behind every queued text.
+    var onSendFile: (PendingAttachment) -> Void = { _ in }
+    /// The bytes of a file in this history, for the bubble showing it.
+    var loadAttachment: (UInt64) async -> Data? = { _ in nil }
     /// My own security code, for the verification sheet. The engine only
     /// exposes this via an instance call (`VoidCore.fingerprintWords`), so
     /// unlike the contact's code below it cannot be computed inline here.
@@ -211,6 +224,9 @@ struct ConversationView: View {
     @State private var showingVerification = false
     @State private var renaming = false
     @State private var newName = ""
+    /// A file picked and not yet confirmed: the confirmation sheet shows its
+    /// size and how long it will take, and sends it or not.
+    @State private var pendingAttachment: PendingAttachment?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -221,7 +237,7 @@ struct ConversationView: View {
             ScrollView {
                 LazyVStack(spacing: 8) {
                     ForEach(messages) { message in
-                        MessageBubble(message: message)
+                        MessageBubble(message: message, loadAttachment: loadAttachment)
                     }
                 }
                 .padding(.horizontal, 12)
@@ -278,6 +294,24 @@ struct ConversationView: View {
                 )
             }
         }
+        .sheet(
+            isPresented: Binding(
+                get: { pendingAttachment != nil },
+                set: { if !$0 { pendingAttachment = nil } }
+            )
+        ) {
+            if let pending = pendingAttachment {
+                AttachmentConfirmView(
+                    pending: pending,
+                    contactName: conversation.name.isEmpty ? "them" : conversation.name,
+                    onSend: {
+                        pendingAttachment = nil
+                        onSendFile(pending)
+                    },
+                    onCancel: { pendingAttachment = nil }
+                )
+            }
+        }
     }
 
     private var trustBanner: some View {
@@ -315,6 +349,9 @@ struct ConversationView: View {
 
     private var composer: some View {
         HStack(spacing: 8) {
+            // A photo or any file. Picked here, confirmed on a sheet that
+            // states its size and the time it will take, then queued.
+            AttachmentPicker { picked in pendingAttachment = picked }
             TextField("Message", text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
@@ -357,14 +394,16 @@ struct ConversationView: View {
 
 private struct MessageBubble: View {
     let message: MessageItem
+    var loadAttachment: (UInt64) async -> Data? = { _ in nil }
 
     var body: some View {
         HStack {
             if message.isOutgoing { Spacer(minLength: 48) }
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 3) {
-                Text(message.text)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+                if let attachment = message.attachment {
+                    AttachmentBubble(
+                        message: message, attachment: attachment, loadAttachment: loadAttachment
+                    )
                     .background(
                         RoundedRectangle(cornerRadius: 16)
                             .fill(
@@ -373,8 +412,21 @@ private struct MessageBubble: View {
                                     : Color.secondary.opacity(0.14)
                             )
                     )
-                if message.isOutgoing && !message.delivery.label.isEmpty {
-                    Text(message.delivery.label)
+                } else {
+                    Text(message.text)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16)
+                                .fill(
+                                    message.isOutgoing
+                                        ? Color.accentColor.opacity(0.20)
+                                        : Color.secondary.opacity(0.14)
+                                )
+                        )
+                }
+                if message.isOutgoing && !statusLine.isEmpty {
+                    Text(statusLine)
                         .font(.caption2)
                         .foregroundStyle(
                             message.delivery == .failed ? Color.orange : Color.secondary
@@ -385,10 +437,21 @@ private struct MessageBubble: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            (message.isOutgoing ? "You said: " : "They said: ")
-                + message.text
-                + (message.delivery.label.isEmpty ? "" : ". \(message.delivery.label)")
+            (message.isOutgoing ? "You sent: " : "They sent: ")
+                + (message.attachment.map { $0.isImage ? "a photo" : "a file, \($0.name)" } ?? message.text)
+                + (statusLine.isEmpty ? "" : ". \(statusLine)")
         )
+    }
+
+    /// The delivery label, or, for a file still leaving, how much longer. A
+    /// photo is hundreds of records at one per slot, so "Waiting to send" on
+    /// its own would look stuck for twenty minutes.
+    private var statusLine: String {
+        if message.delivery == .queued, message.fragmentsRemaining > 0, message.attachment != nil {
+            let seconds = message.fragmentsRemaining * Int(VoidCore.padIntervalMs / 1000)
+            return "Sending — about \(AttachmentFormat.duration(seconds: seconds)) left"
+        }
+        return message.delivery.label
     }
 }
 

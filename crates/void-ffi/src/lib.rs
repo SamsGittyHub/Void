@@ -80,6 +80,10 @@ pub enum VoidStatus {
     /// The invitation is parked on a different relay from the one this app
     /// uses.
     WrongRelay = 10,
+    /// A file is larger than one message carries ([`void_file_max_bytes`]),
+    /// or its name or type is too long. Nothing was queued and no ratchet
+    /// state was spent.
+    TooLarge = 11,
 }
 
 /// The largest `now` this boundary accepts: 3000-01-01T00:00:00Z, in Unix
@@ -290,11 +294,22 @@ pub unsafe extern "C" fn void_engine_open(
 /// Layout, repeated per message:
 ///
 /// ```text
+///   u64 LE(id)           names this message to void_engine_attachment
 ///   u8(direction)        1 = sent by us, 2 = received
 ///   u8(delivery)         0 queued, 1 sent, 2 delivered, 3 failed, 4 received
 ///   u64 LE(timestamp)    Unix seconds, local clock
+///   u16 LE(remaining)    records of it still waiting to leave; 0 once sent
 ///   u32 LE(text_len) || raw(text)
+///   u8(has_file)         0 or 1; the rest only when 1:
+///   u16 LE(name_len) || raw(name)
+///   u16 LE(mime_len) || raw(mime)
+///   u32 LE(size)         the file's size in bytes
 /// ```
+///
+/// A file's bytes are not here; [`void_engine_attachment`] fetches them by
+/// `id` when that message is on screen, so listing a conversation with a
+/// hundred photos in it copies none of them. `remaining` times
+/// [`void_pad_interval_ms`] is how long a file still has to go.
 ///
 /// Empty for an engine with no store attached.
 ///
@@ -315,17 +330,19 @@ pub unsafe extern "C" fn void_engine_messages(
         let Ok(guard) = (*engine).inner.lock() else {
             return VoidBytes::empty();
         };
-        let Ok(messages) = guard.messages(&fp) else {
+        let Ok(history) = guard.history(&fp) else {
             return VoidBytes::empty();
         };
-        VoidBytes::from_vec(encode_stored_messages(&messages))
+        VoidBytes::from_vec(encode_history(&history))
     })
 }
 
-fn encode_stored_messages(messages: &[void_store::model::StoredMessage]) -> Vec<u8> {
+fn encode_history(entries: &[void_client::engine::HistoryEntry]) -> Vec<u8> {
     use void_store::model::{DeliveryState, Direction};
     let mut out = Vec::new();
-    for m in messages {
+    for e in entries {
+        let m = &e.message;
+        out.extend_from_slice(&e.id.to_le_bytes());
         out.push(match m.direction {
             Direction::Outgoing => 1u8,
             Direction::Incoming => 2u8,
@@ -338,10 +355,46 @@ fn encode_stored_messages(messages: &[void_store::model::StoredMessage]) -> Vec<
             DeliveryState::Received => 4,
         });
         out.extend_from_slice(&m.timestamp.to_le_bytes());
+        out.extend_from_slice(&e.fragments_remaining.to_le_bytes());
         out.extend_from_slice(&(m.body.len() as u32).to_le_bytes());
         out.extend_from_slice(m.body.as_bytes());
+        match &m.attachment {
+            None => out.push(0),
+            Some(file) => {
+                out.push(1);
+                let name = &file.name.as_bytes()[..file.name.len().min(u16::MAX as usize)];
+                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                out.extend_from_slice(name);
+                let mime = &file.mime.as_bytes()[..file.mime.len().min(u16::MAX as usize)];
+                out.extend_from_slice(&(mime.len() as u16).to_le_bytes());
+                out.extend_from_slice(mime);
+                out.extend_from_slice(&file.len.to_le_bytes());
+            }
+        }
     }
     out
+}
+
+/// The bytes of the file a stored message carries, by the `id`
+/// [`void_engine_messages`] gave it. Empty for a message that is not a file,
+/// one retention has since deleted, or an id that is not a message's.
+///
+/// # Safety
+/// `engine` must be valid. Free the result with [`void_free_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_attachment(engine: *const VoidEngine, id: u64) -> VoidBytes {
+    if engine.is_null() {
+        return VoidBytes::empty();
+    }
+    guard_bytes(|| {
+        let Ok(guard) = (*engine).inner.lock() else {
+            return VoidBytes::empty();
+        };
+        match guard.attachment(id) {
+            Ok(Some(file)) => VoidBytes::from_vec(file.data.clone()),
+            _ => VoidBytes::empty(),
+        }
+    })
 }
 
 /// Destroy an engine, zeroizing its secrets.
@@ -1169,6 +1222,7 @@ fn client_status(e: void_client::ClientError) -> VoidStatus {
         E::OwnInvite => VoidStatus::OwnInvite,
         E::WrongRelay => VoidStatus::WrongRelay,
         E::InvalidInvite => VoidStatus::BadArgument,
+        E::TooLarge => VoidStatus::TooLarge,
         _ => VoidStatus::Failed,
     }
 }
@@ -1215,6 +1269,94 @@ pub unsafe extern "C" fn void_engine_send(
     })
 }
 
+/// Send a file: a photo, a document, anything up to [`void_file_max_bytes`].
+///
+/// A file is a message (see `void_proto::content`): the same ratchet, the
+/// same fixed-size records, one per emission slot, so the relay cannot tell a
+/// photo from the same number of text messages. What it costs is time —
+/// [`void_file_record_count`] records at [`void_pad_interval_ms`] each — and
+/// the interface says so before sending. Its records go out behind every
+/// queued message, so a reply typed while it leaves does not wait for it.
+///
+/// `name` and `mime` are UTF-8 and may be empty; at most 255 and 127 bytes.
+/// A file over any bound is refused as [`VoidStatus::TooLarge`] before any
+/// ratchet state is spent on it.
+///
+/// # Safety
+/// `engine` must be valid. `fingerprint` must be valid for 32 bytes. `name`,
+/// `mime` and `data` must each be valid for their length, or null with length
+/// zero. `out_message_id` must be a valid output pointer.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_send_file(
+    engine: *mut VoidEngine,
+    fingerprint: *const u8,
+    name: *const u8,
+    name_len: usize,
+    mime: *const u8,
+    mime_len: usize,
+    data: *const u8,
+    data_len: usize,
+    now: u64,
+    out_message_id: *mut u64,
+) -> VoidStatus {
+    if engine.is_null() || fingerprint.is_null() || out_message_id.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    if !plausible_seconds(now) {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let (Some(name), Some(mime), Some(data)) = (
+            slice_from(name, name_len),
+            slice_from(mime, mime_len),
+            slice_from(data, data_len),
+        ) else {
+            return VoidStatus::BadArgument;
+        };
+        let (Ok(name), Ok(mime)) = (std::str::from_utf8(name), std::str::from_utf8(mime)) else {
+            return VoidStatus::BadArgument;
+        };
+        // Bounded before it is copied, so a hostile length cannot ask for an
+        // allocation the protocol would refuse anyway.
+        if data.len() > void_proto::content::MAX_FILE_BYTES {
+            return VoidStatus::TooLarge;
+        }
+        let mut fp = [0u8; 32];
+        std::ptr::copy_nonoverlapping(fingerprint, fp.as_mut_ptr(), 32);
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        match guard.send_file(&fp, name, mime, data.to_vec(), now) {
+            Ok(id) => {
+                *out_message_id = id;
+                VoidStatus::Ok
+            }
+            Err(e) => client_status(e),
+        }
+    })
+}
+
+/// The largest file [`void_engine_send_file`] accepts, in bytes
+/// (`void_proto::content::MAX_FILE_BYTES`).
+#[no_mangle]
+pub extern "C" fn void_file_max_bytes() -> usize {
+    void_proto::content::MAX_FILE_BYTES
+}
+
+/// How many records a file of `data_len` bytes takes to send, at most. Times
+/// [`void_pad_interval_ms`], that is the time to quote before sending.
+#[no_mangle]
+pub extern "C" fn void_file_record_count(data_len: usize) -> u16 {
+    void_proto::content::file_record_count(data_len)
+}
+
+/// How often a connected client emits one record, in milliseconds
+/// (`PAD_INTERVAL_MS`, FR-MSG-06). A protocol constant, the same for everyone.
+#[no_mangle]
+pub extern "C" fn void_pad_interval_ms() -> u64 {
+    void_proto::record::PAD_INTERVAL_MS
+}
+
 /// What one [`void_engine_tick`] call did. Mirrors `void_client::engine::TickOutcome`.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1237,9 +1379,22 @@ fn encode_received_messages(messages: &[void_client::engine::ReceivedMessage]) -
     let mut out = Vec::new();
     for m in messages {
         out.extend_from_slice(&m.contact_fingerprint);
-        let text_bytes = m.text.as_bytes();
-        out.extend_from_slice(&(text_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(text_bytes);
+        match &m.attachment {
+            None => {
+                out.push(1);
+                out.extend_from_slice(&0u32.to_le_bytes());
+                let text_bytes = m.text.as_bytes();
+                out.extend_from_slice(&(text_bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(text_bytes);
+            }
+            Some(file) => {
+                out.push(3);
+                out.extend_from_slice(&file.len.to_le_bytes());
+                let name = file.name.as_bytes();
+                out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                out.extend_from_slice(name);
+            }
+        }
     }
     out
 }
@@ -1249,8 +1404,11 @@ fn encode_received_messages(messages: &[void_client::engine::ReceivedMessage]) -
 /// background-execution budget allows — while the app can run.
 ///
 /// `out_messages` is populated only when the returned outcome is `Retrieved`:
-/// repeated `(fingerprint: 32 bytes, u32 LE text length, UTF-8 text)`.
-/// Otherwise it is left empty.
+/// repeated `(fingerprint: 32 bytes, u8 kind, u32 LE size, u32 LE length,
+/// bytes)`, where kind 1 is text — `size` is 0 and the bytes are the UTF-8
+/// text — and kind 3 is a file: `size` is its size and the bytes are its
+/// name. A file's bytes are in the history ([`void_engine_messages`],
+/// [`void_engine_attachment`]). Otherwise it is left empty.
 ///
 /// # Safety
 /// `engine` must be valid. `out_outcome` and `out_messages` must be valid
@@ -1607,7 +1765,7 @@ pub extern "C" fn void_record_size() -> usize {
 pub extern "C" fn void_protocol_id() -> *const c_char {
     // A static, NUL-terminated string checked at compile time. Nothing is
     // allocated and there is nothing for the caller to free.
-    const ID: &CStr = c"void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
+    const ID: &CStr = c"void/v4/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
     // A literal, because a static C string needs its NUL; checked against the
     // core's constant at compile time, so this copy cannot drift the way
     // PROTOCOL.md's and `PROTOCOL_VERSION` had.
@@ -2432,41 +2590,211 @@ mod tests {
 
     #[test]
     fn stored_message_encoding_matches_its_documented_layout() {
-        use void_store::model::{DeliveryState, Direction, StoredMessage};
-        let encoded = encode_stored_messages(&[
-            StoredMessage {
-                contact_fingerprint: [1u8; 32],
-                direction: Direction::Outgoing,
-                timestamp: 1_700_000_000,
-                body: "sent".to_string(),
-                delivery: DeliveryState::Deposited,
+        use void_client::engine::HistoryEntry;
+        use void_store::model::{Attachment, DeliveryState, Direction, StoredMessage};
+        let encoded = encode_history(&[
+            HistoryEntry {
+                id: 11,
+                message: StoredMessage::text(
+                    [1u8; 32],
+                    Direction::Outgoing,
+                    1_700_000_000,
+                    "sent",
+                    DeliveryState::Deposited,
+                ),
+                fragments_remaining: 0,
             },
-            StoredMessage {
-                contact_fingerprint: [1u8; 32],
-                direction: Direction::Incoming,
-                timestamp: 1_700_000_060,
-                body: "got".to_string(),
-                delivery: DeliveryState::Received,
+            HistoryEntry {
+                id: 12,
+                message: StoredMessage::text(
+                    [1u8; 32],
+                    Direction::Incoming,
+                    1_700_000_060,
+                    "got",
+                    DeliveryState::Received,
+                ),
+                fragments_remaining: 0,
+            },
+            HistoryEntry {
+                id: 13,
+                message: StoredMessage {
+                    contact_fingerprint: [1u8; 32],
+                    direction: Direction::Outgoing,
+                    timestamp: 1_700_000_120,
+                    body: String::new(),
+                    delivery: DeliveryState::Queued,
+                    attachment: Some(Attachment {
+                        name: "photo.jpg".to_string(),
+                        mime: "image/jpeg".to_string(),
+                        len: 123_456,
+                        data: Vec::new(),
+                    }),
+                },
+                fragments_remaining: 97,
             },
         ]);
+        // Decode the way Swift and Kotlin do.
         let mut pos = 0;
         let mut decoded = Vec::new();
         while pos < encoded.len() {
-            let direction = encoded[pos];
-            let delivery = encoded[pos + 1];
-            let timestamp = u64::from_le_bytes(encoded[pos + 2..pos + 10].try_into().unwrap());
-            let len = u32::from_le_bytes(encoded[pos + 10..pos + 14].try_into().unwrap()) as usize;
-            let text = std::str::from_utf8(&encoded[pos + 14..pos + 14 + len]).unwrap();
-            decoded.push((direction, delivery, timestamp, text.to_string()));
-            pos += 14 + len;
+            let id = u64::from_le_bytes(encoded[pos..pos + 8].try_into().unwrap());
+            let direction = encoded[pos + 8];
+            let delivery = encoded[pos + 9];
+            let timestamp = u64::from_le_bytes(encoded[pos + 10..pos + 18].try_into().unwrap());
+            let remaining = u16::from_le_bytes(encoded[pos + 18..pos + 20].try_into().unwrap());
+            let len = u32::from_le_bytes(encoded[pos + 20..pos + 24].try_into().unwrap()) as usize;
+            let text = std::str::from_utf8(&encoded[pos + 24..pos + 24 + len]).unwrap();
+            pos += 24 + len;
+            let has_file = encoded[pos];
+            pos += 1;
+            let file = if has_file == 1 {
+                let n = u16::from_le_bytes(encoded[pos..pos + 2].try_into().unwrap()) as usize;
+                let name = std::str::from_utf8(&encoded[pos + 2..pos + 2 + n]).unwrap();
+                pos += 2 + n;
+                let m = u16::from_le_bytes(encoded[pos..pos + 2].try_into().unwrap()) as usize;
+                let mime = std::str::from_utf8(&encoded[pos + 2..pos + 2 + m]).unwrap();
+                pos += 2 + m;
+                let size = u32::from_le_bytes(encoded[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                Some((name.to_string(), mime.to_string(), size))
+            } else {
+                None
+            };
+            decoded.push((
+                id,
+                direction,
+                delivery,
+                timestamp,
+                remaining,
+                text.to_string(),
+                file,
+            ));
         }
         assert_eq!(
             decoded,
             vec![
-                (1, 1, 1_700_000_000, "sent".to_string()),
-                (2, 4, 1_700_000_060, "got".to_string()),
+                (11, 1, 1, 1_700_000_000, 0, "sent".to_string(), None),
+                (12, 2, 4, 1_700_000_060, 0, "got".to_string(), None),
+                (
+                    13,
+                    1,
+                    0,
+                    1_700_000_120,
+                    97,
+                    String::new(),
+                    Some(("photo.jpg".to_string(), "image/jpeg".to_string(), 123_456)),
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn a_file_sent_through_the_boundary_is_listed_and_fetched_by_id() {
+        // Two in-memory engines cannot talk without a relay, so this checks
+        // the boundary on the sender alone: a persisted engine sends a file,
+        // its history lists the file without its bytes, and the bytes come
+        // back by id. The core's end-to-end tests cover arrival.
+        let dir = temp_data_dir("send-file");
+        let kek = [77u8; 32];
+        unsafe {
+            let (status, engine) = open(&dir, &kek);
+            assert_eq!(status, VoidStatus::Ok);
+            // A contact to send to: a second, in-memory engine's bundle.
+            let mut peer: *mut VoidEngine = std::ptr::null_mut();
+            assert_eq!(void_engine_new(&mut peer), VoidStatus::Ok);
+            let (bundle, _) = (*peer)
+                .inner
+                .lock()
+                .unwrap()
+                .create_bundle(b"relay.onion")
+                .unwrap();
+            let fp = (*engine)
+                .inner
+                .lock()
+                .unwrap()
+                .start_conversation(&bundle, "Peer", "", 1_700_000_000)
+                .unwrap();
+
+            let data = vec![5u8; 2_500];
+            let mut id = 0u64;
+            assert_eq!(
+                void_engine_send_file(
+                    engine,
+                    fp.as_ptr(),
+                    b"a.bin".as_ptr(),
+                    5,
+                    std::ptr::null(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    1_700_000_000,
+                    &mut id,
+                ),
+                VoidStatus::Ok
+            );
+            assert_ne!(id, 0);
+
+            // Too large is refused at the boundary, with its own status.
+            let huge = vec![0u8; void_file_max_bytes() + 1];
+            assert_eq!(
+                void_engine_send_file(
+                    engine,
+                    fp.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    huge.as_ptr(),
+                    huge.len(),
+                    1_700_000_000,
+                    &mut id,
+                ),
+                VoidStatus::TooLarge
+            );
+            assert_eq!(
+                void_file_record_count(huge.len()),
+                void_proto::record::MAX_FRAGMENTS
+            );
+            assert_eq!(void_pad_interval_ms(), void_proto::record::PAD_INTERVAL_MS);
+
+            let listed = void_engine_messages(engine, fp.as_ptr());
+            let bytes = std::slice::from_raw_parts(listed.data, listed.len).to_vec();
+            void_free_bytes(listed);
+            // One message: the file. Its id is the first eight bytes.
+            let record_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            assert_eq!(bytes[8], 1, "sent by us");
+            assert_eq!(bytes[9], 0, "still queued");
+            let remaining = u16::from_le_bytes(bytes[18..20].try_into().unwrap());
+            assert!(
+                remaining >= 3,
+                "{remaining} records of a 2.5 KB file still to go"
+            );
+            assert_eq!(&bytes[20..24], &[0, 0, 0, 0], "no text");
+            assert_eq!(bytes[24], 1, "has a file");
+            assert_eq!(
+                bytes.len(),
+                25 + 2 + 5 + 2 + 4,
+                "name, empty type, size, nothing else"
+            );
+
+            let fetched = void_engine_attachment(engine, record_id);
+            assert_eq!(fetched.len, data.len());
+            assert_eq!(
+                std::slice::from_raw_parts(fetched.data, fetched.len),
+                &data[..]
+            );
+            void_free_bytes(fetched);
+
+            // The wrong id, or a null engine, gives nothing — not a crash.
+            let none = void_engine_attachment(engine, record_id + 1_000);
+            assert!(none.data.is_null() && none.len == 0);
+            let none = void_engine_attachment(std::ptr::null(), record_id);
+            assert!(none.data.is_null());
+
+            void_engine_free(peer);
+            void_engine_free(engine);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2622,33 +2950,54 @@ mod tests {
 
     #[test]
     fn received_message_encoding_roundtrips() {
-        let a = void_client::engine::ReceivedMessage {
+        use void_client::engine::{ReceivedAttachment, ReceivedMessage};
+        let a = ReceivedMessage {
             contact_fingerprint: [7u8; 32],
             text: "hello".to_string(),
+            attachment: None,
         };
-        let b = void_client::engine::ReceivedMessage {
+        let b = ReceivedMessage {
             contact_fingerprint: [9u8; 32],
             text: "".to_string(),
+            attachment: None,
         };
-        let encoded = encode_received_messages(&[a, b]);
+        let c = ReceivedMessage {
+            contact_fingerprint: [11u8; 32],
+            text: String::new(),
+            attachment: Some(ReceivedAttachment {
+                name: "photo.jpg".to_string(),
+                mime: "image/jpeg".to_string(),
+                len: 40_000,
+            }),
+        };
+        let encoded = encode_received_messages(&[a, b, c]);
 
-        // Manually decode, the way Swift will: fingerprint(32) || len(u32 LE) || text.
+        // Manually decode, the way Swift will: fingerprint(32) || kind(u8)
+        // || size(u32 LE) || len(u32 LE) || bytes.
         let mut pos = 0;
         let mut decoded = Vec::new();
         while pos < encoded.len() {
             let fp = &encoded[pos..pos + 32];
             pos += 32;
+            let kind = encoded[pos];
+            pos += 1;
+            let size = u32::from_le_bytes(encoded[pos..pos + 4].try_into().unwrap());
+            pos += 4;
             let len = u32::from_le_bytes(encoded[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             let text = std::str::from_utf8(&encoded[pos..pos + len])
                 .unwrap()
                 .to_string();
             pos += len;
-            decoded.push((fp.to_vec(), text));
+            decoded.push((fp.to_vec(), kind, size, text));
         }
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0], (vec![7u8; 32], "hello".to_string()));
-        assert_eq!(decoded[1], (vec![9u8; 32], String::new()));
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], (vec![7u8; 32], 1, 0, "hello".to_string()));
+        assert_eq!(decoded[1], (vec![9u8; 32], 1, 0, String::new()));
+        assert_eq!(
+            decoded[2],
+            (vec![11u8; 32], 3, 40_000, "photo.jpg".to_string())
+        );
     }
 
     /// One decoded contact event: (kind, invite id, fingerprint, name, first

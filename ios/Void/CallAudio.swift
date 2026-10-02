@@ -35,18 +35,140 @@
 import AVFoundation
 import Foundation
 
+/// Apple's Opus codec, through `AVAudioConverter`, at the one configuration
+/// a call uses: 16 kHz mono, one 20 ms packet per frame, constant bitrate.
+///
+/// Separate from `CallAudio` so that it can be exercised without a
+/// microphone, a call, or Tor: `OpusCodecTests` runs it on the Simulator in
+/// CI, which is the only place the assumption that iOS can encode and decode
+/// Opus at this configuration has ever been checked — no call has yet been
+/// made between two iPhones (D-024, D-031).
+final class OpusCodec {
+    /// 16 kHz mono float: what the encoder takes and the decoder produces.
+    /// Wideband speech is what a circuit this slow carries without the delay
+    /// growing further.
+    let pcmFormat: AVAudioFormat
+    let opusFormat: AVAudioFormat
+    /// Samples in one frame: 320 at 16 kHz and 20 ms.
+    let samplesPerFrame: Int
+    private let encoder: AVAudioConverter
+    private let decoder: AVAudioConverter
+
+    /// Constant bitrate, deliberately (see `CallAudio`): 16 kbit/s is 40
+    /// bytes a packet, a third of what a media frame carries.
+    static let bitRate = 16_000
+
+    init(sampleRate: Double = 16_000, frameMs: Int = Int(VoidCore.frameDurationMs)) throws {
+        let perFrame = Int(sampleRate) * frameMs / 1000
+        samplesPerFrame = perFrame
+        guard
+            let pcm = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1,
+                interleaved: false)
+        else { throw VoidError.failed }
+        var description = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatOpus,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: UInt32(perFrame),
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 0,
+            mReserved: 0
+        )
+        guard let opus = AVAudioFormat(streamDescription: &description),
+            let encoder = AVAudioConverter(from: pcm, to: opus),
+            let decoder = AVAudioConverter(from: opus, to: pcm)
+        else { throw VoidError.failed }
+        encoder.bitRate = Self.bitRate
+        encoder.bitRateStrategy = AVAudioBitRateStrategy_Constant
+        pcmFormat = pcm
+        opusFormat = opus
+        self.encoder = encoder
+        self.decoder = decoder
+    }
+
+    /// Encode one frame of exactly `samplesPerFrame` samples. `nil` if the
+    /// encoder produced nothing usable, in which case the caller sends
+    /// silence instead. A packet larger than a media frame carries is dropped
+    /// rather than cut: half an Opus packet is noise, not quieter speech.
+    func encode(_ samples: [Float]) -> Data? {
+        guard samples.count == samplesPerFrame,
+            let pcm = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(samplesPerFrame)),
+            let channel = pcm.floatChannelData?[0]
+        else { return nil }
+        pcm.frameLength = AVAudioFrameCount(samplesPerFrame)
+        samples.withUnsafeBufferPointer { src in
+            if let base = src.baseAddress {
+                channel.update(from: base, count: samplesPerFrame)
+            }
+        }
+        let out = AVAudioCompressedBuffer(
+            format: opusFormat,
+            packetCapacity: 1,
+            maximumPacketSize: max(encoder.maximumOutputPacketSize, VoidCore.maxPayloadLength)
+        )
+        var supplied = false
+        var error: NSError?
+        let status = encoder.convert(to: out, error: &error) { _, inputStatus in
+            if supplied {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            inputStatus.pointee = .haveData
+            return pcm
+        }
+        guard status != .error, error == nil, out.packetCount > 0, out.byteLength > 0 else {
+            return nil
+        }
+        let offset = Int(out.packetDescriptions?.pointee.mStartOffset ?? 0)
+        let size = Int(out.packetDescriptions?.pointee.mDataByteSize ?? out.byteLength)
+        guard size > 0, size <= VoidCore.maxPayloadLength else { return nil }
+        return Data(bytes: out.data.advanced(by: offset), count: size)
+    }
+
+    /// Decode one packet to PCM. `nil` if it does not decode.
+    func decode(_ frame: Data) -> AVAudioPCMBuffer? {
+        guard !frame.isEmpty else { return nil }
+        let compressed = AVAudioCompressedBuffer(
+            format: opusFormat, packetCapacity: 1, maximumPacketSize: max(frame.count, 1))
+        frame.withUnsafeBytes { src in
+            if let base = src.baseAddress {
+                compressed.data.copyMemory(from: base, byteCount: frame.count)
+            }
+        }
+        compressed.byteLength = UInt32(frame.count)
+        compressed.packetCount = 1
+        compressed.packetDescriptions?.pointee = AudioStreamPacketDescription(
+            mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(frame.count))
+
+        // Room for a whole Opus frame at 48 kHz, whatever the encoder chose.
+        guard let pcm = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: 2_880) else { return nil }
+        var supplied = false
+        var error: NSError?
+        let status = decoder.convert(to: pcm, error: &error) { _, inputStatus in
+            if supplied {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            inputStatus.pointee = .haveData
+            return compressed
+        }
+        guard status != .error, error == nil, pcm.frameLength > 0 else { return nil }
+        return pcm
+    }
+}
+
 final class CallAudio: @unchecked Sendable {
     private let media: CallMedia
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
 
-    /// 16 kHz mono float: what the encoder takes and the decoder produces.
-    /// Wideband speech is what a circuit this slow carries without the delay
-    /// growing further.
-    private let pcmFormat: AVAudioFormat
-    private let opusFormat: AVAudioFormat
-    private let encoder: AVAudioConverter
-    private let decoder: AVAudioConverter
+    private let codec: OpusCodec
+    private var pcmFormat: AVAudioFormat { codec.pcmFormat }
     private var captureConverter: AVAudioConverter?
 
     private let samplesPerFrame: Int
@@ -87,37 +209,9 @@ final class CallAudio: @unchecked Sendable {
     init(media: CallMedia) throws {
         self.media = media
         let frameMs = Int(VoidCore.frameDurationMs)
-        let sampleRate = 16_000.0
-        let perFrame = Int(sampleRate) * frameMs / 1000
-        samplesPerFrame = perFrame
+        codec = try OpusCodec(sampleRate: 16_000, frameMs: frameMs)
+        samplesPerFrame = codec.samplesPerFrame
         frameNanos = UInt64(frameMs) * 1_000_000
-
-        guard
-            let pcm = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1,
-                interleaved: false)
-        else { throw VoidError.failed }
-        var description = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatOpus,
-            mFormatFlags: 0,
-            mBytesPerPacket: 0,
-            mFramesPerPacket: UInt32(perFrame),
-            mBytesPerFrame: 0,
-            mChannelsPerFrame: 1,
-            mBitsPerChannel: 0,
-            mReserved: 0
-        )
-        guard let opus = AVAudioFormat(streamDescription: &description),
-            let encoder = AVAudioConverter(from: pcm, to: opus),
-            let decoder = AVAudioConverter(from: opus, to: pcm)
-        else { throw VoidError.failed }
-        encoder.bitRate = 16_000
-        encoder.bitRateStrategy = AVAudioBitRateStrategy_Constant
-        pcmFormat = pcm
-        opusFormat = opus
-        self.encoder = encoder
-        self.decoder = decoder
     }
 
     /// Ask for the microphone, once, at the moment the user chooses to call or
@@ -282,7 +376,7 @@ final class CallAudio: @unchecked Sendable {
                 captured.removeFirst(samplesPerFrame)
                 return next
             }
-            let payload = frame.flatMap(encode) ?? Data()
+            let payload = frame.flatMap(codec.encode) ?? Data()
             if !media.send(payload) {
                 // Refused because the connection is gone: whichever of the two
                 // threads notices first, a closed connection means the same.
@@ -299,45 +393,6 @@ final class CallAudio: @unchecked Sendable {
                 deadline = now
             }
         }
-    }
-
-    /// Encode one 20 ms frame. `nil` if the encoder produced nothing usable,
-    /// in which case silence goes out instead.
-    private func encode(_ samples: [Float]) -> Data? {
-        guard let pcm = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: AVAudioFrameCount(samplesPerFrame)),
-            let channel = pcm.floatChannelData?[0]
-        else { return nil }
-        pcm.frameLength = AVAudioFrameCount(samplesPerFrame)
-        samples.withUnsafeBufferPointer { src in
-            if let base = src.baseAddress {
-                channel.update(from: base, count: samplesPerFrame)
-            }
-        }
-        let out = AVAudioCompressedBuffer(
-            format: opusFormat,
-            packetCapacity: 1,
-            maximumPacketSize: max(encoder.maximumOutputPacketSize, VoidCore.maxPayloadLength)
-        )
-        var supplied = false
-        var error: NSError?
-        let status = encoder.convert(to: out, error: &error) { _, inputStatus in
-            if supplied {
-                inputStatus.pointee = .noDataNow
-                return nil
-            }
-            supplied = true
-            inputStatus.pointee = .haveData
-            return pcm
-        }
-        guard status != .error, error == nil, out.packetCount > 0, out.byteLength > 0 else {
-            return nil
-        }
-        let offset = Int(out.packetDescriptions?.pointee.mStartOffset ?? 0)
-        let size = Int(out.packetDescriptions?.pointee.mDataByteSize ?? out.byteLength)
-        // Anything larger than the core carries is dropped rather than cut:
-        // half an Opus packet is noise, not quieter speech.
-        guard size > 0, size <= VoidCore.maxPayloadLength else { return nil }
-        return Data(bytes: out.data.advanced(by: offset), count: size)
     }
 
     // MARK: Receiving
@@ -384,32 +439,7 @@ final class CallAudio: @unchecked Sendable {
     }
 
     private func play(_ frame: Data) {
-        let compressed = AVAudioCompressedBuffer(
-            format: opusFormat, packetCapacity: 1, maximumPacketSize: max(frame.count, 1))
-        frame.withUnsafeBytes { src in
-            if let base = src.baseAddress {
-                compressed.data.copyMemory(from: base, byteCount: frame.count)
-            }
-        }
-        compressed.byteLength = UInt32(frame.count)
-        compressed.packetCount = 1
-        compressed.packetDescriptions?.pointee = AudioStreamPacketDescription(
-            mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(frame.count))
-
-        // Room for a whole Opus frame at 48 kHz, whatever the encoder chose.
-        guard let pcm = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: 2_880) else { return }
-        var supplied = false
-        var error: NSError?
-        let status = decoder.convert(to: pcm, error: &error) { _, inputStatus in
-            if supplied {
-                inputStatus.pointee = .noDataNow
-                return nil
-            }
-            supplied = true
-            inputStatus.pointee = .haveData
-            return compressed
-        }
-        guard status != .error, error == nil, pcm.frameLength > 0 else { return }
+        guard let pcm = codec.decode(frame) else { return }
 
         let maxQueued = Self.maxQueuedPlaybackMs / Int(VoidCore.frameDurationMs)
         let behind = lock.withLock { scheduledFrames >= maxQueued }

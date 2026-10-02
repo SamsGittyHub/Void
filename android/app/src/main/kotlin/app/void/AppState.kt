@@ -48,7 +48,24 @@ data class OpenedInvite(val fetchId: ByteArray, val stage: Stage) {
 }
 
 /** One message in a conversation, as the screen renders it. */
-data class MessageItem(val text: String, val isMine: Boolean, val delivery: DeliveryState, val timestampSeconds: Long)
+data class MessageItem(
+    val text: String,
+    val isMine: Boolean,
+    val delivery: DeliveryState,
+    val timestampSeconds: Long,
+    /** The store record behind it, for fetching a file's bytes; 0 before the engine has stored it. */
+    val recordId: Long = 0,
+    /** The file this message is, if it is one. Bytes come from [AppState.attachment]. */
+    val attachment: AttachmentInfo? = null,
+    /** Records of it still waiting to leave; zero once sent. One leaves per [VoidCore.padIntervalMs]. */
+    val fragmentsRemaining: Int = 0,
+) {
+    /** What the conversation list shows for it. */
+    val summary: String get() = attachment?.summary ?: text
+}
+
+/** A file the user picked and has not sent yet. */
+class PendingAttachment(val name: String, val mime: String, val data: ByteArray)
 
 /**
  * The one place [Engine] meets Compose state — the Kotlin mirror of
@@ -81,6 +98,9 @@ class AppState(
     private val engineDispatcher: CoroutineDispatcher,
 ) {
     var screen by mutableStateOf<Screen>(Screen.List)
+
+    /** The application context, for screens that need a content resolver (saving a file). */
+    val appContext: Context get() = context
 
     var conversations by mutableStateOf<List<Engine.ContactSummary>>(emptyList())
         private set
@@ -205,7 +225,7 @@ class AppState(
 
         val changed = mutableMapOf<String, ByteArray>()
         when (outcome) {
-            is Engine.TickResult.Retrieved -> outcome.messages.forEach { (fp, _) -> changed[fp.toHex()] = fp }
+            is Engine.TickResult.Retrieved -> outcome.messages.forEach { changed[it.fingerprint.toHex()] = it.fingerprint }
             // A message may just have moved to "Sent".
             Engine.TickResult.Deposited -> engine.contacts().forEach { changed[it.key] = it.fingerprint }
             else -> {}
@@ -236,8 +256,8 @@ class AppState(
         update.contacts?.let { applyContacts(it) }
         (update.outcome as? Engine.TickResult.Retrieved)?.let { retrieved ->
             val counts = unread.toMutableMap()
-            for ((fp, _) in retrieved.messages) {
-                val key = fp.toHex()
+            for (message in retrieved.messages) {
+                val key = message.fingerprint.toHex()
                 if (key != visibleConversation) counts[key] = (counts[key] ?: 0) + 1
             }
             unread = counts
@@ -260,11 +280,28 @@ class AppState(
 
     private fun applyHistory(key: String, history: List<StoredMessage>) {
         messagesByFingerprint = messagesByFingerprint + (
-            key to history.map { MessageItem(it.text, it.isOutgoing, it.delivery, it.timestampSeconds) }
+            key to history.map {
+                MessageItem(it.text, it.isOutgoing, it.delivery, it.timestampSeconds, it.id, it.attachment, it.fragmentsRemaining)
+            }
             )
     }
 
-    fun lastMessage(key: String): String = messagesByFingerprint[key]?.lastOrNull()?.text.orEmpty()
+    fun lastMessage(key: String): String = messagesByFingerprint[key]?.lastOrNull()?.summary.orEmpty()
+
+    /** Files whose bytes the conversation on screen asked for, by record id. Cleared when it closes. */
+    private val attachmentCache = mutableMapOf<Long, ByteArray>()
+
+    /**
+     * The bytes of a file in a conversation, fetched from the engine the first
+     * time a bubble needs them and kept while the conversation is open. Null if
+     * the message is not a file or has since expired.
+     */
+    suspend fun attachment(recordId: Long): ByteArray? {
+        attachmentCache[recordId]?.let { return it }
+        val data = onEngine { it.attachment(recordId) } ?: return null
+        attachmentCache[recordId] = data
+        return data
+    }
 
     fun openConversation(key: String) {
         visibleConversation = key
@@ -274,6 +311,7 @@ class AppState(
 
     fun closeConversation() {
         visibleConversation = null
+        attachmentCache.clear()
         screen = Screen.List
     }
 
@@ -494,6 +532,37 @@ class AppState(
             try {
                 val history = onEngine { e ->
                     e.send(fingerprint, text, System.currentTimeMillis() / 1000)
+                    e.messages(fingerprint)
+                }
+                applyHistory(key, history)
+            } catch (e: VoidException) {
+                lastError = e.message
+                applyHistory(key, onEngine { it.messages(fingerprint) })
+            }
+        }
+    }
+
+    /**
+     * Send a file. Shown at once as sending, like a message; the stored copy,
+     * with its progress, replaces it once the engine has it. Its size and the
+     * time it takes were shown and agreed to first ([AttachmentConfirmDialog]).
+     */
+    fun sendFile(fingerprint: ByteArray, pending: PendingAttachment) {
+        val key = fingerprint.toHex()
+        val info = AttachmentInfo(pending.name, pending.mime, pending.data.size)
+        messagesByFingerprint = messagesByFingerprint + (
+            key to (
+                messagesByFingerprint[key].orEmpty() + MessageItem(
+                    "", true, DeliveryState.QUEUED, System.currentTimeMillis() / 1000,
+                    attachment = info,
+                    fragmentsRemaining = VoidCore.fileRecordCount(pending.data.size),
+                )
+                )
+            )
+        scope.launch {
+            try {
+                val history = onEngine { e ->
+                    e.sendFile(fingerprint, pending.name, pending.mime, pending.data, System.currentTimeMillis() / 1000)
                     e.messages(fingerprint)
                 }
                 applyHistory(key, history)

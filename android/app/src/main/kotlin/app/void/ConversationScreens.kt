@@ -142,6 +142,9 @@ fun ConversationListScreen(
 fun ConversationScreen(state: AppState, contact: Engine.ContactSummary, onBack: () -> Unit, onVerify: () -> Unit) {
     var draft by remember { mutableStateOf("") }
     var renaming by remember { mutableStateOf(false) }
+    // A file picked and not yet confirmed: the dialog shows its size and how
+    // long it will take, and sends it or not.
+    var pendingAttachment by remember { mutableStateOf<PendingAttachment?>(null) }
     val messages = state.messagesByFingerprint[contact.key].orEmpty()
     val listState = rememberLazyListState()
     LaunchedEffect(messages.size) {
@@ -186,10 +189,16 @@ fun ConversationScreen(state: AppState, contact: Engine.ContactSummary, onBack: 
                         contentAlignment = if (message.isMine) Alignment.CenterEnd else Alignment.CenterStart,
                     ) {
                         Column(horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start) {
-                            Card { Text(message.text, modifier = Modifier.padding(10.dp)) }
-                            if (message.isMine && message.delivery.label.isNotEmpty()) {
+                            val attachment = message.attachment
+                            if (attachment != null) {
+                                AttachmentBubble(state = state, message = message, attachment = attachment)
+                            } else {
+                                Card { Text(message.text, modifier = Modifier.padding(10.dp)) }
+                            }
+                            val status = statusLine(message)
+                            if (message.isMine && status.isNotEmpty()) {
                                 Text(
-                                    message.delivery.label,
+                                    status,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = if (message.delivery == DeliveryState.FAILED) {
                                         MaterialTheme.colorScheme.error
@@ -216,8 +225,29 @@ fun ConversationScreen(state: AppState, contact: Engine.ContactSummary, onBack: 
                         draft = ""
                     }
                 },
+                attachments = {
+                    // A photo or any file. Picked here, confirmed in a dialog
+                    // that states its size and the time it will take, then
+                    // queued like a message.
+                    AttachmentButtons(
+                        onPicked = { pendingAttachment = it },
+                        onFailed = { state.lastError = it },
+                    )
+                },
             )
         }
+    }
+
+    pendingAttachment?.let { pending ->
+        AttachmentConfirmDialog(
+            pending = pending,
+            contactName = contact.name.ifBlank { "them" },
+            onSend = {
+                pendingAttachment = null
+                state.sendFile(contact.fingerprint, pending)
+            },
+            onCancel = { pendingAttachment = null },
+        )
     }
 
     if (renaming) {
@@ -230,6 +260,19 @@ fun ConversationScreen(state: AppState, contact: Engine.ContactSummary, onBack: 
             onCancel = { renaming = false },
         )
     }
+}
+
+/**
+ * The delivery label, or, for a file still leaving, how much longer. A photo
+ * is hundreds of records at one per slot, so "Waiting to send" on its own
+ * would look stuck for twenty minutes.
+ */
+private fun statusLine(message: MessageItem): String {
+    if (message.delivery == DeliveryState.QUEUED && message.fragmentsRemaining > 0 && message.attachment != null) {
+        val seconds = message.fragmentsRemaining * (VoidCore.padIntervalMs() / 1000).toInt()
+        return "Sending — about ${AttachmentFormat.duration(seconds)} left"
+    }
+    return message.delivery.label
 }
 
 /** FR-UI-03: trust state as sentences, and a changed key's two ways forward. */

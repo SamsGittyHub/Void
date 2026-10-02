@@ -273,6 +273,31 @@ impl DeliveryState {
     }
 }
 
+/// A file carried by a stored message.
+///
+/// Stored inside the message's own encrypted record, not as a file beside the
+/// database: a photo on disk under its own name is exactly the plaintext
+/// column this module's documentation promises there is none of.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Attachment {
+    /// The name the sender gave it. May be empty.
+    pub name: String,
+    /// Its media type, such as `image/jpeg`. May be empty.
+    pub mime: String,
+    /// The file's size in bytes — always the real size, including when
+    /// [`StoredMessage::decode_meta`] has left `data` empty.
+    pub len: u32,
+    /// The bytes. Empty after [`StoredMessage::decode_meta`]; the full record
+    /// has them.
+    pub data: Vec<u8>,
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
+}
+
 /// A stored message.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StoredMessage {
@@ -283,10 +308,12 @@ pub struct StoredMessage {
     /// Unix seconds. Local clock only; never taken from the peer, because a
     /// peer-supplied timestamp is a channel we would have to trust.
     pub timestamp: u64,
-    /// The message body.
+    /// The message body. Empty for a message that is a file.
     pub body: String,
     /// Delivery state.
     pub delivery: DeliveryState,
+    /// The file this message carries, if it is one.
+    pub attachment: Option<Attachment>,
 }
 
 impl Drop for StoredMessage {
@@ -310,8 +337,36 @@ impl Drop for StoredMessage {
     }
 }
 
+/// Largest attachment a stored message record will decode. The protocol's
+/// own bound (`void_proto::content::MAX_FILE_BYTES`) is lower; this one only
+/// stops a corrupt length field from asking for a huge allocation.
+const MAX_STORED_ATTACHMENT: usize = 1024 * 1024;
+
 impl StoredMessage {
+    /// A text message. Convenience for the common case; the fields are public.
+    #[must_use]
+    pub fn text(
+        contact_fingerprint: [u8; 32],
+        direction: Direction,
+        timestamp: u64,
+        body: &str,
+        delivery: DeliveryState,
+    ) -> StoredMessage {
+        StoredMessage {
+            contact_fingerprint,
+            direction,
+            timestamp,
+            body: body.to_string(),
+            delivery,
+            attachment: None,
+        }
+    }
+
     /// Encode for storage.
+    ///
+    /// A message without a file encodes exactly as it did before files
+    /// existed; the attachment, when there is one, follows the body. That is
+    /// what lets a database written by an earlier build still open.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -323,11 +378,31 @@ impl StoredMessage {
             .u64(self.timestamp)
             .u8(self.delivery.to_byte())
             .bytes32(self.body.as_bytes());
+        if let Some(file) = &self.attachment {
+            w.u8(1)
+                .bytes16(file.name.as_bytes())
+                .bytes16(file.mime.as_bytes())
+                .bytes32(&file.data);
+        }
         w.finish()
     }
 
-    /// Decode from storage.
+    /// Decode from storage, file bytes included.
     pub fn decode(bytes: &[u8]) -> StoreResult<StoredMessage> {
+        Self::decode_inner(bytes, true)
+    }
+
+    /// Decode from storage without copying the file's bytes: the attachment,
+    /// if any, has its name, type and real `len`, and an empty `data`.
+    ///
+    /// For listing a conversation. A history with a hundred photos in it is
+    /// tens of megabytes, and a screen that is drawing a list of bubbles needs
+    /// none of them until one is on screen.
+    pub fn decode_meta(bytes: &[u8]) -> StoreResult<StoredMessage> {
+        Self::decode_inner(bytes, false)
+    }
+
+    fn decode_inner(bytes: &[u8], with_data: bool) -> StoreResult<StoredMessage> {
         let mut r = Reader::new(bytes);
         let contact_fingerprint = r.array::<32>().map_err(|_| StoreError::Corrupt)?;
         let direction = match r.u8().map_err(|_| StoreError::Corrupt)? {
@@ -340,13 +415,33 @@ impl StoredMessage {
         let body = r
             .bytes32_max(1024 * 1024)
             .map_err(|_| StoreError::Corrupt)?;
+        let body = String::from_utf8(body.to_vec()).map_err(|_| StoreError::Corrupt)?;
+        let attachment = if r.remaining() == 0 {
+            None
+        } else {
+            if r.u8().map_err(|_| StoreError::Corrupt)? != 1 {
+                return Err(StoreError::Corrupt);
+            }
+            let name = r.bytes16().map_err(|_| StoreError::Corrupt)?;
+            let mime = r.bytes16().map_err(|_| StoreError::Corrupt)?;
+            let data = r
+                .bytes32_max(MAX_STORED_ATTACHMENT)
+                .map_err(|_| StoreError::Corrupt)?;
+            Some(Attachment {
+                name: String::from_utf8(name.to_vec()).map_err(|_| StoreError::Corrupt)?,
+                mime: String::from_utf8(mime.to_vec()).map_err(|_| StoreError::Corrupt)?,
+                len: data.len() as u32,
+                data: if with_data { data.to_vec() } else { Vec::new() },
+            })
+        };
         r.finish().map_err(|_| StoreError::Corrupt)?;
         Ok(StoredMessage {
             contact_fingerprint,
             direction,
             timestamp,
-            body: String::from_utf8(body.to_vec()).map_err(|_| StoreError::Corrupt)?,
+            body,
             delivery,
+            attachment,
         })
     }
 }
@@ -553,18 +648,70 @@ mod tests {
 
     #[test]
     fn message_encoding_roundtrips() {
-        let m = StoredMessage {
-            contact_fingerprint: [7u8; 32],
-            direction: Direction::Outgoing,
-            timestamp: 999,
-            body: "hello \u{1F600}".to_string(),
-            delivery: DeliveryState::Queued,
-        };
+        let m = StoredMessage::text(
+            [7u8; 32],
+            Direction::Outgoing,
+            999,
+            "hello \u{1F600}",
+            DeliveryState::Queued,
+        );
         let enc = m.encode();
         let decoded = StoredMessage::decode(&enc).unwrap();
         assert_eq!(decoded.body, m.body);
         assert_eq!(decoded.delivery, DeliveryState::Queued);
+        assert!(decoded.attachment.is_none());
         assert!(StoredMessage::decode(&enc[..10]).is_err());
+    }
+
+    #[test]
+    fn a_message_with_a_file_roundtrips_and_lists_without_its_bytes() {
+        let m = StoredMessage {
+            contact_fingerprint: [7u8; 32],
+            direction: Direction::Incoming,
+            timestamp: 999,
+            body: String::new(),
+            delivery: DeliveryState::Received,
+            attachment: Some(Attachment {
+                name: "photo.jpg".to_string(),
+                mime: "image/jpeg".to_string(),
+                len: 3,
+                data: vec![1, 2, 3],
+            }),
+        };
+        let enc = m.encode();
+        assert_eq!(StoredMessage::decode(&enc).unwrap(), m);
+
+        let meta = StoredMessage::decode_meta(&enc).unwrap();
+        let file = meta.attachment.as_ref().unwrap();
+        assert_eq!(file.name, "photo.jpg");
+        assert_eq!(file.mime, "image/jpeg");
+        assert_eq!(file.len, 3, "the real size, with the bytes left behind");
+        assert!(file.data.is_empty());
+
+        // A record cut off inside the attachment is corrupt, not a text
+        // message that happens to have trailing bytes.
+        assert!(StoredMessage::decode(&enc[..enc.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_message_written_before_files_existed_still_decodes() {
+        // The pre-file layout, byte for byte: no trailing attachment section.
+        let mut w = Writer::new();
+        w.raw(&[9u8; 32]).u8(2).u64(5).u8(5).bytes32(b"old");
+        let decoded = StoredMessage::decode(&w.finish()).unwrap();
+        assert_eq!(decoded.body, "old");
+        assert!(decoded.attachment.is_none());
+        // And a message without a file still encodes to that layout.
+        let m = StoredMessage::text(
+            [9u8; 32],
+            Direction::Incoming,
+            5,
+            "old",
+            DeliveryState::Received,
+        );
+        let mut again = Writer::new();
+        again.raw(&[9u8; 32]).u8(2).u64(5).u8(5).bytes32(b"old");
+        assert_eq!(m.encode(), again.finish());
     }
 
     #[test]

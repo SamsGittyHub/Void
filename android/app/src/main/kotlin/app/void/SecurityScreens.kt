@@ -241,6 +241,8 @@ fun ComposerArea(
     draft: String,
     onDraftChanged: (String) -> Unit,
     onSend: () -> Unit,
+    /** The attach buttons, ahead of the text field; nothing by default. */
+    attachments: @Composable () -> Unit = {},
 ) {
     if (trust.canSend) {
         Row(
@@ -248,6 +250,7 @@ fun ComposerArea(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            attachments()
             OutlinedTextField(
                 value = draft,
                 onValueChange = onDraftChanged,
