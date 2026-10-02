@@ -32,23 +32,6 @@ struct MessageItem: Identifiable, Equatable {
     var fragmentsRemaining: Int = 0
 }
 
-/// What a file in a conversation is, without its bytes.
-struct AttachmentInfo: Equatable {
-    let name: String
-    let mime: String
-    /// Size in bytes.
-    let size: Int
-
-    /// Whether to show it as a picture rather than a file card.
-    var isImage: Bool { mime.lowercased().hasPrefix("image/") }
-
-    /// What the conversation list shows for it.
-    var summary: String {
-        if isImage { return "Photo" }
-        return name.isEmpty ? "File" : name
-    }
-}
-
 /// A file the user picked and has not sent yet.
 struct PendingAttachment: Equatable {
     let name: String

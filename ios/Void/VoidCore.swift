@@ -788,6 +788,26 @@ enum InviteFailure: Equatable {
 
 // MARK: - Stored messages
 
+/// What a file in a conversation is, without its bytes. Lives here rather
+/// than in `Models.swift` because the core wrapper parses it off the
+/// boundary, and the Linux bindings check type-checks this file without the
+/// models.
+struct AttachmentInfo: Equatable {
+    let name: String
+    let mime: String
+    /// Size in bytes.
+    let size: Int
+
+    /// Whether to show it as a picture rather than a file card.
+    var isImage: Bool { mime.lowercased().hasPrefix("image/") }
+
+    /// What the conversation list shows for it.
+    var summary: String {
+        if isImage { return "Photo" }
+        return name.isEmpty ? "File" : name
+    }
+}
+
 /// One message from the stored history.
 struct StoredMessage: Equatable {
     /// The store record that holds it; what `VoidCore.attachment(id:)` takes.
