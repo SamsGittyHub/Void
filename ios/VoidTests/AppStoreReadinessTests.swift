@@ -18,8 +18,23 @@ import XCTest
 @testable import Void
 
 final class AppStoreReadinessTests: XCTestCase {
+    /// The Info.plist as the running device resolves it: device-specific
+    /// keys (`~ipad`, `~iphone`) are folded in for this device and the other
+    /// device's are dropped. Right for everything that is the same on both.
     private var info: [String: Any] {
         Bundle.main.infoDictionary ?? [:]
+    }
+
+    /// The Info.plist as written into the bundle, every key as App Store
+    /// Connect sees it. On an iPhone Simulator the resolved dictionary has no
+    /// `UISupportedInterfaceOrientations~ipad` at all (CI found this), so the
+    /// iPad check reads the file.
+    private var rawInfo: [String: Any] {
+        guard let url = Bundle.main.url(forResource: "Info", withExtension: "plist"),
+            let data = try? Data(contentsOf: url),
+            let plist = try? PropertyListSerialization.propertyList(from: data, format: nil)
+        else { return info }
+        return plist as? [String: Any] ?? info
     }
 
     func testTheAppHasAnIcon() throws {
@@ -31,10 +46,10 @@ final class AppStoreReadinessTests: XCTestCase {
     }
 
     func testIPadDeclaresEveryOrientationOrOptsOutOfMultitasking() throws {
-        let fullScreen = info["UIRequiresFullScreen"] as? Bool ?? false
+        let fullScreen = rawInfo["UIRequiresFullScreen"] as? Bool ?? false
         if fullScreen { return }
         let ipad = try XCTUnwrap(
-            info["UISupportedInterfaceOrientations~ipad"] as? [String],
+            rawInfo["UISupportedInterfaceOrientations~ipad"] as? [String],
             "an iPad app that multitasks must list its orientations")
         XCTAssertEqual(
             Set(ipad),

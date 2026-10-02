@@ -1607,7 +1607,10 @@ so far has been.
   orientations are all four (or multitasking is off), every permission string
   explains itself, export compliance is declared `true`, and the version,
   build and bundle identifier are set. A regenerated project or an edited
-  plist that undoes any of these fails CI's iOS job.
+  plist that undoes any of these fails CI's iOS job. The iPad check reads the
+  plist file itself rather than `Bundle.infoDictionary`: on an iPhone the
+  resolved dictionary folds in that device's `~iphone` keys and drops the
+  `~ipad` ones, which the first run of the test found out.
 
 **What this does not make true.** "Ready to upload" is not "ready to ship".
 The listing, screenshots and the export compliance questionnaire are
