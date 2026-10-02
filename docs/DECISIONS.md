@@ -1548,6 +1548,14 @@ the decoded audio must carry the tone (an RMS near a half-amplitude sine's),
 not silence. The Linux bindings check still type-checks the whole file against
 the AVFoundation stand-ins.
 
+**What its first run found.** The codec is there and behaves: every frame
+after the encoder's lookahead came out as one packet under 80 bytes, every
+packet decoded, and the decoded tone had the expected level. One assumption
+was wrong, in the test and not the code: Apple's decoder applies Opus's
+pre-skip to the first packet, so that one decodes to 280 samples and not 320.
+The audio loop schedules whatever a packet decodes to, so a short first packet
+costs nothing; the test now requires an exact frame only after the first few.
+
 **What it does not prove.** That a call connects, that echo cancellation
 works, that the microphone or the speaker route correctly, or what a voice
 sounds like through 750 ms of Tor. It proves the one piece of the iOS path that

@@ -70,7 +70,16 @@ final class OpusCodecTests: XCTestCase {
             }
             decodedFrames += 1
             XCTAssertEqual(pcm.format.sampleRate, codec.pcmFormat.sampleRate)
-            XCTAssertEqual(Int(pcm.frameLength), codec.samplesPerFrame, "one packet is one frame")
+            // Opus has a pre-skip: the encoder's lookahead, which the decoder
+            // trims from the start of the stream. Apple's decoder applies it
+            // to the first packet (observed in CI: 280 samples out of 320),
+            // so the first packets may come up short; after that one packet
+            // is exactly one frame, or the player's cadence would drift.
+            XCTAssertGreaterThan(pcm.frameLength, 0)
+            XCTAssertLessThanOrEqual(Int(pcm.frameLength), codec.samplesPerFrame)
+            if index >= 5 {
+                XCTAssertEqual(Int(pcm.frameLength), codec.samplesPerFrame, "one packet is one frame")
+            }
             // Skip the first frames: the decoder's pre-skip is silence.
             if index >= 5, let channel = pcm.floatChannelData?[0] {
                 for i in 0..<Int(pcm.frameLength) {
