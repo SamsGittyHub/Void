@@ -17,6 +17,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-or-later"
+# Nothing here goes to crates.io; this also stops an accidental `cargo publish`.
+publish = false
 repository = "https://github.com/void-messenger/void"
 
 # NFR-SEC-04: reproducible builds. These settings are part of the documented

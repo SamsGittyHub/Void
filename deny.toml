@@ -1,16 +1,34 @@
 # cargo-deny configuration (NFR-SEC-07).
 #
-# void-crypto has an empty dependency table today, which makes most of this
-# vacuous. It is written now so the policy is already in force when the
-# ACVP-validated PQC crates arrive (DECISIONS D-006) rather than being drafted
-# under time pressure at that point.
+# Most of the dependency graph is Arti (void-tor), about 540 crates. The rules
+# below hold Void's own crates to the strict line and say, entry by entry,
+# where Arti's tree is let through and why.
 
 [advisories]
 yanked = "deny"
+# Fail on unmaintained crates Void depends on directly. Arti's (`paste`, under
+# fs-mistrust) are Arti's to replace; `cargo audit` still lists them.
+unmaintained = "workspace"
+ignore = [
+    # The Marvin attack recovers an RSA private key by timing operations made
+    # with it, and `rsa` has no fixed release. It arrives through Arti, which
+    # uses RSA private keys only to sign as a Tor relay or directory authority
+    # (tor-cert, tor-netdoc) and to keep such keys (tor-key-forge). Void is a
+    # client and an onion service, whose keys are ed25519; it never holds an
+    # RSA private key. Drop this once `rsa` ships a fix or Arti drops RSA.
+    # The same exception is in .cargo/audit.toml for `cargo audit`.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via Arti; Void never holds an RSA private key" },
+]
 
 [bans]
-multiple-versions = "deny"
+# Arti's tree has two or three versions of about 45 crates (windows-sys, syn,
+# rand, digest...). That costs build size, not safety, and Void cannot change
+# it without forking Arti, so duplicates are listed rather than failed.
+multiple-versions = "warn"
 wildcards = "deny"
+# Void's crates depend on each other by path, which is not a crates.io
+# wildcard. They are never published (`publish = false`).
+allow-wildcard-paths = true
 # FR-TRANS-02 / non-negotiable #4, at the dependency-graph level.
 deny = [
     { name = "webrtc" },
@@ -22,8 +40,22 @@ deny = [
 
 [licenses]
 # NFR-SEC-06 publishes Void under an OSI-approved licence; dependencies must be
-# compatible with AGPL-3.0-or-later.
-allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0", "AGPL-3.0"]
+# compatible with AGPL-3.0-or-later. Each licence here is (MPL-2.0 through its
+# secondary-licence clause); add one only after checking that it is too.
+allow = [
+    "AGPL-3.0-or-later", # Void's own crates
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
 confidence-threshold = 0.93
 
 [sources]

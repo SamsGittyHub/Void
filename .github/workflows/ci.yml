@@ -77,9 +77,9 @@ jobs:
   audit:
     name: "NFR-SEC-07 — cargo audit / vet / deny"
     runs-on: ubuntu-latest
-    # void-crypto has zero dependencies today, so this is currently trivial.
-    # It is here so that it is already wired when that changes — which it will,
-    # when the ACVP-validated PQC crates land (DECISIONS D-006).
+    # Checks all ~540 crates (mostly Arti's) for known advisories, licences and
+    # banned crates. deny.toml says where Arti's tree is let through and why,
+    # including the one advisory excepted; .cargo/audit.toml mirrors it.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

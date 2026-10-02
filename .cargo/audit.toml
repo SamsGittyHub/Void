@@ -1,0 +1,4 @@
+# `cargo audit`'s copy of the advisory exception in deny.toml, where the reason
+# is written out. Keep the two in step.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

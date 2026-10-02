@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Bootstraps Arti and hands void-client's TorTransport a live circuit. Kept separate from void-client (D-009) so the async runtime never enters the trusted core's dependency graph."
 
 [dependencies]
