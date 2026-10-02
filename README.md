@@ -22,7 +22,7 @@ protocol and infrastructure**, not a shippable product — see
 | Files | A file is a message: kind 3 inside the ratchet, up to 500 KiB, the same records at the same rate, so the relay cannot tell a photo from messages. Core, FFI, JNI and both apps built (pickers, shrunk photos, a time estimate before sending, progress while it leaves, save). Proven end to end through a relay in the core's tests; **never sent between two running apps** — D-032 |
 | `void-cli` — reference client | Working. Plain TCP, loudly insecure, development only |
 | `void-ffi` — C ABI | Working: opening the persistent engine, short invitations (create, open, confirm, contact events), send, tick, history, contacts, Tor bootstrap/attach, calls, and duress |
-| `ios/` | Builds with Xcode and passes its unit and UI tests on the Simulator. Ran on two Simulators over the live Tor network: launch, Tor, an invitation made and read back off the screen, adding a contact, messages both ways, a restart. **Never run on a physical device, so the Secure Enclave key, the QR camera and calls are untested on iOS** — D-019, D-029, D-031 |
+| `ios/` | Builds with Xcode and passes its unit and UI tests on the Simulator. Ran on two Simulators over the live Tor network: launch, Tor, an invitation made and read back off the screen, adding a contact, messages both ways, a restart. Has an app icon, iPad orientations and a two-column iPad layout, pinned by `AppStoreReadinessTests`, so App Store Connect accepts the upload (D-034); the listing, screenshots, export questionnaire and a production relay address are submission-time steps. **Never run on a physical device, so the Secure Enclave key, the QR camera and calls are untested on iOS** — D-019, D-029, D-031 |
 | `void-jni` — JNI ABI | Cross-compiled for Android (arm64-v8a, x86_64) and run inside the app on emulators; run in a desktop JVM against the real core in CI — D-023, D-029 |
 | `android/` | Runs end to end on two emulators over the live Tor network: onboarding, a Keystore-held key, adding a contact, messages, calls, restarts. **Never run on a physical device; the QR camera is untested** (emulators have none) — D-020, D-029 |
 
@@ -260,7 +260,7 @@ should require to pass.
 
 ## What was decided while building this
 
-[`docs/DECISIONS.md`](docs/DECISIONS.md) has all thirty-three entries. The ones worth
+[`docs/DECISIONS.md`](docs/DECISIONS.md) has all thirty-four entries. The ones worth
 knowing about before reading the code:
 
 - **D-005** — the ML-KEM ratchet runs every 4 DH steps, not every step. Doing it

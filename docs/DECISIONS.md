@@ -1559,6 +1559,61 @@ calls on iOS as unproven until someone has held a conversation.
 
 ---
 
+## D-034 — The iOS app can be uploaded, and has an iPad layout
+
+**Found, not planned,** when asked whether the app was ready for the App
+Store. It built, ran and passed its tests, and App Store Connect would have
+refused the upload twice over before a reviewer saw it:
+
+1. **It had no icon.** The project had no asset catalog at all. An upload
+   without an app icon is rejected at validation.
+2. **It took part in iPad multitasking without declaring its orientations.**
+   The device family was iPhone and iPad and `UIRequiresFullScreen` was false,
+   which opts into Split View, and an app that does so must list all four
+   orientations for iPad. The plist listed three, for phones.
+
+Neither shows on a Simulator or a developer device, which is where every run
+so far has been.
+
+**Decided.**
+
+- **One icon, one size.** `Assets.xcassets/AppIcon.appiconset` holds a single
+  1,024-pixel PNG and Xcode renders every size from it. The image is generated
+  by a few lines of Python in the commit that added it — a dark field and one
+  off-white ring, no text, no alpha (the store refuses an icon with one) — so
+  there is no design file to lose and nothing a reviewer could call a
+  placeholder. Replace it by replacing the file.
+- **iPad orientations are the iPad's.** `UISupportedInterfaceOrientations~ipad`
+  lists all four; the phone list keeps three. `LSRequiresIPhoneOS` is set, as
+  every App Store build has it.
+- **A wide screen gets two columns.** At a regular horizontal size class the
+  conversation list is a `NavigationSplitView` with the open conversation
+  beside it; at compact widths the navigation stack is unchanged. The two
+  layouts share one list and one conversation builder, so what a row shows and
+  what a conversation does cannot drift between them. Message bubbles stop
+  growing at 560 points, so a short message on an iPad is a bubble and not a
+  banner. The call, incoming-call and disclosure screens were already centred
+  stacks and needed nothing.
+- **Pinned by a test.** `AppStoreReadinessTests` runs inside the built app and
+  reads the Info.plist Xcode produced: the icon entry is there, the iPad
+  orientations are all four (or multitasking is off), every permission string
+  explains itself, export compliance is declared `true`, and the version,
+  build and bundle identifier are set. A regenerated project or an edited
+  plist that undoes any of these fails CI's iOS job.
+
+**What this does not make true.** "Ready to upload" is not "ready to ship".
+The listing, screenshots and the export compliance questionnaire are
+submission-time steps for a person. `RelayConfig.swift` still names a
+development relay on a developer's machine, and a release needs that to come
+from configuration (README, *Status*). The Secure Enclave key path, the QR
+camera, calls on iOS and files between two apps are all still unverified on a
+device (D-029, D-031, D-032, D-033). And the iPad layout has been built and
+type-checked in CI's iOS job, not used on an iPad.
+
+**Enforced by.** `AppStoreReadinessTests` in CI's iOS job.
+
+---
+
 ## Open, and deliberately so
 
 **PRD §13.3 — who runs the relays.** Not resolved. The code supports any

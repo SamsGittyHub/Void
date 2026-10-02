@@ -34,6 +34,12 @@ struct ConversationListView: View {
     var onOpen: (Data) -> Void = { _ in }
     var onClose: (Data) -> Void = { _ in }
 
+    /// On an iPad, or an iPhone in landscape with room for it, the list and
+    /// the open conversation sit side by side; otherwise one at a time.
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    /// The conversation open in the side-by-side layout.
+    @State private var selected: Data?
+
     private var emptyStateDescription: String {
         "Void has no directory and no way to look people up. You start a conversation by "
             + "scanning someone's code in person, or by sending them a one-time link through "
@@ -41,94 +47,142 @@ struct ConversationListView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            List {
-                if isOffline {
-                    // NFR-REL-04 and FR-TRANS-05: the user is told plainly that
-                    // nothing is being sent, and told *why that is deliberate*.
-                    // A generic "no connection" banner would invite them to
-                    // look for a workaround; there isn't one, by design.
-                    Section {
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Not connected").font(.subheadline.bold())
-                                Text(
-                                    "Messages are saved on this phone and will send when Void "
-                                        + "can reach the network. Nothing is sent any other way."
-                                )
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "wifi.slash").foregroundStyle(.orange)
-                        }
-                    }
-                }
+        if sizeClass == .regular {
+            splitLayout
+        } else {
+            stackLayout
+        }
+    }
 
-                ForEach($conversations) { $conversation in
-                    NavigationLink(value: conversation.id) {
-                        ConversationRow(conversation: conversation)
-                    }
+    // MARK: Compact: one screen at a time
+
+    private var stackLayout: some View {
+        NavigationStack {
+            list
+                .navigationDestination(for: Data.self) { id in
+                    conversation(id)
+                }
+        }
+    }
+
+    // MARK: Regular: list beside conversation (D-034)
+
+    private var splitLayout: some View {
+        NavigationSplitView {
+            list
+        } detail: {
+            if let id = selected, conversations.contains(where: { $0.id == id }) {
+                NavigationStack {
+                    conversation(id)
+                }
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text("Choose a conversation")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Void")
-            .navigationDestination(for: Data.self) { id in
-                if let index = conversations.firstIndex(where: { $0.id == id }) {
-                    ConversationView(
-                        conversation: $conversations[index],
-                        messages: messagesByFingerprint[id] ?? [],
-                        onSend: { text in onSend(id, text) },
-                        onSendFile: { pending in onSendFile(id, pending) },
-                        loadAttachment: loadAttachment,
-                        myWords: myWords,
-                        onVerificationResult: { matched in onVerificationResult(id, matched) },
-                        onAcknowledgeKeyChange: { onAcknowledgeKeyChange(id) },
-                        onRename: { name in onRename(id, name) },
-                        onCall: { onCall(id) }
-                    )
-                    .onAppear { onOpen(id) }
-                    .onDisappear { onClose(id) }
-                }
-            }
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button(action: onNewContact) {
-                        Label("Add contact", systemImage: "qrcode")
-                    }
-                }
-            }
-            .overlay {
-                // ContentUnavailableView is iOS 17+; NFR-COMP-01 sets the
-                // floor at iOS 16, so this needs a plain fallback rather
-                // than raising the deployment target for one empty state.
-                if conversations.isEmpty {
-                    if #available(iOS 17.0, *) {
-                        ContentUnavailableView {
-                            Label("No conversations", systemImage: "qrcode.viewfinder")
-                        } description: {
-                            Text(emptyStateDescription)
-                        } actions: {
-                            Button("Add a contact", action: onNewContact)
-                                .buttonStyle(.borderedProminent)
+        }
+    }
+
+    // MARK: The pieces both layouts share
+
+    /// The list itself. `selection` is read only by the split layout; in a
+    /// navigation stack the links push instead.
+    private var list: some View {
+        List(selection: $selected) {
+            if isOffline {
+                // NFR-REL-04 and FR-TRANS-05: the user is told plainly that
+                // nothing is being sent, and told *why that is deliberate*.
+                // A generic "no connection" banner would invite them to
+                // look for a workaround; there isn't one, by design.
+                Section {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Not connected").font(.subheadline.bold())
+                            Text(
+                                "Messages are saved on this phone and will send when Void "
+                                    + "can reach the network. Nothing is sent any other way."
+                            )
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                         }
-                    } else {
-                        VStack(spacing: 12) {
-                            Image(systemName: "qrcode.viewfinder")
-                                .font(.system(size: 40))
-                                .foregroundStyle(.secondary)
-                            Text("No conversations").font(.headline)
-                            Text(emptyStateDescription)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .padding(.horizontal, 32)
-                            Button("Add a contact", action: onNewContact)
-                                .buttonStyle(.borderedProminent)
-                        }
+                    } icon: {
+                        Image(systemName: "wifi.slash").foregroundStyle(.orange)
                     }
                 }
             }
+
+            ForEach($conversations) { $conversation in
+                NavigationLink(value: conversation.id) {
+                    ConversationRow(conversation: conversation)
+                }
+            }
+        }
+        .navigationTitle("Void")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: onNewContact) {
+                    Label("Add contact", systemImage: "qrcode")
+                }
+            }
+        }
+        .overlay {
+            // ContentUnavailableView is iOS 17+; NFR-COMP-01 sets the
+            // floor at iOS 16, so this needs a plain fallback rather
+            // than raising the deployment target for one empty state.
+            if conversations.isEmpty {
+                if #available(iOS 17.0, *) {
+                    ContentUnavailableView {
+                        Label("No conversations", systemImage: "qrcode.viewfinder")
+                    } description: {
+                        Text(emptyStateDescription)
+                    } actions: {
+                        Button("Add a contact", action: onNewContact)
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "qrcode.viewfinder")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.secondary)
+                        Text("No conversations").font(.headline)
+                        Text(emptyStateDescription)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 32)
+                        Button("Add a contact", action: onNewContact)
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+        }
+    }
+
+    /// One conversation, wired to the callbacks. Its appearing and
+    /// disappearing is what tells `AppState` which conversation is on screen,
+    /// in either layout.
+    @ViewBuilder private func conversation(_ id: Data) -> some View {
+        if let index = conversations.firstIndex(where: { $0.id == id }) {
+            ConversationView(
+                conversation: $conversations[index],
+                messages: messagesByFingerprint[id] ?? [],
+                onSend: { text in onSend(id, text) },
+                onSendFile: { pending in onSendFile(id, pending) },
+                loadAttachment: loadAttachment,
+                myWords: myWords,
+                onVerificationResult: { matched in onVerificationResult(id, matched) },
+                onAcknowledgeKeyChange: { onAcknowledgeKeyChange(id) },
+                onRename: { name in onRename(id, name) },
+                onCall: { onCall(id) }
+            )
+            .onAppear { onOpen(id) }
+            .onDisappear { onClose(id) }
         }
     }
 }
@@ -396,6 +450,10 @@ private struct MessageBubble: View {
     let message: MessageItem
     var loadAttachment: (UInt64) async -> Data? = { _ in nil }
 
+    /// A bubble never grows past this, so a short message on an iPad is a
+    /// bubble and not a banner.
+    private static let maxBubbleWidth: CGFloat = 560
+
     var body: some View {
         HStack {
             if message.isOutgoing { Spacer(minLength: 48) }
@@ -433,6 +491,7 @@ private struct MessageBubble: View {
                         )
                 }
             }
+            .frame(maxWidth: Self.maxBubbleWidth, alignment: message.isOutgoing ? .trailing : .leading)
             if !message.isOutgoing { Spacer(minLength: 48) }
         }
         .accessibilityElement(children: .combine)
