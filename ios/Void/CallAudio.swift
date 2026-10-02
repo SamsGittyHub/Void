@@ -223,6 +223,8 @@ final class CallAudio: @unchecked Sendable {
             threads.leave()
         }
         thread.name = name
+        // Both loops call into the core; see `CoreThread`.
+        thread.stackSize = CoreThread.stackSize
         thread.qualityOfService = .userInteractive
         thread.start()
     }

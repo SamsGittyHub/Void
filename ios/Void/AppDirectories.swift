@@ -1,9 +1,9 @@
 //  AppDirectories.swift
 //
-//  Where Void keeps things on disk. Every directory here is app-private and
-//  excluded from backup (FR-STOR-05), and the app's entitlement sets
-//  `NSFileProtectionComplete`, so none of it is readable while the phone is
-//  locked.
+//  Where Void keeps things on disk. Every directory here is app-private,
+//  readable by its owner only, and excluded from backup (FR-STOR-05), and the
+//  app's entitlement sets `NSFileProtectionComplete`, so none of it is
+//  readable while the phone is locked.
 
 import Foundation
 
@@ -43,7 +43,14 @@ enum AppDirectories {
     }
 
     private static func excludedFromBackup(_ url: URL) throws -> URL {
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        // Owner-only, and set again on every launch for a directory an earlier
+        // build made 0755, `createDirectory`'s default. Arti refuses a state
+        // or cache directory that anyone else can read: bootstrap failed in
+        // well under a second, "problem with filesystem permissions", and the
+        // app retried forever, offline.
+        let ownerOnly: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: ownerOnly)
+        try FileManager.default.setAttributes(ownerOnly, ofItemAtPath: url.path)
         var marked = url
         var values = URLResourceValues()
         values.isExcludedFromBackup = true

@@ -112,13 +112,30 @@ Task { () async -> Void in
 semaphore.wait()
 var ticks = 0
 let tickDone = DispatchSemaphore(value: 0)
-let timer = queue.makeTimer(every: .milliseconds(50)) { core in
+let timer = queue.makeTimer(every: 0.05) { core in
     _ = core.tick(nowMs: UInt64(Date().timeIntervalSince1970 * 1000))
     ticks += 1
     if ticks == 3 { tickDone.signal() }
 }
 check(tickDone.wait(timeout: .now() + 5) == .success, "timer ticks on the core queue")
 timer.cancel()
+// Blocks until everything queued before it has run.
+func onQueue<T>(_ body: @escaping @Sendable (VoidCore) -> T) -> T {
+    var result: T?
+    let done = DispatchSemaphore(value: 0)
+    Task { () async -> Void in
+        result = await queue.run(body)
+        done.signal()
+    }
+    done.wait()
+    return result!
+}
+let ticksAtCancel = onQueue { _ in ticks }
+Thread.sleep(forTimeInterval: 0.25)
+check(onQueue { _ in ticks } == ticksAtCancel, "a cancelled timer stops ticking")
+// ML-DSA-87 keygen overflows the 512 KiB of a dispatch queue's thread on iOS.
+check(onQueue { _ in Thread.current.stackSize } >= CoreThread.stackSize, "the core queue's thread has the core's stack")
+check(onQueue { _ in (try? VoidCore())?.fingerprintWords.contains("-") ?? false }, "an identity is made on the core queue")
 
 print("byte reader")
 var reader = ByteReader([1, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12, 0xff])

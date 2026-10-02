@@ -63,7 +63,9 @@ final class AppStateBox: ObservableObject {
 
     func unlock() {
         phase = .unlocking
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // Opening an engine for the first time generates its identity, which
+        // needs `CoreThread`'s stack, not a dispatch queue's.
+        CoreThread.detach(name: "app.void.unlock", qos: .userInitiated) { [weak self] in
             let result = Result { () throws -> (VoidCore, VaultBacking, String) in
                 var opened = try KeyVault.openOrCreate(reason: "Unlock Void")
                 let core = try VoidCore(

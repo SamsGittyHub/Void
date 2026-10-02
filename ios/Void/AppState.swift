@@ -111,7 +111,7 @@ final class AppState: ObservableObject {
     let fingerprintWords: String
 
     private let worker: CoreQueue
-    private var tickTimer: DispatchSourceTimer?
+    private var tickTimer: CoreQueue.Timer?
     private let watchedInvites = WatchedInvites()
 
     private var tor: TorClient?
@@ -185,7 +185,7 @@ final class AppState: ObservableObject {
     /// slots (D-025); there is no separate timer for them.
     private func startTicking() {
         let watched = watchedInvites
-        tickTimer = worker.makeTimer(every: .seconds(1)) { [weak self] core in
+        tickTimer = worker.makeTimer(every: 1) { [weak self] core in
             let outcome = core.tick(nowMs: Clock.nowMs)
             let contactEvents = core.takeContactEvents()
             let callEvents = core.takeCallEvents()
@@ -336,7 +336,7 @@ final class AppState: ObservableObject {
     private func connectTor() {
         guard tor == nil, torStatus != .bootstrapping else { return }
         torStatus = .bootstrapping
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        CoreThread.detach(name: "app.void.tor-bootstrap", qos: .utility) { [weak self] in
             let result = Result {
                 try TorClient(
                     stateDirectory: AppDirectories.torState(),
@@ -365,7 +365,7 @@ final class AppState: ObservableObject {
         guard let tor, !attaching else { return }
         attaching = true
         let core = worker.core
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        CoreThread.detach(name: "app.void.relay-attach", qos: .utility) { [weak self] in
             let attached =
                 (try? core.attachTor(tor, onionAddress: RelayConfig.onionAddress, port: RelayConfig.port))
                 != nil
@@ -695,7 +695,7 @@ final class AppState: ObservableObject {
         }
         activeCall = CallSession(fingerprint: fingerprint, callId: Data(), role: .caller, phase: .publishing)
         let worker = self.worker
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        CoreThread.detach(name: "app.void.call-publish", qos: .userInitiated) { [weak self] in
             let host = CallHost(tor: tor, keyDirectory: AppDirectories.callKeys())
             Task { @MainActor in
                 guard let self, self.activeCall?.fingerprint == fingerprint else { return }
@@ -732,7 +732,7 @@ final class AppState: ObservableObject {
     /// relayed answer arrives (D-028): the callee dials the moment they
     /// answer, and their first authenticated frame is the answer.
     private func waitForCallee(host: CallHost, placed: (callId: Data, mediaSecret: Data), fingerprint: Data) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        CoreThread.detach(name: "app.void.call-accept", qos: .userInitiated) { [weak self] in
             let media = host.accept(mediaSecret: placed.mediaSecret, callId: placed.callId)
             Task { @MainActor in
                 guard let self, self.activeCall?.callId == placed.callId else {
@@ -764,7 +764,7 @@ final class AppState: ObservableObject {
         Task { [weak self, worker] in
             do {
                 let answered = try await worker.attempt { try $0.answerCall(from: fingerprint) }
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                CoreThread.detach(name: "app.void.call-connect", qos: .userInitiated) { [weak self] in
                     let media = CallMedia.connect(
                         tor: tor,
                         address: answered.address,
