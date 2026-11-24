@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod blobs;
 pub mod protocol;
 pub mod server;
 pub mod store;

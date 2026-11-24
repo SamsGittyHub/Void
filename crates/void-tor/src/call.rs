@@ -64,6 +64,8 @@ use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::{handle_rend_requests, HsNickname, RunningOnionService};
 use tor_proto::stream::IncomingStreamRequest;
 
+use void_proto::call::MediaMode;
+#[cfg(test)]
 use void_proto::call::MEDIA_FRAME_LEN;
 
 use crate::{TorError, TorHandle};
@@ -263,9 +265,10 @@ impl TorHandle {
 
 /// One call's media connection, before it is split for sending and receiving.
 ///
-/// Frames are fixed-size ([`MEDIA_FRAME_LEN`]) and already encrypted by
-/// `void_proto::call::MediaSealer` before they reach here — this type moves
-/// bytes and knows nothing about what is in them.
+/// Frames are fixed-size — `MediaMode::frame_len` for the call's mode, voice
+/// or video — and already encrypted by `void_proto::call::MediaSealer` before
+/// they reach here; this type moves bytes and knows nothing about what is in
+/// them.
 pub struct MediaSocket {
     handle: tokio::runtime::Handle,
     inner: arti_client::DataStream,
@@ -273,21 +276,23 @@ pub struct MediaSocket {
 
 impl MediaSocket {
     /// Separate the halves, for a sending thread and a receiving thread that
-    /// must never wait on each other.
+    /// must never wait on each other, framed for a call in `mode`.
     #[must_use]
-    pub fn split(self) -> (MediaReader, MediaWriter) {
+    pub fn split(self, mode: MediaMode) -> (MediaReader, MediaWriter) {
+        let frame_len = mode.frame_len();
         let (reader, writer) = self.inner.split();
         (
             MediaReader {
                 handle: self.handle.clone(),
                 inner: reader,
-                buf: [0u8; MEDIA_FRAME_LEN],
+                buf: vec![0u8; frame_len],
                 filled: 0,
             },
             MediaWriter {
                 handle: self.handle,
                 inner: writer,
-                pending: Vec::with_capacity(2 * MEDIA_FRAME_LEN),
+                pending: Vec::with_capacity(2 * frame_len),
+                frame_len,
             },
         )
     }
@@ -299,8 +304,8 @@ pub struct MediaReader<R = arti_client::DataReader> {
     handle: tokio::runtime::Handle,
     inner: R,
     /// The frame being read, kept across calls so a stall mid-frame costs time
-    /// and never alignment.
-    buf: [u8; MEDIA_FRAME_LEN],
+    /// and never alignment. Exactly one frame long.
+    buf: Vec<u8>,
     filled: usize,
 }
 
@@ -310,10 +315,7 @@ impl<R: AsyncRead + Unpin> MediaReader<R> {
     /// `Ok(Some(frame))` is a frame; `Ok(None)` means none finished arriving
     /// in time — any part of one that did is kept for the next call; `Err`
     /// means the stream is closed, or `cancelled` was set.
-    pub fn recv_frame(
-        &mut self,
-        cancelled: &AtomicBool,
-    ) -> Result<Option<[u8; MEDIA_FRAME_LEN]>, TorError> {
+    pub fn recv_frame(&mut self, cancelled: &AtomicBool) -> Result<Option<Vec<u8>>, TorError> {
         self.recv_frame_within(cancelled, MEDIA_TIMEOUT)
     }
 
@@ -321,9 +323,10 @@ impl<R: AsyncRead + Unpin> MediaReader<R> {
         &mut self,
         cancelled: &AtomicBool,
         limit: Duration,
-    ) -> Result<Option<[u8; MEDIA_FRAME_LEN]>, TorError> {
+    ) -> Result<Option<Vec<u8>>, TorError> {
         let deadline = Instant::now() + limit;
-        while self.filled < MEDIA_FRAME_LEN {
+        let frame_len = self.buf.len();
+        while self.filled < frame_len {
             if cancelled.load(Ordering::SeqCst) {
                 return Err(TorError::Connect(String::from("the call was closed")));
             }
@@ -350,7 +353,7 @@ impl<R: AsyncRead + Unpin> MediaReader<R> {
             }
         }
         self.filled = 0;
-        Ok(Some(self.buf))
+        Ok(Some(self.buf.clone()))
     }
 }
 
@@ -362,10 +365,12 @@ pub struct MediaWriter<W = arti_client::DataWriter> {
     /// Bytes of an accepted frame that Tor has not yet taken. Always finished
     /// before another frame starts, so frames only ever go out whole.
     pending: Vec<u8>,
+    /// Bytes of every frame this call sends.
+    frame_len: usize,
 }
 
 impl<W: AsyncWrite + Unpin> MediaWriter<W> {
-    /// Send one frame of exactly [`MEDIA_FRAME_LEN`] bytes.
+    /// Send one frame of exactly this call's frame length.
     ///
     /// `Ok(true)` means the frame is on its way — possibly with its tail still
     /// waiting, which the next call finishes first. `Ok(false)` means it was
@@ -378,7 +383,7 @@ impl<W: AsyncWrite + Unpin> MediaWriter<W> {
     }
 
     fn send_frame_within(&mut self, frame: &[u8], limit: Duration) -> Result<bool, TorError> {
-        if frame.len() != MEDIA_FRAME_LEN {
+        if frame.len() != self.frame_len {
             return Err(TorError::Connect(String::from("wrong media frame size")));
         }
         if !self.pending.is_empty() {
@@ -490,7 +495,7 @@ mod tests {
         let mut reader = MediaReader {
             handle: rt.handle().clone(),
             inner: near,
-            buf: [0u8; MEDIA_FRAME_LEN],
+            buf: vec![0u8; MEDIA_FRAME_LEN],
             filled: 0,
         };
         let never = AtomicBool::new(false);
@@ -506,12 +511,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             reader.recv_frame_within(&never, patience).unwrap(),
-            Some(frame(1)),
+            Some(frame(1).to_vec()),
             "the half that arrived before the stall is completed, not dropped"
         );
         assert_eq!(
             reader.recv_frame_within(&never, patience).unwrap(),
-            Some(frame(2)),
+            Some(frame(2).to_vec()),
             "and every frame after it is still aligned"
         );
 
@@ -529,7 +534,7 @@ mod tests {
         let mut reader = MediaReader {
             handle: rt.handle().clone(),
             inner: near,
-            buf: [0u8; MEDIA_FRAME_LEN],
+            buf: vec![0u8; MEDIA_FRAME_LEN],
             filled: 0,
         };
         let cancelled = AtomicBool::new(true);
@@ -549,6 +554,7 @@ mod tests {
             handle: rt.handle().clone(),
             inner: near,
             pending: Vec::new(),
+            frame_len: MEDIA_FRAME_LEN,
         };
         let patience = Duration::from_millis(100);
 
@@ -578,6 +584,42 @@ mod tests {
         let got = rt.block_on(reader).unwrap().unwrap();
         assert_eq!(&got[..MEDIA_FRAME_LEN], &frame(1)[..]);
         assert_eq!(&got[MEDIA_FRAME_LEN..], &frame(3)[..]);
+    }
+
+    #[test]
+    fn a_video_call_moves_its_larger_frames_whole() {
+        use void_proto::call::VIDEO_FRAME_LEN;
+        let rt = runtime();
+        let (mut far, near) = tokio::io::duplex(3 * VIDEO_FRAME_LEN);
+        let mut reader = MediaReader {
+            handle: rt.handle().clone(),
+            inner: near,
+            buf: vec![0u8; MediaMode::Video.frame_len()],
+            filled: 0,
+        };
+        let never = AtomicBool::new(false);
+        let big = vec![7u8; VIDEO_FRAME_LEN];
+        rt.block_on(far.write_all(&big)).unwrap();
+        assert_eq!(
+            reader
+                .recv_frame_within(&never, Duration::from_millis(300))
+                .unwrap(),
+            Some(big)
+        );
+
+        let (_far2, near2) = tokio::io::duplex(4 * VIDEO_FRAME_LEN);
+        let mut writer = MediaWriter {
+            handle: rt.handle().clone(),
+            inner: near2,
+            pending: Vec::new(),
+            frame_len: VIDEO_FRAME_LEN,
+        };
+        assert!(
+            writer
+                .send_frame_within(&[0u8; MEDIA_FRAME_LEN], Duration::from_millis(50))
+                .is_err(),
+            "a voice-sized frame on a video call is refused"
+        );
     }
 
     #[test]

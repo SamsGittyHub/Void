@@ -66,7 +66,12 @@ use crate::{ProtoError, Result};
 /// Bumped to `v3` when call offers gained the time they were sent and calls
 /// gained a busy signal (`crate::call`). A v2 client would fail to decode a v3
 /// offer and silently never ring — the same reasoning again.
-pub const PROTOCOL_ID: &[u8] = b"void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
+///
+/// Bumped to `v4` when attachments became a content kind and call offers
+/// gained the video flag (`crate::attachment`, `crate::video`). A v3 client
+/// would refuse every attachment as malformed and misread every offer, so the
+/// two must fail to handshake rather than appear to talk.
+pub const PROTOCOL_ID: &[u8] = b"void/v4/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
 
 /// Domain separator for the prekey signature.
 const PREKEY_SIG_CONTEXT: &[u8] = b"void/v1/prekey-bundle";

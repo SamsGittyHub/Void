@@ -23,12 +23,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::attachment::Attachment;
 use crate::call::CallSignal;
 use crate::{ProtoError, Result};
 
 /// The kind byte prefixed to every ratchet plaintext.
 const KIND_TEXT: u8 = 1;
 const KIND_CALL: u8 = 2;
+const KIND_ATTACHMENT: u8 = 3;
 
 /// A decrypted message's contents.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -37,6 +39,9 @@ pub enum Content {
     Text(String),
     /// Call setup or teardown. Never shown to the user as a message.
     Call(CallSignal),
+    /// A file, by reference: where its sealed blob is parked on the relay and
+    /// the key that opens it (`crate::attachment`, D-032).
+    Attachment(Attachment),
 }
 
 impl Content {
@@ -52,6 +57,10 @@ impl Content {
             Content::Call(signal) => {
                 out.push(KIND_CALL);
                 out.extend_from_slice(&signal.encode());
+            }
+            Content::Attachment(attachment) => {
+                out.push(KIND_ATTACHMENT);
+                out.extend_from_slice(&attachment.encode());
             }
         }
         out
@@ -71,6 +80,7 @@ impl Content {
                 Ok(Content::Text(String::from(text)))
             }
             KIND_CALL => Ok(Content::Call(CallSignal::decode(body)?)),
+            KIND_ATTACHMENT => Ok(Content::Attachment(Attachment::decode(body)?)),
             _ => Err(ProtoError::Malformed),
         }
     }
@@ -101,7 +111,7 @@ mod tests {
 
     #[test]
     fn call_signals_roundtrip() {
-        let offer = CallOffer::new("abc.onion", 9999, 1_700_000_000).unwrap();
+        let offer = CallOffer::new("abc.onion", 9999, 1_700_000_000, false).unwrap();
         let c = Content::Call(CallSignal::Offer(offer));
         assert_eq!(Content::decode(&c.encode()).unwrap(), c);
 
@@ -116,12 +126,23 @@ mod tests {
     fn a_call_signal_is_never_mistaken_for_text() {
         // The failure this framing exists to prevent: signalling bytes shown
         // to a user as a message from their contact.
-        let offer = CallOffer::new("abc.onion", 1, 1_700_000_000).unwrap();
+        let offer = CallOffer::new("abc.onion", 1, 1_700_000_000, true).unwrap();
         let encoded = Content::Call(CallSignal::Offer(offer)).encode();
         match Content::decode(&encoded).unwrap() {
             Content::Call(_) => {}
-            Content::Text(t) => panic!("signalling decoded as text: {t:?}"),
+            other => panic!("signalling decoded as something else: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_attachment_roundtrips_and_is_never_mistaken_for_text() {
+        use crate::attachment::{Attachment, AttachmentSecrets};
+        let secrets = AttachmentSecrets::generate().unwrap();
+        let a = Attachment::new(&secrets, 42, "notes.txt", "text/plain", 0, 0, "see this").unwrap();
+        let c = Content::Attachment(a);
+        let decoded = Content::decode(&c.encode()).unwrap();
+        assert_eq!(decoded, c);
+        assert!(matches!(decoded, Content::Attachment(_)));
     }
 
     #[test]

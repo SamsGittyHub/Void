@@ -53,15 +53,17 @@ import androidx.compose.ui.unit.dp
 data class PendingCall(
     val fingerprint: ByteArray,
     val isAnswering: Boolean,
+    val video: Boolean = false,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is PendingCall) return false
-        return fingerprint.contentEquals(other.fingerprint) && isAnswering == other.isAnswering
+        return fingerprint.contentEquals(other.fingerprint) && isAnswering == other.isAnswering &&
+            video == other.video
     }
 
     override fun hashCode(): Int =
-        fingerprint.contentHashCode() * 31 + isAnswering.hashCode()
+        (fingerprint.contentHashCode() * 31 + isAnswering.hashCode()) * 31 + video.hashCode()
 }
 
 /** Where a call is in its life. */
@@ -95,12 +97,17 @@ data class CallSession(
     val callId: ByteArray,
     val role: CallRole,
     val phase: CallPhase,
+    /** A video call: fixed by the offer, at both ends. */
+    val video: Boolean = false,
+    /** When the call connected, in milliseconds, for the timer on the call screen. */
+    val connectedAtMs: Long? = null,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is CallSession) return false
         return fingerprint.contentEquals(other.fingerprint) && callId.contentEquals(other.callId) &&
-            role == other.role && phase == other.phase
+            role == other.role && phase == other.phase && video == other.video &&
+            connectedAtMs == other.connectedAtMs
     }
 
     override fun hashCode(): Int = (fingerprint.contentHashCode() * 31 + callId.contentHashCode()) * 31 + phase.ordinal

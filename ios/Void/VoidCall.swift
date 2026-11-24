@@ -55,7 +55,7 @@ enum CallEndReason: UInt32 {
 
 /// What the engine reported about a call.
 enum CallEvent: Equatable {
-    case incoming(fingerprint: Data, callId: Data, address: String, port: UInt16)
+    case incoming(fingerprint: Data, callId: Data, address: String, port: UInt16, video: Bool)
     case answered(fingerprint: Data, callId: Data)
     case ended(fingerprint: Data, callId: Data, reason: CallEndReason)
     /// A call that never rang here: it arrived too late to be live, or this
@@ -78,17 +78,30 @@ enum MediaReceive: Equatable {
 
 private let statusOk = VoidStatus(rawValue: 0)
 
+/// One encoded video frame, as it crosses the core. Opaque there; H.264 Annex
+/// B by agreement between the apps.
+struct VideoUnit {
+    let data: Data
+    let keyframe: Bool
+    /// Quarter turns clockwise to display it upright.
+    let rotation: Int
+    let timestampMs: UInt32
+}
+
 /// A live media connection.
 final class CallMedia: @unchecked Sendable {
     private let handle: OpaquePointer
+    /// Whether this call carries video. Fixed by the offer.
+    let isVideo: Bool
 
-    fileprivate init(_ handle: OpaquePointer) {
+    fileprivate init(_ handle: OpaquePointer, video: Bool) {
         self.handle = handle
+        self.isVideo = video
     }
 
     /// Dial the caller's service (the callee side). Blocks on the network.
     static func connect(
-        tor: TorClient, address: String, port: UInt16, mediaSecret: Data, callId: Data
+        tor: TorClient, address: String, port: UInt16, mediaSecret: Data, callId: Data, video: Bool
     ) -> CallMedia? {
         var out: OpaquePointer?
         let status = address.withCString { addr in
@@ -100,14 +113,56 @@ final class CallMedia: @unchecked Sendable {
                         port,
                         secret.bindMemory(to: UInt8.self).baseAddress,
                         id.bindMemory(to: UInt8.self).baseAddress,
+                        video,
                         &out
                     )
                 }
             }
         }
         guard status == statusOk, let out else { return nil }
-        return CallMedia(out)
+        return CallMedia(out, video: video)
     }
+
+    // MARK: Video (D-033)
+
+    /// Hand one encoded frame to the outgoing lane. False if it was dropped —
+    /// the lane is a second behind — and the next frame must be a keyframe.
+    /// Never waits on the network.
+    @discardableResult
+    func pushVideo(_ unit: VideoUnit) -> Bool {
+        unit.data.withUnsafeBytes { buf in
+            void_call_video_push(
+                handle, buf.bindMemory(to: UInt8.self).baseAddress, UInt(unit.data.count),
+                unit.keyframe, UInt8(clamping: unit.rotation), unit.timestampMs
+            ) == statusOk
+        }
+    }
+
+    /// The next whole frame the other end sent, if one is waiting.
+    func takeVideo() -> VideoUnit? {
+        var bytes = VoidBytes()
+        var keyframe = false
+        var rotation: UInt8 = 0
+        var timestamp: UInt32 = 0
+        let got = void_call_video_take(handle, &bytes, &keyframe, &rotation, &timestamp)
+        let buffer = CoreBuffer(bytes)
+        guard got else { return nil }
+        return VideoUnit(
+            data: Data(buffer.array), keyframe: keyframe, rotation: Int(rotation),
+            timestampMs: timestamp)
+    }
+
+    /// Whether the next frame encoded should be a keyframe.
+    var videoNeedsKeyframe: Bool { void_call_video_needs_keyframe(handle) }
+
+    /// Tell the other end the camera is on or off. The frames on the wire are
+    /// the same size either way.
+    func setCamera(on: Bool) {
+        void_call_video_set_camera(handle, on)
+    }
+
+    /// Whether the other end says its camera is off.
+    var peerCameraOff: Bool { void_call_video_peer_camera_off(handle) }
 
     /// Encrypt and send one encoded audio frame; an empty one is silence, which
     /// keeps the cadence constant while nobody talks. Returns false once the
@@ -180,7 +235,7 @@ final class CallHost: @unchecked Sendable {
     /// Call it off the main thread straight after placing the call — not once
     /// the relayed answer arrives: the callee dials the moment they answer, and
     /// their first authenticated frame is the answer (D-028).
-    func accept(mediaSecret: Data, callId: Data) -> CallMedia? {
+    func accept(mediaSecret: Data, callId: Data, video: Bool) -> CallMedia? {
         var out: OpaquePointer?
         let status = mediaSecret.withUnsafeBytes { secret in
             callId.withUnsafeBytes { id in
@@ -188,12 +243,13 @@ final class CallHost: @unchecked Sendable {
                     handle,
                     secret.bindMemory(to: UInt8.self).baseAddress,
                     id.bindMemory(to: UInt8.self).baseAddress,
+                    video,
                     &out
                 )
             }
         }
         guard status == statusOk, let out else { return nil }
-        return CallMedia(out)
+        return CallMedia(out, video: video)
     }
 
     /// Stop waiting: a blocked `accept` returns nil within about a tenth of a
@@ -228,13 +284,20 @@ extension VoidCore {
         CoreBuffer(void_call_disclosure()).string
     }
 
+    /// What the user must also be told before a video call: what the other
+    /// person sees, and that a video call is a bigger stream on the wire. See
+    /// `void_proto::call::VIDEO_CALL_DISCLOSURE`.
+    static var videoCallDisclosure: String {
+        CoreBuffer(void_call_video_disclosure()).string
+    }
+
     /// Place a call to a contact whose onion service is already publishing.
     /// Returns the call id and the media secret to key it with. `now` is in
     /// seconds: the offer carries it, so one that reaches the callee too late
     /// to be live shows as missed instead of ringing.
-    func placeCall(to fingerprint: Data, address: String, port: UInt16, now: UInt64) throws -> (
-        callId: Data, mediaSecret: Data
-    ) {
+    func placeCall(to fingerprint: Data, address: String, port: UInt16, video: Bool, now: UInt64)
+        throws -> (callId: Data, mediaSecret: Data)
+    {
         var callId = [UInt8](repeating: 0, count: 16)
         var secret = [UInt8](repeating: 0, count: 32)
         defer {
@@ -247,6 +310,7 @@ extension VoidCore {
                     fp.bindMemory(to: UInt8.self).baseAddress,
                     addr,
                     port,
+                    video,
                     now,
                     &callId,
                     &secret
@@ -259,7 +323,7 @@ extension VoidCore {
 
     /// Answer an incoming call, returning what the media connection needs.
     func answerCall(from fingerprint: Data) throws -> (
-        callId: Data, mediaSecret: Data, address: String, port: UInt16
+        callId: Data, mediaSecret: Data, address: String, port: UInt16, video: Bool
     ) {
         var callId = [UInt8](repeating: 0, count: 16)
         var secret = [UInt8](repeating: 0, count: 32)
@@ -268,6 +332,7 @@ extension VoidCore {
         }
         var addressBytes = VoidBytes()
         var port: UInt16 = 0
+        var video = false
         let status = fingerprint.withUnsafeBytes { fp in
             void_engine_answer_call(
                 handle,
@@ -275,12 +340,13 @@ extension VoidCore {
                 &callId,
                 &secret,
                 &addressBytes,
-                &port
+                &port,
+                &video
             )
         }
         let address = CoreBuffer(addressBytes).string
         guard status == statusOk else { throw VoidError(status) }
-        return (Data(callId), Data(secret), address, port)
+        return (Data(callId), Data(secret), address, port, video)
     }
 
     /// The caller has seen the callee's first authenticated media frame: the
@@ -317,12 +383,15 @@ extension VoidCore {
                 let reason = reader.u8(),
                 let addressLength = reader.u32(),
                 let address = reader.string(Int(addressLength)),
-                let port = reader.u16()
+                let port = reader.u16(),
+                let flags = reader.u8()
             else { break }
             switch kind {
             case 1:
                 events.append(
-                    .incoming(fingerprint: fingerprint, callId: callId, address: address, port: port))
+                    .incoming(
+                        fingerprint: fingerprint, callId: callId, address: address, port: port,
+                        video: flags & 1 != 0))
             case 2:
                 events.append(.answered(fingerprint: fingerprint, callId: callId))
             case 3:

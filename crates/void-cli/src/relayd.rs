@@ -74,16 +74,23 @@ void-relayd — Void mailbox relay
 
 Usage:
   void-relayd [--listen ADDR] [--ttl-days N] [--rate N]
+              [--blob-ttl-days N] [--blob-capacity-mb N]
 
 Options:
-  --listen ADDR   Loopback address to bind (default 127.0.0.1:9443).
-                  Point a Tor onion service at this; never expose it directly.
-  --ttl-days N    How long an undelivered record is held (default 14).
-  --rate N        Deposits allowed per queue per hour (default 600).
+  --listen ADDR         Loopback address to bind (default 127.0.0.1:9443).
+                        Point a Tor onion service at this; never expose it.
+  --ttl-days N          How long an undelivered record is held (default 14).
+  --rate N              Deposits allowed per queue per hour (default 600).
+  --blob-ttl-days N     How long an attachment's sealed blob is held
+                        (default 7).
+  --blob-capacity-mb N  The most attachment data held at once, in MiB
+                        (default 1024). Held in memory.
 
-The relay stores sealed blobs against opaque queue ids. It cannot read them,
-cannot tell who deposited them, and keeps no record linking one client's
-queues (docs/DECISIONS.md, \"Retrieval shape\", says what a modified relay could).
+The relay stores sealed records against opaque queue ids, and attachments'
+sealed blobs against hashes of tokens it never keeps. It cannot read either,
+cannot tell who deposited or uploaded them, and keeps no record linking one
+client's queues or a blob to a queue (docs/DECISIONS.md, \"Retrieval shape\"
+and D-032, say what a modified relay could).
 "
     );
     std::process::exit(2);
@@ -94,6 +101,8 @@ fn main() {
     let mut listen = "127.0.0.1:9443".to_string();
     let mut ttl_days = 14u64;
     let mut rate = 600u32;
+    let mut blob_ttl_days = 7u64;
+    let mut blob_capacity_mb = 1024usize;
 
     let mut i = 0;
     while i < args.len() {
@@ -108,6 +117,14 @@ fn main() {
             }
             "--rate" if i + 1 < args.len() => {
                 rate = args[i + 1].parse().unwrap_or_else(|_| usage());
+                i += 2;
+            }
+            "--blob-ttl-days" if i + 1 < args.len() => {
+                blob_ttl_days = args[i + 1].parse().unwrap_or_else(|_| usage());
+                i += 2;
+            }
+            "--blob-capacity-mb" if i + 1 < args.len() => {
+                blob_capacity_mb = args[i + 1].parse().unwrap_or_else(|_| usage());
                 i += 2;
             }
             _ => usage(),
@@ -126,6 +143,11 @@ fn main() {
     let config = Config {
         ttl_seconds: ttl_days * 24 * 60 * 60,
         deposit_rate_per_hour: rate,
+        blobs: void_relay::blobs::BlobConfig {
+            ttl_seconds: blob_ttl_days * 24 * 60 * 60,
+            capacity_bytes: blob_capacity_mb.saturating_mul(1024 * 1024),
+            ..void_relay::blobs::BlobConfig::default()
+        },
         ..Config::default()
     };
 
@@ -146,7 +168,7 @@ fn main() {
         let now = server::now();
         let epoch = WakeSecret::epoch(now);
         match sweeper.sweep(now, epoch) {
-            Ok(n) if n > 0 => eprintln!("swept {n} expired records"),
+            Ok(n) if n > 0 => eprintln!("swept {n} expired records and blobs"),
             Ok(_) => {}
             Err(e) => eprintln!("sweep failed: {e}"),
         }
@@ -154,6 +176,7 @@ fn main() {
 
     eprintln!("void-relayd listening on {listen}");
     eprintln!("ttl: {ttl_days}d, rate limit: {rate}/queue/hour");
+    eprintln!("attachments: held {blob_ttl_days}d, at most {blob_capacity_mb} MiB in memory");
     eprintln!("Point a Tor onion service at this address.");
 
     if let Err(e) = server::listen(relay, &listen) {

@@ -15,7 +15,20 @@ enum AppDirectories {
     static func support() throws -> URL {
         let base = try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        return try excludedFromBackup(base.appendingPathComponent("Void", isDirectory: true))
+        return try excludedFromBackup(base.appendingPathComponent(folderName, isDirectory: true))
+    }
+
+    /// The folder everything lives in. In a debug build an end-to-end test can
+    /// name another — `-uiTestsDataSuffix <name>` — to start from a new identity
+    /// while leaving the one already there untouched.
+    static var folderName: String {
+        #if DEBUG
+            let arguments = ProcessInfo.processInfo.arguments
+            if let index = arguments.firstIndex(of: "-uiTestsDataSuffix"), index + 1 < arguments.count {
+                return "Void-" + arguments[index + 1].filter { $0.isLetter || $0.isNumber }
+            }
+        #endif
+        return "Void"
     }
 
     /// Where the engine keeps its database.

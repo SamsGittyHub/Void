@@ -61,6 +61,19 @@
 //! speech — which leaks phonetics to anyone counting bytes, and is a published
 //! attack, not a theoretical one. Frames are emitted on a fixed cadence
 //! whether or not anyone is talking.
+//!
+//! ## Video calls
+//!
+//! A video call is the same call with a bigger frame ([`MediaMode::Video`]):
+//! every frame carries its audio and a fixed-capacity video slice
+//! ([`VIDEO_SLICE_LEN`]), sealed together, on the same cadence. Video does not
+//! get packets of its own, because a video encoder's output tracks motion the
+//! way a variable-bitrate voice codec tracks speech; [`crate::video`] cuts the
+//! encoded stream into slices and pads the rest. The offer says which mode the
+//! call is, inside the ciphertext, and both ends then use that frame size for
+//! the whole call — so a video call is distinguishable from a voice call by its
+//! rate, which [`VIDEO_CALL_DISCLOSURE`] says, and turning the camera off is
+//! not distinguishable from leaving it on, which it also says.
 
 use alloc::string::String;
 use alloc::vec;
@@ -106,6 +119,19 @@ whether or not you are sending anything. Someone watching your internet connecti
 you are on a call, and someone watching both ends at once has a far easier time matching \
 them up than they do with messages.";
 
+/// Added to [`CALL_DISCLOSURE`] before a video call, in either direction.
+///
+/// The two things that are true of video and not of voice: what the other
+/// person can see, which is the user's to manage, and that a video call is a
+/// bigger stream than a voice call — to someone watching the connection, a
+/// different shape, which is not. And one reassurance that is true because
+/// the lane is constant-bitrate: switching the camera off changes nothing on
+/// the wire.
+pub const VIDEO_CALL_DISCLOSURE: &str = "On a video call they see what your camera sees until you \
+turn it off. A video call is a bigger stream than a voice call, and someone watching your \
+connection can tell the two apart. Turning your camera off does not change what they see: the \
+stream stays the same size either way.";
+
 /// Fixed plaintext size of one media frame's payload.
 ///
 /// 120 bytes at one frame per 20 ms is 48 kbit/s of headroom, which covers
@@ -119,6 +145,65 @@ pub const MEDIA_FRAME_MS: u64 = 20;
 
 /// On-wire size of one media frame: sequence, then the sealed payload.
 pub const MEDIA_FRAME_LEN: usize = 4 + MEDIA_PAYLOAD_LEN + 2 + aead::TAG_LEN;
+
+/// Fixed capacity of one video call frame's video slice.
+///
+/// 560 bytes at one frame per 20 ms is a 224 kbit/s lane, of which the
+/// platforms' encoders are asked to fill about two thirds on average, so a
+/// keyframe drains in well under a second. With the audio, a video call is
+/// about 280 kbit/s each way on the wire — sustained comfortably by an onion
+/// circuit, where several times that is not.
+pub const VIDEO_SLICE_LEN: usize = 560;
+
+/// On-wire size of one video call media frame: sequence, then the sealed
+/// audio and video slice.
+pub const VIDEO_FRAME_LEN: usize = 4 + 2 + MEDIA_PAYLOAD_LEN + 2 + VIDEO_SLICE_LEN + aead::TAG_LEN;
+
+/// Which frame a call uses, fixed for the call by its offer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaMode {
+    /// Audio only: [`MEDIA_FRAME_LEN`]-byte frames.
+    Audio,
+    /// Audio and video: [`VIDEO_FRAME_LEN`]-byte frames.
+    Video,
+}
+
+impl MediaMode {
+    /// The mode an offer's video flag names.
+    #[must_use]
+    pub const fn for_call(video: bool) -> MediaMode {
+        if video {
+            MediaMode::Video
+        } else {
+            MediaMode::Audio
+        }
+    }
+
+    /// Bytes of one frame on the wire.
+    #[must_use]
+    pub const fn frame_len(self) -> usize {
+        match self {
+            MediaMode::Audio => MEDIA_FRAME_LEN,
+            MediaMode::Video => VIDEO_FRAME_LEN,
+        }
+    }
+
+    /// Video bytes one frame can carry.
+    #[must_use]
+    pub const fn video_capacity(self) -> usize {
+        match self {
+            MediaMode::Audio => 0,
+            MediaMode::Video => VIDEO_SLICE_LEN,
+        }
+    }
+
+    const fn plaintext_len(self) -> usize {
+        match self {
+            MediaMode::Audio => 2 + MEDIA_PAYLOAD_LEN,
+            MediaMode::Video => 2 + MEDIA_PAYLOAD_LEN + 2 + VIDEO_SLICE_LEN,
+        }
+    }
+}
 
 /// Largest onion address we will parse. A v3 address is 56 characters plus
 /// `.onion`; the bound exists so a malformed offer cannot allocate freely.
@@ -189,6 +274,8 @@ pub struct CallOffer {
     /// tell a live call from one that waited in the mailbox until its caller
     /// had long since given up.
     pub sent_at: u64,
+    /// Whether this is a video call, and so which [`MediaMode`] both ends use.
+    pub video: bool,
 }
 
 impl Drop for CallOffer {
@@ -204,6 +291,7 @@ impl core::fmt::Debug for CallOffer {
             .field("onion_address", &self.onion_address)
             .field("port", &self.port)
             .field("sent_at", &self.sent_at)
+            .field("video", &self.video)
             .field("media_secret", &"<redacted>")
             .finish()
     }
@@ -211,8 +299,8 @@ impl core::fmt::Debug for CallOffer {
 
 impl CallOffer {
     /// Build an offer for a service already publishing at `onion_address`,
-    /// sent at `now` (Unix seconds).
-    pub fn new(onion_address: &str, port: u16, now: u64) -> Result<CallOffer> {
+    /// sent at `now` (Unix seconds); a video call if `video`.
+    pub fn new(onion_address: &str, port: u16, now: u64, video: bool) -> Result<CallOffer> {
         if onion_address.is_empty() || onion_address.len() > MAX_ONION_LEN {
             return Err(ProtoError::Malformed);
         }
@@ -222,9 +310,19 @@ impl CallOffer {
             port,
             media_secret: rand::bytes32().map_err(|_| ProtoError::Crypto)?,
             sent_at: now,
+            video,
         })
     }
+
+    /// The frame this call uses.
+    #[must_use]
+    pub fn mode(&self) -> MediaMode {
+        MediaMode::for_call(self.video)
+    }
 }
+
+/// Bit 0 of an offer's flags byte: a video call.
+const OFFER_VIDEO: u8 = 0x01;
 
 /// The answer to an offer.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -279,7 +377,8 @@ impl CallSignal {
                     .bytes16(o.onion_address.as_bytes())
                     .u16(o.port)
                     .raw(&o.media_secret)
-                    .u64(o.sent_at);
+                    .u64(o.sent_at)
+                    .u8(if o.video { OFFER_VIDEO } else { 0 });
             }
             CallSignal::Answer(a) => {
                 w.u8(2).raw(&a.call_id).u8(a.accepted as u8);
@@ -307,12 +406,17 @@ impl CallSignal {
                 let port = r.u16()?;
                 let media_secret = r.array::<32>()?;
                 let sent_at = r.u64()?;
+                let flags = r.u8()?;
+                if flags & !OFFER_VIDEO != 0 {
+                    return Err(ProtoError::Malformed);
+                }
                 CallSignal::Offer(CallOffer {
                     call_id,
                     onion_address: String::from(onion_address),
                     port,
                     media_secret,
                     sent_at,
+                    video: flags & OFFER_VIDEO != 0,
                 })
             }
             2 => CallSignal::Answer(CallAnswer {
@@ -391,6 +495,7 @@ pub struct MediaSealer {
     key: [u8; 32],
     call_id: CallId,
     next_send: u32,
+    mode: MediaMode,
 }
 
 /// The receiving half of one call's media: opens the other end's frames.
@@ -399,6 +504,19 @@ pub struct MediaOpener {
     call_id: CallId,
     highest_recv: u32,
     started: bool,
+    mode: MediaMode,
+}
+
+/// One opened media frame.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MediaFrame {
+    /// Its sequence number, so a gap — frames the other end dropped — can be
+    /// noticed (`crate::video::Depacketizer`).
+    pub seq: u32,
+    /// The encoded audio, empty for silence.
+    pub audio: Vec<u8>,
+    /// The video slice, empty in an audio call.
+    pub video: Vec<u8>,
 }
 
 impl Drop for MediaSealer {
@@ -414,21 +532,35 @@ impl Drop for MediaOpener {
 }
 
 impl MediaStream {
-    /// Begin a media stream for `call_id`.
+    /// Begin an audio-only media stream for `call_id`.
     #[must_use]
     pub fn new(media_secret: &[u8; 32], role: Role, call_id: CallId) -> MediaStream {
+        MediaStream::with_mode(media_secret, role, call_id, MediaMode::Audio)
+    }
+
+    /// Begin a media stream for `call_id` in the given mode — which must be the
+    /// one the offer named, at both ends, or no frame will open.
+    #[must_use]
+    pub fn with_mode(
+        media_secret: &[u8; 32],
+        role: Role,
+        call_id: CallId,
+        mode: MediaMode,
+    ) -> MediaStream {
         let keys = MediaKeys::derive(media_secret, role);
         MediaStream {
             sealer: MediaSealer {
                 key: keys.send,
                 call_id,
                 next_send: 0,
+                mode,
             },
             opener: MediaOpener {
                 key: keys.recv,
                 call_id,
                 highest_recv: 0,
                 started: false,
+                mode,
             },
         }
     }
@@ -459,36 +591,64 @@ impl MediaStream {
     pub fn seal_silence(&mut self) -> Result<Vec<u8>> {
         self.sealer.seal_silence()
     }
+
+    /// See [`MediaSealer::seal_av`].
+    pub fn seal_av(&mut self, audio: &[u8], video: &[u8]) -> Result<Vec<u8>> {
+        self.sealer.seal_av(audio, video)
+    }
+
+    /// See [`MediaOpener::open_av`].
+    pub fn open_av(&mut self, frame: &[u8]) -> Result<MediaFrame> {
+        self.opener.open_av(frame)
+    }
 }
 
 impl MediaSealer {
-    /// Seal one audio frame into a wire frame of exactly [`MEDIA_FRAME_LEN`].
+    /// Seal one audio frame into a wire frame of exactly this call's
+    /// [`MediaMode::frame_len`] — in a video call, with an empty video slice.
     ///
     /// `audio` is whatever the platform's encoder produced; this layer does
     /// not know or care what codec that was.
     pub fn seal(&mut self, audio: &[u8]) -> Result<Vec<u8>> {
-        if audio.len() > MEDIA_PAYLOAD_LEN {
+        self.seal_av(audio, &[])
+    }
+
+    /// Seal one frame of audio and, in a video call, one video slice.
+    ///
+    /// Both are length-prefixed inside the encryption and padded outside
+    /// their lengths, so the wire frame is one size whatever either carries.
+    pub fn seal_av(&mut self, audio: &[u8], video: &[u8]) -> Result<Vec<u8>> {
+        if audio.len() > MEDIA_PAYLOAD_LEN || video.len() > self.mode.video_capacity() {
             return Err(ProtoError::Malformed);
         }
         let seq = self.next_send;
         self.next_send = seq.checked_add(1).ok_or(ProtoError::NotReady)?;
 
-        // Length inside the encryption, payload padded outside it: the wire
-        // frame is one size regardless of how much audio it carries.
-        let mut plaintext = Vec::with_capacity(2 + MEDIA_PAYLOAD_LEN);
+        let mut plaintext = Vec::with_capacity(self.mode.plaintext_len() + aead::TAG_LEN);
         plaintext.extend_from_slice(&(audio.len() as u16).to_be_bytes());
         plaintext.extend_from_slice(audio);
         plaintext.resize(2 + MEDIA_PAYLOAD_LEN, 0);
+        if self.mode == MediaMode::Video {
+            plaintext.extend_from_slice(&(video.len() as u16).to_be_bytes());
+            plaintext.extend_from_slice(video);
+            plaintext.resize(self.mode.plaintext_len(), 0);
+        }
 
         let nonce = aead::nonce_from_counter(seq as u64);
         let sealed = aead::seal(&self.key, &nonce, &self.call_id, &plaintext);
         plaintext.zeroize();
 
-        let mut out = Vec::with_capacity(MEDIA_FRAME_LEN);
+        let mut out = Vec::with_capacity(self.mode.frame_len());
         out.extend_from_slice(&seq.to_be_bytes());
         out.extend_from_slice(&sealed);
-        debug_assert_eq!(out.len(), MEDIA_FRAME_LEN);
+        debug_assert_eq!(out.len(), self.mode.frame_len());
         Ok(out)
+    }
+
+    /// This call's mode.
+    #[must_use]
+    pub fn mode(&self) -> MediaMode {
+        self.mode
     }
 
     /// A frame of silence, for the cadence to keep running while nobody is
@@ -514,7 +674,15 @@ impl MediaOpener {
     /// repeated syllable, which is both audible and a way to feed the same
     /// audio twice.
     pub fn open(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
-        if frame.len() != MEDIA_FRAME_LEN {
+        Ok(self.open_av(frame)?.audio)
+    }
+
+    /// Open one wire frame of this call's mode, returning its sequence number,
+    /// its audio, and its video slice. The same rules as [`MediaOpener::open`]:
+    /// a frame that does not authenticate, or that is not newer than every
+    /// frame already opened, is refused and changes nothing.
+    pub fn open_av(&mut self, frame: &[u8]) -> Result<MediaFrame> {
+        if frame.len() != self.mode.frame_len() {
             return Err(ProtoError::Malformed);
         }
         let seq = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
@@ -525,12 +693,18 @@ impl MediaOpener {
         let nonce = aead::nonce_from_counter(seq as u64);
         let mut plaintext = aead::open(&self.key, &nonce, &self.call_id, &frame[4..])
             .map_err(|_| ProtoError::DecryptionFailed)?;
-        if plaintext.len() != 2 + MEDIA_PAYLOAD_LEN {
+        if plaintext.len() != self.mode.plaintext_len() {
             plaintext.zeroize();
             return Err(ProtoError::Malformed);
         }
-        let len = u16::from_be_bytes([plaintext[0], plaintext[1]]) as usize;
-        if len > MEDIA_PAYLOAD_LEN {
+        let audio_len = u16::from_be_bytes([plaintext[0], plaintext[1]]) as usize;
+        let video_at = 2 + MEDIA_PAYLOAD_LEN;
+        let video_len = if self.mode == MediaMode::Video {
+            u16::from_be_bytes([plaintext[video_at], plaintext[video_at + 1]]) as usize
+        } else {
+            0
+        };
+        if audio_len > MEDIA_PAYLOAD_LEN || video_len > self.mode.video_capacity() {
             plaintext.zeroize();
             return Err(ProtoError::Malformed);
         }
@@ -539,9 +713,20 @@ impl MediaOpener {
         self.highest_recv = seq;
         self.started = true;
 
-        let audio = plaintext[2..2 + len].to_vec();
+        let audio = plaintext[2..2 + audio_len].to_vec();
+        let video = if video_len > 0 {
+            plaintext[video_at + 2..video_at + 2 + video_len].to_vec()
+        } else {
+            Vec::new()
+        };
         plaintext.zeroize();
-        Ok(audio)
+        Ok(MediaFrame { seq, audio, video })
+    }
+
+    /// This call's mode.
+    #[must_use]
+    pub fn mode(&self) -> MediaMode {
+        self.mode
     }
 }
 
@@ -561,6 +746,7 @@ mod tests {
             "5rnxosw3zlrt5dppafbkw4f2kpdp7gdliaghf5uo5l2rvd24hm5pwtqd.onion",
             9999,
             1_700_000_000,
+            false,
         )
         .unwrap()
     }
@@ -577,9 +763,76 @@ mod tests {
                 assert_eq!(d.port, o.port);
                 assert_eq!(d.media_secret, o.media_secret);
                 assert_eq!(d.sent_at, 1_700_000_000);
+                assert!(!d.video);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn the_video_flag_travels_in_the_offer() {
+        let o = CallOffer::new("abc.onion", 9999, 5, true).unwrap();
+        assert_eq!(o.mode(), MediaMode::Video);
+        match CallSignal::decode(&CallSignal::Offer(o.clone()).encode()).unwrap() {
+            CallSignal::Offer(d) => assert!(d.video),
+            _ => panic!("wrong variant"),
+        }
+        // An unknown flag bit is a newer client's offer, not a guess to make.
+        let mut bytes = CallSignal::Offer(o).encode();
+        *bytes.last_mut().unwrap() = 0x80;
+        assert!(CallSignal::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_video_frame_carries_audio_and_a_slice_at_one_size() {
+        let o = CallOffer::new("abc.onion", 9999, 5, true).unwrap();
+        let (mut send, _) =
+            MediaStream::with_mode(&o.media_secret, Role::Caller, o.call_id, o.mode()).split();
+        let mut callee = MediaStream::with_mode(&o.media_secret, Role::Callee, o.call_id, o.mode());
+
+        let a = send.seal_av(b"opus", &[9u8; VIDEO_SLICE_LEN]).unwrap();
+        let b = send.seal_av(&[], &[]).unwrap();
+        let c = send.seal(b"just audio").unwrap();
+        for f in [&a, &b, &c] {
+            assert_eq!(
+                f.len(),
+                VIDEO_FRAME_LEN,
+                "camera on or off, one size on the wire"
+            );
+        }
+        let fa = callee.open_av(&a).unwrap();
+        assert_eq!(
+            (fa.seq, fa.audio.as_slice(), fa.video.len()),
+            (0, &b"opus"[..], VIDEO_SLICE_LEN)
+        );
+        let fb = callee.open_av(&b).unwrap();
+        assert!(fb.audio.is_empty() && fb.video.is_empty());
+        assert_eq!(callee.open(&c).unwrap(), b"just audio");
+    }
+
+    #[test]
+    fn the_two_modes_cannot_open_each_others_frames() {
+        let secret = [5u8; 32];
+        let id = [6u8; 16];
+        let mut video = MediaStream::with_mode(&secret, Role::Caller, id, MediaMode::Video);
+        let mut audio_callee = MediaStream::with_mode(&secret, Role::Callee, id, MediaMode::Audio);
+        assert!(audio_callee.open(&video.seal(b"x").unwrap()).is_err());
+
+        let mut audio = MediaStream::new(&secret, Role::Caller, id);
+        let mut video_callee = MediaStream::with_mode(&secret, Role::Callee, id, MediaMode::Video);
+        assert!(video_callee.open(&audio.seal(b"x").unwrap()).is_err());
+        // And an audio call cannot carry video at all.
+        assert!(audio.seal_av(b"x", b"y").is_err());
+        assert!(video.seal_av(b"x", &[0u8; VIDEO_SLICE_LEN + 1]).is_err());
+    }
+
+    #[test]
+    fn the_video_disclosure_says_what_is_true() {
+        let d = VIDEO_CALL_DISCLOSURE;
+        assert!(d.contains("bigger stream than a voice call"));
+        assert!(d.contains("tell the two apart"));
+        assert!(d.contains("does not change what they see"));
+        assert!(!d.to_lowercase().contains("location"));
     }
 
     #[test]
@@ -632,8 +885,8 @@ mod tests {
 
     #[test]
     fn an_offer_with_no_address_is_refused() {
-        assert!(CallOffer::new("", 1, 0).is_err());
-        assert!(CallOffer::new(&"a".repeat(MAX_ONION_LEN + 1), 1, 0).is_err());
+        assert!(CallOffer::new("", 1, 0, false).is_err());
+        assert!(CallOffer::new(&"a".repeat(MAX_ONION_LEN + 1), 1, 0, false).is_err());
     }
 
     #[test]

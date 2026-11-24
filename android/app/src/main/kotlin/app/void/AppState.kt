@@ -47,8 +47,50 @@ data class OpenedInvite(val fetchId: ByteArray, val stage: Stage) {
     }
 }
 
+/** A file moving to or from the relay. */
+data class TransferProgress(
+    val upload: Boolean,
+    /** From 0 to 1. Sealing the file counts as zero. */
+    val fraction: Float,
+    /** Why it stopped, in plain language, if it failed. */
+    val failure: String? = null,
+)
+
 /** One message in a conversation, as the screen renders it. */
-data class MessageItem(val text: String, val isMine: Boolean, val delivery: DeliveryState, val timestampSeconds: Long)
+data class MessageItem(
+    /** Stable for the message's life: the engine's record id, or a placeholder's for a file still uploading. */
+    val id: String,
+    val text: String,
+    val isMine: Boolean,
+    val delivery: DeliveryState,
+    val timestampSeconds: Long,
+    /** The file it carries, if any. */
+    val attachment: AttachmentInfo? = null,
+    /** A transfer in progress for that file, or one that failed. */
+    val transfer: TransferProgress? = null,
+) {
+    /** What the conversation list shows for this message. */
+    val preview: String
+        get() {
+            val file = attachment ?: return text
+            val what = when {
+                file.isImage -> "Photo"
+                file.isVideo -> "Video"
+                else -> file.name
+            }
+            return if (text.isEmpty()) what else "$what · $text"
+        }
+}
+
+/** A file the user chose to send, already copied somewhere private. */
+data class OutgoingFile(
+    val file: File,
+    val name: String,
+    val mime: String,
+    val width: Int = 0,
+    val height: Int = 0,
+    val caption: String = "",
+)
 
 /**
  * The one place [Engine] meets Compose state — the Kotlin mirror of
@@ -119,6 +161,34 @@ class AppState(
     var pendingDisclosure by mutableStateOf<PendingCall?>(null)
         private set
 
+    /** A video call's pictures, while one runs. */
+    var callVideo by mutableStateOf<CallVideo?>(null)
+        private set
+
+    /** What the other end's video is doing. */
+    var remoteVideo by mutableStateOf(RemoteVideoState())
+        private set
+
+    /** Quarter turns the other end's picture asks for. */
+    var remoteRotation by mutableStateOf(0)
+        private set
+
+    /** Whether this end's camera is on, in a video call. */
+    var isCameraOn by mutableStateOf(false)
+        private set
+
+    /** Files still being sealed or uploaded, by contact — not in the history until their pointer is sent. */
+    var pendingUploads by mutableStateOf<Map<String, List<MessageItem>>>(emptyMap())
+        private set
+
+    /** Downloads in progress or failed, by attachment id. */
+    var downloads by mutableStateOf<Map<String, TransferProgress>>(emptyMap())
+        private set
+
+    /** Bumped once a second during a call so its details re-read the counts. */
+    var statsTick by mutableStateOf(0)
+        private set
+
     private var tickJob: Job? = null
     private var tor: TorHandle? = null
     private var attaching = false
@@ -127,6 +197,19 @@ class AppState(
     private var callHost: CallHost? = null
     private var callAudio: CallAudio? = null
     private var noticeJob: Job? = null
+    private var statsJob: Job? = null
+    private var progressJob: Job? = null
+    private var cameraAllowed = false
+
+    /** Uploads in flight, by placeholder id. */
+    private val uploads = mutableMapOf<String, UploadJob>()
+
+    /** Downloads in flight, by attachment id. */
+    private val downloadHandles = mutableMapOf<String, AttachmentTransfer>()
+
+    private class UploadJob(val key: String, val placeholderId: String) {
+        var transfer: AttachmentTransfer? = null
+    }
 
     /** Invitations whose upload progress the tick reports. Touched only on the engine thread. */
     private val watchedInvites = mutableMapOf<String, ByteArray>()
@@ -207,7 +290,8 @@ class AppState(
         when (outcome) {
             is Engine.TickResult.Retrieved -> outcome.messages.forEach { (fp, _) -> changed[fp.toHex()] = fp }
             // A message may just have moved to "Sent".
-            Engine.TickResult.Deposited -> engine.contacts().forEach { changed[it.key] = it.fingerprint }
+            Engine.TickResult.Deposited, Engine.TickResult.Refused ->
+                engine.contacts().forEach { changed[it.key] = it.fingerprint }
             else -> {}
         }
         var contacts: List<Engine.ContactSummary>? = null
@@ -259,12 +343,36 @@ class AppState(
     }
 
     private fun applyHistory(key: String, history: List<StoredMessage>) {
-        messagesByFingerprint = messagesByFingerprint + (
-            key to history.map { MessageItem(it.text, it.isOutgoing, it.delivery, it.timestampSeconds) }
+        val items = history.map {
+            MessageItem(
+                id = "m${it.id}",
+                text = it.text,
+                isMine = it.isOutgoing,
+                delivery = it.delivery,
+                timestampSeconds = it.timestampSeconds,
+                attachment = it.attachment,
+                transfer = it.attachment?.let { file -> downloads[file.key] },
             )
+        }
+        messagesByFingerprint = messagesByFingerprint + (key to items)
+        // Fetch what arrived, if it is small enough to fetch unasked.
+        for (item in items) {
+            val file = item.attachment ?: continue
+            if (!item.isMine && !file.isLocal && file.size <= AUTO_DOWNLOAD_LIMIT && downloads[file.key] == null) {
+                val fingerprint = conversations.firstOrNull { it.key == key }?.fingerprint ?: continue
+                download(file, fingerprint)
+            }
+        }
     }
 
-    fun lastMessage(key: String): String = messagesByFingerprint[key]?.lastOrNull()?.text.orEmpty()
+    /** Everything a conversation shows: the history, then any file of ours still on its way. */
+    fun items(key: String): List<MessageItem> =
+        messagesByFingerprint[key].orEmpty() + pendingUploads[key].orEmpty()
+
+    fun lastMessage(key: String): String = items(key).lastOrNull()?.preview.orEmpty()
+
+    /** When the last message was sent or received, in seconds; for sorting and the row. */
+    fun lastActivity(key: String): Long? = items(key).lastOrNull()?.timestampSeconds
 
     fun openConversation(key: String) {
         visibleConversation = key
@@ -487,9 +595,10 @@ class AppState(
     fun send(fingerprint: ByteArray, text: String) {
         val key = fingerprint.toHex()
         // Shown at once as "Waiting to send", then replaced by the stored copy.
-        messagesByFingerprint = messagesByFingerprint + (
-            key to (messagesByFingerprint[key].orEmpty() + MessageItem(text, true, DeliveryState.QUEUED, System.currentTimeMillis() / 1000))
-            )
+        val pending = MessageItem(
+            "q${System.nanoTime()}", text, true, DeliveryState.QUEUED, System.currentTimeMillis() / 1000,
+        )
+        messagesByFingerprint = messagesByFingerprint + (key to (messagesByFingerprint[key].orEmpty() + pending))
         scope.launch {
             try {
                 val history = onEngine { e ->
@@ -502,6 +611,190 @@ class AppState(
                 applyHistory(key, onEngine { it.messages(fingerprint) })
             }
         }
+    }
+
+    // --- files (D-032) ---------------------------------------------------------------
+
+    /**
+     * Seal, upload, then send a file. Shows at once as a placeholder with its
+     * progress; becomes an ordinary message once its pointer is queued.
+     */
+    fun sendFile(outgoing: OutgoingFile, fingerprint: ByteArray) {
+        val key = fingerprint.toHex()
+        if (outgoing.file.length() > VoidCore.attachmentMaxBytes()) {
+            outgoing.file.delete()
+            lastError = VoidException(VoidStatus.TOO_LARGE).message
+            return
+        }
+        val placeholderId = "p${System.nanoTime()}"
+        val placeholder = MessageItem(
+            id = placeholderId,
+            text = outgoing.caption,
+            isMine = true,
+            delivery = DeliveryState.QUEUED,
+            timestampSeconds = System.currentTimeMillis() / 1000,
+            attachment = AttachmentInfo(
+                ByteArray(0), outgoing.file.length(), outgoing.width, outgoing.height, outgoing.name, outgoing.mime, false,
+            ),
+            transfer = TransferProgress(upload = true, fraction = 0f),
+        )
+        pendingUploads = pendingUploads + (key to (pendingUploads[key].orEmpty() + placeholder))
+        val job = UploadJob(key, placeholderId)
+        uploads[placeholderId] = job
+        scope.launch {
+            val sealed = withContext(Dispatchers.IO) {
+                runCatching {
+                    engine.prepareAttachment(
+                        outgoing.file, outgoing.name, outgoing.mime, outgoing.width, outgoing.height, outgoing.caption,
+                    )
+                }.also { outgoing.file.delete() }
+            }
+            sealed.onSuccess { transfer ->
+                job.transfer = transfer
+                updatePlaceholder(job) { item ->
+                    item.copy(attachment = item.attachment?.copy(id = transfer.id, isLocal = true))
+                }
+                upload(job)
+            }.onFailure { failUpload(job, it.message ?: "That file couldn't be read.") }
+        }
+    }
+
+    private fun upload(job: UploadJob) {
+        val transfer = job.transfer ?: return
+        val tor = tor ?: run {
+            failUpload(job, "Waiting for the network. Try again once Void is connected.")
+            return
+        }
+        updatePlaceholder(job) { it.copy(transfer = TransferProgress(upload = true, fraction = 0f)) }
+        watchProgress()
+        scope.launch {
+            val uploaded = withContext(Dispatchers.IO) { runCatching { transfer.upload(tor) } }
+            if (uploads[job.placeholderId] == null) return@launch
+            uploaded.onFailure {
+                failUpload(job, transferFailure(it, upload = true))
+                return@launch
+            }
+            val fingerprint = conversations.firstOrNull { it.key == job.key }?.fingerprint ?: return@launch
+            try {
+                val history = onEngine { e ->
+                    e.sendAttachment(transfer, fingerprint, System.currentTimeMillis() / 1000)
+                    e.messages(fingerprint)
+                }
+                uploads.remove(job.placeholderId)
+                transfer.free()
+                pendingUploads = pendingUploads + (job.key to pendingUploads[job.key].orEmpty().filter { it.id != job.placeholderId })
+                applyHistory(job.key, history)
+            } catch (e: VoidException) {
+                failUpload(job, e.message)
+            }
+        }
+    }
+
+    private fun failUpload(job: UploadJob, message: String) {
+        updatePlaceholder(job) { item ->
+            item.copy(transfer = TransferProgress(upload = true, fraction = item.transfer?.fraction ?: 0f, failure = message))
+        }
+    }
+
+    private fun updatePlaceholder(job: UploadJob, change: (MessageItem) -> MessageItem) {
+        val items = pendingUploads[job.key] ?: return
+        pendingUploads = pendingUploads + (job.key to items.map { if (it.id == job.placeholderId) change(it) else it })
+    }
+
+    /** Try a failed upload again. */
+    fun retryUpload(placeholderId: String) {
+        val job = uploads[placeholderId] ?: return
+        if (job.transfer == null) discardUpload(placeholderId) else upload(job)
+    }
+
+    /** Give up on an upload. Nothing was sent. */
+    fun discardUpload(placeholderId: String) {
+        val job = uploads.remove(placeholderId) ?: return
+        job.transfer?.cancel()
+        job.transfer?.free()
+        pendingUploads = pendingUploads + (job.key to pendingUploads[job.key].orEmpty().filter { it.id != placeholderId })
+    }
+
+    /** Fetch a received file over a circuit of its own. */
+    fun download(file: AttachmentInfo, fingerprint: ByteArray) {
+        val existing = downloads[file.key]
+        if (existing != null && existing.failure == null) return
+        val tor = tor ?: run {
+            setDownload(file.key, TransferProgress(upload = false, fraction = 0f, failure = "Waiting for the network."))
+            return
+        }
+        setDownload(file.key, TransferProgress(upload = false, fraction = 0f))
+        scope.launch {
+            val transfer = onEngine { it.openAttachment(file.id) } ?: run {
+                setDownload(file.key, TransferProgress(upload = false, fraction = 0f, failure = "This file is no longer here."))
+                return@launch
+            }
+            downloadHandles[file.key] = transfer
+            watchProgress()
+            val fetched = withContext(Dispatchers.IO) { runCatching { transfer.download(tor) } }
+            downloadHandles.remove(file.key)
+            transfer.free()
+            fetched.onSuccess {
+                downloads = downloads - file.key
+                applyHistory(fingerprint.toHex(), onEngine { it.messages(fingerprint) })
+            }.onFailure {
+                setDownload(file.key, TransferProgress(upload = false, fraction = 0f, failure = transferFailure(it, upload = false)))
+            }
+        }
+    }
+
+    private fun setDownload(id: String, progress: TransferProgress?) {
+        downloads = if (progress == null) downloads - id else downloads + (id to progress)
+        messagesByFingerprint = messagesByFingerprint.mapValues { (_, items) ->
+            items.map { if (it.attachment?.key == id) it.copy(transfer = progress) else it }
+        }
+    }
+
+    /** While anything is moving, read its progress four times a second. */
+    private fun watchProgress() {
+        if (progressJob?.isActive == true) return
+        progressJob = scope.launch {
+            while (isActive) {
+                delay(250)
+                var moving = false
+                for (job in uploads.values) {
+                    val transfer = job.transfer ?: continue
+                    val fraction = transfer.fraction
+                    updatePlaceholder(job) { item ->
+                        if (item.transfer?.failure == null) {
+                            moving = true
+                            item.copy(transfer = item.transfer?.copy(fraction = fraction))
+                        } else {
+                            item
+                        }
+                    }
+                }
+                for ((id, transfer) in downloadHandles.toMap()) {
+                    moving = true
+                    setDownload(id, TransferProgress(upload = false, fraction = transfer.fraction))
+                }
+                if (!moving) return@launch
+            }
+        }
+    }
+
+    private fun transferFailure(error: Throwable, upload: Boolean): String =
+        when ((error as? VoidException)?.status) {
+            VoidStatus.OFFLINE -> "Couldn't reach the relay. Try again in a moment."
+            VoidStatus.EXPIRED -> "The relay no longer has this file. Ask them to send it again."
+            VoidStatus.CANCELLED -> "Cancelled."
+            else -> if (upload) "The relay didn't take the file. Try again later." else "This file didn't arrive intact."
+        }
+
+    /** The bytes of a file this phone holds — for showing an image. Off the engine thread. */
+    suspend fun attachmentData(file: AttachmentInfo): ByteArray? =
+        withContext(Dispatchers.IO) { engine.readAttachment(file.id) }
+
+    /** A file written out in the clear for a viewer or the share sheet, in the cache; delete when done. */
+    suspend fun exportAttachment(file: AttachmentInfo): File? = withContext(Dispatchers.IO) {
+        val folder = File(context.cacheDir, "void-open/${System.nanoTime()}").apply { mkdirs() }
+        val dest = File(folder, file.name.ifBlank { "file" })
+        runCatching { engine.exportAttachment(file.id, dest) }.map { dest }.getOrNull()
     }
 
     /** Change the name this device shows for a contact. Never transmitted. */
@@ -569,23 +862,25 @@ class AppState(
      * on the call, not whoever started it. Warning only the caller would leave
      * the person answering uninformed about their own exposure.
      */
-    fun requestCall(fingerprint: ByteArray) {
+    fun requestCall(fingerprint: ByteArray, video: Boolean = false) {
         if (activeCall != null) return
-        pendingDisclosure = PendingCall(fingerprint, isAnswering = false)
+        pendingDisclosure = PendingCall(fingerprint, isAnswering = false, video = video)
     }
 
     /** Ask for the disclosure before answering. See [requestCall]. */
     fun requestAnswer() {
         val call = activeCall ?: return
         if (call.phase != CallPhase.INCOMING) return
-        pendingDisclosure = PendingCall(call.fingerprint, isAnswering = true)
+        pendingDisclosure = PendingCall(call.fingerprint, isAnswering = true, video = call.video)
     }
 
     /**
-     * The user read the disclosure, chose to go ahead, and the microphone
-     * permission was settled — asked for at that moment, never at launch.
+     * The user read the disclosure, chose to go ahead, and the microphone —
+     * and for a video call the camera — permission was settled: asked for at
+     * that moment, never at launch. A refused camera means the call goes ahead
+     * with it off.
      */
-    fun confirmDisclosure(microphoneGranted: Boolean) {
+    fun confirmDisclosure(microphoneGranted: Boolean, cameraGranted: Boolean = false) {
         val pending = pendingDisclosure ?: return
         pendingDisclosure = null
         if (!microphoneGranted) {
@@ -593,7 +888,9 @@ class AppState(
             if (pending.isAnswering) hangUp()
             return
         }
-        if (pending.isAnswering) answerCall() else placeCall(pending.fingerprint)
+        cameraAllowed = cameraGranted
+        if (pending.video && !cameraGranted) showNotice("The camera is off. You can allow it in Settings.")
+        if (pending.isAnswering) answerCall() else placeCall(pending.fingerprint, pending.video)
     }
 
     /** Backing out of an incoming call is a decline, not a silent dismissal — the caller is told. */
@@ -608,13 +905,13 @@ class AppState(
      * Publishing touches the network, so it runs off the main thread; the
      * offer is queued the instant the address exists.
      */
-    private fun placeCall(fingerprint: ByteArray) {
+    private fun placeCall(fingerprint: ByteArray, video: Boolean) {
         if (activeCall != null) return
         val tor = tor ?: run {
             lastError = "Void isn't connected yet. Calls need the network."
             return
         }
-        activeCall = CallSession(fingerprint, ByteArray(0), CallRole.CALLER, CallPhase.PUBLISHING)
+        activeCall = CallSession(fingerprint, ByteArray(0), CallRole.CALLER, CallPhase.PUBLISHING, video = video)
         scope.launch {
             val host = withContext(Dispatchers.IO) {
                 runCatching { CallHost.publish(tor, File(context.cacheDir, "call-${System.nanoTime()}").absolutePath) }
@@ -631,7 +928,7 @@ class AppState(
             callHost = host
             try {
                 val credentials = onEngine {
-                    it.placeCall(fingerprint, host.address, VoidCore.callPort(), System.currentTimeMillis() / 1000)
+                    it.placeCall(fingerprint, host.address, VoidCore.callPort(), video, System.currentTimeMillis() / 1000)
                 }
                 val call = activeCall
                 if (call == null || !call.fingerprint.contentEquals(fingerprint)) {
@@ -704,6 +1001,15 @@ class AppState(
         val audio = CallAudio(context, media)
         audio.onConnected = { scope.launch { mediaConnected(callId, fingerprint, role) } }
         audio.onDropped = { connectionClosed -> scope.launch { mediaDropped(callId, connectionClosed) } }
+        val video = if (media.isVideo) {
+            CallVideo(context, media).also { pictures ->
+                pictures.onRemoteState = { remoteVideo = it }
+                pictures.onRemoteRotation = { remoteRotation = it }
+                audio.afterReceive = { pictures.drainRemote() }
+            }
+        } else {
+            null
+        }
         try {
             audio.start()
         } catch (e: Exception) {
@@ -712,16 +1018,45 @@ class AppState(
             return
         }
         callAudio = audio
+        if (video != null) {
+            remoteVideo = RemoteVideoState()
+            remoteRotation = 0
+            video.start(cameraAllowed)
+            isCameraOn = video.isCameraOn
+            callVideo = video
+        }
+        statsJob?.cancel()
+        statsJob = scope.launch {
+            while (isActive) {
+                delay(1_000)
+                statsTick++
+            }
+        }
         // Keeps the microphone working when the screen locks or the user
         // switches apps, as a phone call does.
         CallService.start(context)
     }
 
+    /** Turn the camera on or off during a video call; the wire is the same size either way. */
+    fun toggleCamera() {
+        val video = callVideo ?: return
+        video.setCamera(!video.isCameraOn)
+        isCameraOn = video.isCameraOn
+    }
+
+    /** Switch between the front and back cameras. */
+    fun flipCamera() {
+        callVideo?.flipCamera()
+    }
+
+    /** What the call has carried, for its details. */
+    fun callStats(): Pair<CallAudio.Stats?, CallVideo.Stats?> = callAudio?.stats to callVideo?.stats
+
     /** The first authenticated frame arrived. For the caller that is the answer. */
     private fun mediaConnected(callId: ByteArray, fingerprint: ByteArray, role: CallRole) {
         val call = activeCall ?: return
         if (!call.callId.contentEquals(callId)) return
-        activeCall = call.copy(phase = CallPhase.ACTIVE)
+        activeCall = call.copy(phase = CallPhase.ACTIVE, connectedAtMs = System.currentTimeMillis())
         if (role == CallRole.CALLER) scope.launch { onEngine { it.markCallConnected(fingerprint) } }
     }
 
@@ -745,7 +1080,7 @@ class AppState(
                 // The engine already answers a second offer "busy"; this is
                 // the UI's own guard on the same rule.
                 if (activeCall != null) return
-                activeCall = CallSession(event.fingerprint, event.callId, CallRole.CALLEE, CallPhase.INCOMING)
+                activeCall = CallSession(event.fingerprint, event.callId, CallRole.CALLEE, CallPhase.INCOMING, video = event.video)
             }
             is CallEvent.Answered -> {
                 // Usually the callee's media got here first and the call is
@@ -778,6 +1113,11 @@ class AppState(
 
     /** Tear down local call state. Always safe to call twice. */
     private fun finishCall(summary: String) {
+        statsJob?.cancel()
+        statsJob = null
+        callVideo?.stop()
+        callVideo = null
+        isCameraOn = false
         callAudio?.stop()
         callAudio = null
         callHost?.release()
@@ -801,5 +1141,14 @@ class AppState(
     fun mute(muted: Boolean) {
         isMuted = muted
         callAudio?.muted = muted
+    }
+
+    companion object {
+        /**
+         * Received files up to this size are fetched as soon as they arrive.
+         * Larger ones wait for a tap: a transfer is a burst anyone watching the
+         * connection can see, and its size is roughly the file's.
+         */
+        const val AUTO_DOWNLOAD_LIMIT = 12L * 1024 * 1024
     }
 }

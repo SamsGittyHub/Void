@@ -325,3 +325,113 @@ struct KeyStorageView: View {
         .navigationTitle("Key storage")
     }
 }
+
+// MARK: - The Security tab
+
+/// Everything about how this phone is protected, in one place: your own
+/// security code, how your keys are held, how Void reaches the network, and —
+/// FR-UI-05 — the "what Void does and does not protect" screen, reachable from
+/// here and not only during onboarding.
+struct SecurityHomeView: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        List {
+            Section {
+                VStack(spacing: 14) {
+                    VoidMark(size: 64)
+                        .padding(.top, 10)
+                    Text("Your security code")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Text(state.fingerprintWords)
+                        .font(.callout.monospaced().weight(.medium))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                        .accessibilityLabel(spelled(state.fingerprintWords))
+                    Text("Read this to someone when you compare codes in person. It is yours alone.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.65))
+                        .multilineTextAlignment(.center)
+                        .padding(.bottom, 12)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 8)
+                .listRowBackground(Theme.callBackground)
+            }
+
+            Section {
+                NavigationLink {
+                    KeyStorageView(backing: state.backing)
+                } label: {
+                    row(
+                        icon: state.backing.isHardwareBacked ? "lock.shield.fill" : "exclamationmark.shield.fill",
+                        tint: state.backing.isHardwareBacked ? Theme.verified : Theme.warning,
+                        title: "Key storage",
+                        detail: state.backing.isHardwareBacked ? "Secure Enclave" : "Software only")
+                }
+                row(
+                    icon: state.isOffline ? "network.slash" : "network",
+                    tint: state.isOffline ? Theme.warning : Theme.verified,
+                    title: "Connection",
+                    detail: state.isOffline ? "Not connected — nothing is sent" : "Connected over Tor")
+                    .accessibilityIdentifier("securityConnectionRow")
+            } header: {
+                Text("This phone")
+            } footer: {
+                Text("Void reaches the network only through Tor. If Tor is down, messages wait on this phone; there is no other way out.")
+            }
+
+            Section {
+                NavigationLink {
+                    ProtectionScreen(onAcknowledge: nil)
+                        .navigationTitle("What Void protects")
+                        .navigationBarTitleDisplayMode(.inline)
+                } label: {
+                    row(
+                        icon: "checkmark.shield", tint: Theme.accent,
+                        title: "What Void protects, and what it doesn't", detail: nil)
+                }
+            }
+
+            Section("About") {
+                LabeledContent("Protocol", value: "v\(VoidCore.protocolVersion)")
+                LabeledContent("Record size", value: "\(VoidCore.recordSize) bytes")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Protocol identifier")
+                    Text(VoidCore.protocolIdentifier)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .navigationTitle("Security")
+    }
+
+    private func row(icon: String, tint: Color, title: String, detail: String?) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 32, height: 32)
+                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(tint))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                if let detail {
+                    Text(detail).font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Spelled letter by letter for VoiceOver, as the verification screen does.
+    private func spelled(_ code: String) -> String {
+        code.replacingOccurrences(of: "\n", with: ", ")
+            .split(separator: "-")
+            .map { $0.map(String.init).joined(separator: " ") }
+            .joined(separator: ", then ")
+    }
+}

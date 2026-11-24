@@ -81,6 +81,9 @@ pub struct Config {
     pub max_queues: usize,
     /// How long a retrieval challenge stays valid.
     pub challenge_ttl_seconds: u64,
+    /// Limits for attachments' sealed blobs, held apart from queues
+    /// (`crate::blobs`, D-032).
+    pub blobs: crate::blobs::BlobConfig,
 }
 
 impl Default for Config {
@@ -91,6 +94,7 @@ impl Default for Config {
             max_records_per_queue: 1000,
             max_queues: 1_000_000,
             challenge_ttl_seconds: 60,
+            blobs: crate::blobs::BlobConfig::default(),
         }
     }
 }

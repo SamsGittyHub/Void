@@ -80,6 +80,10 @@ pub enum VoidStatus {
     /// The invitation is parked on a different relay from the one this app
     /// uses.
     WrongRelay = 10,
+    /// The file is larger than [`void_attachment_max_bytes`].
+    TooLarge = 11,
+    /// The transfer was cancelled.
+    Cancelled = 12,
 }
 
 /// The largest `now` this boundary accepts: 3000-01-01T00:00:00Z, in Unix
@@ -130,6 +134,68 @@ impl VoidBytes {
 /// An opaque handle to an engine.
 pub struct VoidEngine {
     inner: Mutex<Engine>,
+    /// Where this engine's attachments' sealed copies live, for an engine
+    /// opened with [`void_engine_open`]. Fixed for the engine's life, so read
+    /// without the lock: sealing and opening files never waits on a tick.
+    attachments: Option<std::path::PathBuf>,
+    /// Unix seconds of the last sweep of attachments no message points at.
+    last_attachment_sweep: std::sync::atomic::AtomicU64,
+    /// What each attachment in the history is, by id, as the engine last
+    /// reported it — so showing an image never waits on the engine's lock,
+    /// which a tick holds for as long as the network makes it wait. Only what
+    /// the encrypted database already holds; emptied by duress.
+    attachment_cache:
+        Mutex<std::collections::HashMap<void_proto::attachment::BlobId, CachedAttachment>>,
+}
+
+/// One attachment as the cache keeps it.
+#[derive(Clone)]
+struct CachedAttachment {
+    attachment: void_proto::attachment::Attachment,
+    incoming: bool,
+}
+
+impl VoidEngine {
+    fn new(engine: Engine, attachments: Option<std::path::PathBuf>) -> VoidEngine {
+        VoidEngine {
+            inner: Mutex::new(engine),
+            attachments,
+            last_attachment_sweep: std::sync::atomic::AtomicU64::new(0),
+            attachment_cache: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn remember_attachment(&self, attachment: &void_proto::attachment::Attachment, incoming: bool) {
+        if let Ok(mut cache) = self.attachment_cache.lock() {
+            cache.insert(
+                attachment.blob_id(),
+                CachedAttachment {
+                    attachment: attachment.clone(),
+                    incoming,
+                },
+            );
+        }
+    }
+
+    /// The attachment `id` names: from the cache, or from the engine — which
+    /// may wait on its lock — the first time.
+    fn find_attachment(&self, id: &void_proto::attachment::BlobId) -> Option<CachedAttachment> {
+        if let Some(found) = self
+            .attachment_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(id).cloned())
+        {
+            return Some(found);
+        }
+        let (attachment, _peer, direction) = self.inner.lock().ok()?.attachment(id)?;
+        let incoming = direction == void_store::model::Direction::Incoming;
+        self.remember_attachment(&attachment, incoming);
+        Some(CachedAttachment {
+            attachment,
+            incoming,
+        })
+    }
 }
 
 /// Convert a caller pointer and length into a slice.
@@ -183,16 +249,16 @@ pub unsafe extern "C" fn void_engine_new(out: *mut *mut VoidEngine) -> VoidStatu
         ) else {
             return VoidStatus::Failed;
         };
-        let boxed = Box::new(VoidEngine {
-            inner: Mutex::new(engine),
-        });
-        *out = Box::into_raw(boxed);
+        *out = Box::into_raw(Box::new(VoidEngine::new(engine, None)));
         VoidStatus::Ok
     })
 }
 
 /// The database file inside the data directory [`void_engine_open`] is given.
 const DATABASE_FILE: &str = "void.db";
+
+/// The directory inside the data directory holding attachments' sealed copies.
+const ATTACHMENTS_DIR: &str = "attachments";
 
 /// Open this device's engine: restore it if it has run here before, otherwise
 /// create it with a freshly generated identity. The apps call this, not
@@ -277,11 +343,27 @@ pub unsafe extern "C" fn void_engine_open(
         let Ok(engine) = engine else {
             return VoidStatus::Failed;
         };
-        *out = Box::into_raw(Box::new(VoidEngine {
-            inner: Mutex::new(engine),
-        }));
+        let attachments = dir.join(ATTACHMENTS_DIR);
+        if create_private_dir(&attachments).is_err() {
+            return VoidStatus::Failed;
+        }
+        let handle = VoidEngine::new(engine, Some(attachments));
+        sweep_attachments(&handle);
+        *out = Box::into_raw(Box::new(handle));
         VoidStatus::Ok
     })
+}
+
+/// Make a directory only its owner can enter, as D-031 requires of every
+/// directory the apps make — and close one an earlier build left open.
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// The stored history with one contact, oldest first — what a conversation
@@ -290,11 +372,23 @@ pub unsafe extern "C" fn void_engine_open(
 /// Layout, repeated per message:
 ///
 /// ```text
+///   u64 LE(id)           the record's id: stable for the message's life
 ///   u8(direction)        1 = sent by us, 2 = received
 ///   u8(delivery)         0 queued, 1 sent, 2 delivered, 3 failed, 4 received
 ///   u64 LE(timestamp)    Unix seconds, local clock
-///   u32 LE(text_len) || raw(text)
+///   u32 LE(text_len) || raw(text)        for a file, its caption
+///   u8(kind)             0 = text, 1 = a file (D-032), followed by:
+///     raw(attachment_id : 16)
+///     u64 LE(size)                       bytes
+///     u16 LE(width) || u16 LE(height)    pixels, 0 if unknown
+///     u16 LE(name_len) || raw(name)
+///     u16 LE(mime_len) || raw(mime)
+///     u8(local)          1 if this device holds the sealed copy, so
+///                        [`void_engine_attachment_read`] can open it now
 /// ```
+///
+/// Never the attachment's key or token: those stay in the core, and the id is
+/// only the relay address, which the relay already sees.
 ///
 /// Empty for an engine with no store attached.
 ///
@@ -315,17 +409,31 @@ pub unsafe extern "C" fn void_engine_messages(
         let Ok(guard) = (*engine).inner.lock() else {
             return VoidBytes::empty();
         };
-        let Ok(messages) = guard.messages(&fp) else {
+        let Ok(messages) = guard.messages_with_ids(&fp) else {
             return VoidBytes::empty();
         };
-        VoidBytes::from_vec(encode_stored_messages(&messages))
+        drop(guard);
+        for (_, m) in &messages {
+            if let Some(a) = &m.attachment {
+                (*engine)
+                    .remember_attachment(a, m.direction == void_store::model::Direction::Incoming);
+            }
+        }
+        let dir = (*engine).attachments.as_deref();
+        VoidBytes::from_vec(encode_stored_messages(&messages, |id| {
+            dir.is_some_and(|d| sealed_copy_path(d, id).is_file())
+        }))
     })
 }
 
-fn encode_stored_messages(messages: &[void_store::model::StoredMessage]) -> Vec<u8> {
+fn encode_stored_messages(
+    messages: &[(u64, void_store::model::StoredMessage)],
+    is_local: impl Fn(&void_proto::attachment::BlobId) -> bool,
+) -> Vec<u8> {
     use void_store::model::{DeliveryState, Direction};
     let mut out = Vec::new();
-    for m in messages {
+    for (id, m) in messages {
+        out.extend_from_slice(&id.to_le_bytes());
         out.push(match m.direction {
             Direction::Outgoing => 1u8,
             Direction::Incoming => 2u8,
@@ -340,6 +448,22 @@ fn encode_stored_messages(messages: &[void_store::model::StoredMessage]) -> Vec<
         out.extend_from_slice(&m.timestamp.to_le_bytes());
         out.extend_from_slice(&(m.body.len() as u32).to_le_bytes());
         out.extend_from_slice(m.body.as_bytes());
+        match &m.attachment {
+            None => out.push(0),
+            Some(a) => {
+                let blob = a.blob_id();
+                out.push(1);
+                out.extend_from_slice(&blob);
+                out.extend_from_slice(&a.size.to_le_bytes());
+                out.extend_from_slice(&a.width.to_le_bytes());
+                out.extend_from_slice(&a.height.to_le_bytes());
+                out.extend_from_slice(&(a.name.len() as u16).to_le_bytes());
+                out.extend_from_slice(a.name.as_bytes());
+                out.extend_from_slice(&(a.mime.len() as u16).to_le_bytes());
+                out.extend_from_slice(a.mime.as_bytes());
+                out.push(u8::from(is_local(&blob)));
+            }
+        }
     }
     out
 }
@@ -527,7 +651,18 @@ pub unsafe extern "C" fn void_engine_duress_destroy(engine: *mut VoidEngine) -> 
         let Ok(mut guard) = (*engine).inner.lock() else {
             return VoidStatus::Internal;
         };
-        match guard.duress_destroy() {
+        let destroyed = guard.duress_destroy();
+        if let Ok(mut cache) = (*engine).attachment_cache.lock() {
+            cache.clear();
+        }
+        // The sealed copies were unreadable the moment the vault key went —
+        // their keys were in the database it opened — so this is the same
+        // defence in depth as erasing the database: no intact ciphertext left
+        // beside a key nobody has.
+        if let Some(dir) = &(*engine).attachments {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        match destroyed {
             Ok(()) => VoidStatus::Ok,
             Err(_) => VoidStatus::Failed,
         }
@@ -1290,6 +1425,23 @@ pub unsafe extern "C" fn void_engine_tick(
             Ok(TickOutcome::Retrieved(messages)) => {
                 *out_outcome = VoidTickOutcome::Retrieved;
                 *out_messages = VoidBytes::from_vec(encode_received_messages(&messages));
+                for a in messages.iter().filter_map(|m| m.attachment.as_ref()) {
+                    (*engine).remember_attachment(a, true);
+                }
+                // The retention sweep runs in the retrieval slot; files whose
+                // messages it just deleted go too, at most every ten minutes.
+                let now = now_ms / 1000;
+                let last = (*engine)
+                    .last_attachment_sweep
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= ATTACHMENT_SWEEP_SECONDS {
+                    (*engine)
+                        .last_attachment_sweep
+                        .store(now, std::sync::atomic::Ordering::Relaxed);
+                    let referenced = guard.attachment_ids();
+                    drop(guard);
+                    remove_unreferenced(&*engine, &referenced);
+                }
                 VoidStatus::Ok
             }
             Ok(TickOutcome::Offline) => {
@@ -1607,7 +1759,7 @@ pub extern "C" fn void_record_size() -> usize {
 pub extern "C" fn void_protocol_id() -> *const c_char {
     // A static, NUL-terminated string checked at compile time. Nothing is
     // allocated and there is nothing for the caller to free.
-    const ID: &CStr = c"void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
+    const ID: &CStr = c"void/v4/pqxdh/x25519+mlkem1024/ed25519+mldsa87";
     // A literal, because a static C string needs its NUL; checked against the
     // core's constant at compile time, so this copy cannot drift the way
     // PROTOCOL.md's and `PROTOCOL_VERSION` had.
@@ -1616,6 +1768,748 @@ pub extern "C" fn void_protocol_id() -> *const c_char {
         void_proto::handshake::PROTOCOL_ID
     ));
     ID.as_ptr()
+}
+
+// --- attachments (D-032) -------------------------------------------------
+//
+// A file crosses this boundary as a path, never as key material. The platform
+// writes the file it wants to send somewhere private (a photo re-encoded
+// without its metadata, a document the user picked) and hands over the path;
+// this crate seals it, chunk by chunk, into the attachments directory, and
+// from then on the platform holds only an opaque handle and a 16-byte id. The
+// token and key live in that handle and, once sent, in the encrypted database
+// beside the message — which is why destroying the database's vault key
+// destroys every file with it.
+//
+// The sealed copy kept here is the same ciphertext the relay holds: chunks
+// sealed under the file's own key. Nothing is ever written in the clear
+// except where the platform asks for it ([`void_engine_attachment_export`]),
+// and the platform then owns that file.
+//
+// Uploading and downloading block for as long as the transfer takes — seconds
+// to minutes — so call them on a background thread, never the engine's.
+// [`void_attachment_progress`] can be read from any thread meanwhile.
+
+/// How often, at most, sealed copies nothing points at any more are removed.
+const ATTACHMENT_SWEEP_SECONDS: u64 = 10 * 60;
+
+/// How old a sealed copy no message points at must be before it is removed.
+/// A file just prepared is not in any message until its upload finishes.
+const UNSENT_ATTACHMENT_GRACE_SECONDS: u64 = 2 * 60 * 60;
+
+fn hex_id(id: &void_proto::attachment::BlobId) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(32);
+    for b in id {
+        s.push(DIGITS[(b >> 4) as usize] as char);
+        s.push(DIGITS[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn parse_hex_id(s: &str) -> Option<void_proto::attachment::BlobId> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    for (i, pair) in s.as_bytes().chunks(2).enumerate() {
+        let digit = |c: u8| (c as char).to_digit(16);
+        id[i] = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
+    }
+    Some(id)
+}
+
+/// Where the sealed copy of an attachment lives once it is whole.
+fn sealed_copy_path(
+    dir: &std::path::Path,
+    id: &void_proto::attachment::BlobId,
+) -> std::path::PathBuf {
+    dir.join(format!("{}.blob", hex_id(id)))
+}
+
+/// Where it lives while it is being written.
+fn partial_copy_path(
+    dir: &std::path::Path,
+    id: &void_proto::attachment::BlobId,
+) -> std::path::PathBuf {
+    dir.join(format!("{}.part", hex_id(id)))
+}
+
+/// Remove sealed copies no stored message points at — their messages expired
+/// (FR-STOR-04) — once they are older than [`UNSENT_ATTACHMENT_GRACE_SECONDS`].
+fn remove_unreferenced(engine: &VoidEngine, referenced: &[void_proto::attachment::BlobId]) {
+    if let Ok(mut cache) = engine.attachment_cache.lock() {
+        cache.retain(|id, _| referenced.contains(id));
+    }
+    let Some(dir) = &engine.attachments else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let grace = std::time::Duration::from_secs(UNSENT_ATTACHMENT_GRACE_SECONDS);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(parse_hex_id)
+        else {
+            continue;
+        };
+        if referenced.contains(&id) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= grace);
+        if old_enough {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// [`remove_unreferenced`], fetching what is referenced from the engine.
+fn sweep_attachments(engine: &VoidEngine) {
+    let referenced = match engine.inner.lock() {
+        Ok(guard) => guard.attachment_ids(),
+        Err(_) => return,
+    };
+    remove_unreferenced(engine, &referenced);
+}
+
+/// One file, being sent or fetched. Holds its token and key; the platform
+/// holds only this handle.
+pub struct VoidAttachment {
+    attachment: void_proto::attachment::Attachment,
+    /// Received rather than sent: once fetched, the relay's copy is deleted.
+    incoming: bool,
+    dir: std::path::PathBuf,
+    progress: void_client::attachment::Progress,
+}
+
+impl VoidAttachment {
+    fn sealed_copy(&self) -> std::path::PathBuf {
+        sealed_copy_path(&self.dir, &self.attachment.blob_id())
+    }
+
+    fn has_whole_copy(&self) -> bool {
+        let expected = u64::from(self.attachment.data_chunks())
+            * void_proto::attachment::SEALED_CHUNK_LEN as u64;
+        std::fs::metadata(self.sealed_copy()).is_ok_and(|m| m.len() == expected)
+    }
+}
+
+fn transfer_status(e: void_client::ClientError) -> VoidStatus {
+    use void_client::ClientError as E;
+    match e {
+        E::TorUnavailable => VoidStatus::Offline,
+        E::Cancelled => VoidStatus::Cancelled,
+        E::AttachmentUnavailable => VoidStatus::Expired,
+        _ => VoidStatus::Failed,
+    }
+}
+
+/// The largest file [`void_engine_prepare_attachment`] accepts, in bytes.
+#[no_mangle]
+pub extern "C" fn void_attachment_max_bytes() -> u64 {
+    void_proto::attachment::MAX_ATTACHMENT_BYTES
+}
+
+/// Seal a file for sending: read `source_path`, seal it under a key made for
+/// it alone into this engine's attachments directory, and return a handle to
+/// upload and then send. The source file is only read; deleting it afterwards
+/// is the platform's business.
+///
+/// `name` and `mime` are sanitised here — a single path component, a
+/// `type/subtype` — and so is what the recipient decodes. `width` and
+/// `height` may be zero. `caption` may be empty.
+///
+/// Returns `TooLarge` past [`void_attachment_max_bytes`], and `Failed` for an
+/// engine opened without a data directory.
+///
+/// # Safety
+/// `engine` must be valid; `source_path` NUL-terminated UTF-8; each pointer
+/// and length pair valid for its length; `out` a valid output pointer. Free
+/// the handle with [`void_attachment_free`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn void_engine_prepare_attachment(
+    engine: *const VoidEngine,
+    source_path: *const c_char,
+    name: *const u8,
+    name_len: usize,
+    mime: *const u8,
+    mime_len: usize,
+    width: u16,
+    height: u16,
+    caption: *const u8,
+    caption_len: usize,
+    out: *mut *mut VoidAttachment,
+) -> VoidStatus {
+    if engine.is_null() || source_path.is_null() || out.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let (Some(name), Some(mime), Some(caption)) = (
+            slice_from(name, name_len),
+            slice_from(mime, mime_len),
+            slice_from(caption, caption_len),
+        ) else {
+            return VoidStatus::BadArgument;
+        };
+        let (Ok(name), Ok(mime), Ok(caption), Ok(source)) = (
+            std::str::from_utf8(name),
+            std::str::from_utf8(mime),
+            std::str::from_utf8(caption),
+            CStr::from_ptr(source_path).to_str(),
+        ) else {
+            return VoidStatus::BadArgument;
+        };
+        let Some(dir) = (*engine).attachments.clone() else {
+            return VoidStatus::Failed;
+        };
+        match seal_into(
+            &dir,
+            std::path::Path::new(source),
+            name,
+            mime,
+            width,
+            height,
+            caption,
+        ) {
+            Ok(attachment) => {
+                let handle = std::sync::Arc::new(VoidAttachment {
+                    attachment,
+                    incoming: false,
+                    dir,
+                    progress: void_client::attachment::Progress::new(),
+                });
+                *out = std::sync::Arc::into_raw(handle) as *mut VoidAttachment;
+                VoidStatus::Ok
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// Seal `source` chunk by chunk into `dir`, returning what describes it.
+fn seal_into(
+    dir: &std::path::Path,
+    source: &std::path::Path,
+    name: &str,
+    mime: &str,
+    width: u16,
+    height: u16,
+    caption: &str,
+) -> Result<void_proto::attachment::Attachment, VoidStatus> {
+    use std::io::{Read, Write};
+    use void_proto::attachment::{
+        seal_chunk, Attachment, AttachmentSecrets, CHUNK_LEN, MAX_ATTACHMENT_BYTES, MAX_CAPTION_LEN,
+    };
+    let size = std::fs::metadata(source)
+        .map_err(|_| VoidStatus::BadArgument)?
+        .len();
+    if size > MAX_ATTACHMENT_BYTES {
+        return Err(VoidStatus::TooLarge);
+    }
+    if caption.len() > MAX_CAPTION_LEN {
+        return Err(VoidStatus::BadArgument);
+    }
+    let secrets = AttachmentSecrets::generate().map_err(|_| VoidStatus::Failed)?;
+    let attachment = Attachment::new(&secrets, size, name, mime, width, height, caption)
+        .map_err(|_| VoidStatus::BadArgument)?;
+    let blob = attachment.blob_id();
+    create_private_dir(dir).map_err(|_| VoidStatus::Failed)?;
+    let partial = partial_copy_path(dir, &blob);
+
+    let written = (|| -> std::io::Result<()> {
+        let mut input = std::io::BufReader::new(std::fs::File::open(source)?);
+        let mut output = std::io::BufWriter::new(std::fs::File::create(&partial)?);
+        let mut buf = vec![0u8; CHUNK_LEN];
+        let mut total = 0u64;
+        for index in 0..attachment.data_chunks() {
+            let want = attachment.chunk_data_len(index);
+            input.read_exact(&mut buf[..want])?;
+            total += want as u64;
+            let sealed = seal_chunk(
+                &attachment.key,
+                &blob,
+                index,
+                attachment.chunks,
+                &buf[..want],
+            )
+            .map_err(|_| std::io::Error::other("seal"))?;
+            output.write_all(&sealed)?;
+        }
+        void_crypto::Zeroize::zeroize(&mut buf);
+        // A file that grew while it was read is not the file the user chose.
+        let mut extra = [0u8; 1];
+        if total != size || input.read(&mut extra)? != 0 {
+            return Err(std::io::Error::other("the file changed while it was read"));
+        }
+        output.flush()?;
+        output.get_ref().sync_all()?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+        return Err(VoidStatus::Failed);
+    }
+    std::fs::rename(&partial, sealed_copy_path(dir, &blob)).map_err(|_| VoidStatus::Failed)?;
+    Ok(attachment)
+}
+
+/// The attachment's 16-byte id — its relay address, which is also how
+/// [`void_engine_messages`] names it.
+///
+/// # Safety
+/// `handle` must be valid and `out_id` valid for 16 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn void_attachment_id(
+    handle: *const VoidAttachment,
+    out_id: *mut u8,
+) -> VoidStatus {
+    if handle.is_null() || out_id.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let handle = retain(handle);
+        let id = handle.attachment.blob_id();
+        std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, 16);
+        VoidStatus::Ok
+    })
+}
+
+/// How far a transfer has got: chunks done and chunks in all, padding
+/// included. Safe from any thread while the transfer runs.
+///
+/// # Safety
+/// `handle` must be valid; the outputs must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn void_attachment_progress(
+    handle: *const VoidAttachment,
+    out_done: *mut u32,
+    out_total: *mut u32,
+) -> VoidStatus {
+    if handle.is_null() || out_done.is_null() || out_total.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let handle = retain(handle);
+        *out_done = handle.progress.done();
+        *out_total = handle.progress.total();
+        VoidStatus::Ok
+    })
+}
+
+/// Stop a transfer at its next chunk; it returns `Cancelled`.
+///
+/// # Safety
+/// `handle` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_attachment_cancel(handle: *const VoidAttachment) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| retain(handle).progress.cancel()));
+}
+
+/// Release an attachment handle. Its key is wiped once nothing is using it.
+///
+/// # Safety
+/// `handle` must have come from this crate and must not be used after.
+#[no_mangle]
+pub unsafe extern "C" fn void_attachment_free(handle: *mut VoidAttachment) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        drop(std::sync::Arc::from_raw(handle as *const VoidAttachment));
+    }));
+}
+
+/// Park a prepared attachment on the relay, over a circuit of its own.
+///
+/// **Blocks** for the whole upload. Runs again cleanly after a failure:
+/// chunks the relay already holds are acknowledged, not duplicated. Returns
+/// `Offline` if Tor or the relay could not be reached, `Failed` if the relay
+/// refused (it may be full), `Cancelled` after [`void_attachment_cancel`].
+///
+/// # Safety
+/// `tor` and `handle` must be valid; `onion_address` NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn void_attachment_upload(
+    tor: *const VoidTorHandle,
+    onion_address: *const c_char,
+    port: u16,
+    handle: *const VoidAttachment,
+) -> VoidStatus {
+    if tor.is_null() || onion_address.is_null() || handle.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let Ok(address) = CStr::from_ptr(onion_address).to_str() else {
+            return VoidStatus::BadArgument;
+        };
+        let handle = retain(handle);
+        if !handle.has_whole_copy() {
+            return VoidStatus::Failed;
+        }
+        match (*tor).inner.open_isolated(address, port) {
+            Ok(mut stream) => upload_attachment(&mut stream, &handle),
+            Err(_) => VoidStatus::Offline,
+        }
+    })
+}
+
+/// The body of [`void_attachment_upload`], over any stream to the relay.
+fn upload_attachment<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    handle: &VoidAttachment,
+) -> VoidStatus {
+    use std::io::Read;
+    use void_proto::attachment::{seal_chunk, SEALED_CHUNK_LEN};
+    let Ok(file) = std::fs::File::open(handle.sealed_copy()) else {
+        return VoidStatus::Failed;
+    };
+    let mut local = std::io::BufReader::new(file);
+    let a = &handle.attachment;
+    let blob = a.blob_id();
+    let data = a.data_chunks();
+    let result = void_client::attachment::upload(
+        stream,
+        &a.token,
+        a.chunks,
+        |index| {
+            if index < data {
+                let mut sealed = vec![0u8; SEALED_CHUNK_LEN];
+                local
+                    .read_exact(&mut sealed)
+                    .map_err(|_| void_client::ClientError::Storage)?;
+                Ok(sealed)
+            } else {
+                // Padding, sealed like the rest so the relay cannot tell where
+                // the file ends. Deterministic, so an upload run a second time
+                // sends the same bytes.
+                seal_chunk(&a.key, &blob, index, a.chunks, &[])
+                    .map_err(|_| void_client::ClientError::Protocol)
+            }
+        },
+        &handle.progress,
+    );
+    match result {
+        Ok(()) => VoidStatus::Ok,
+        Err(e) => transfer_status(e),
+    }
+}
+
+/// Send an uploaded attachment to a contact: the pointer goes through the
+/// ratchet like any message, and the file is in the history from now on.
+/// Upload first; a pointer sent before its blob is parked points at nothing.
+///
+/// # Safety
+/// `engine` and `handle` must be valid, `fingerprint` 32 readable bytes,
+/// `out_message_id` a valid output pointer.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_send_attachment(
+    engine: *mut VoidEngine,
+    fingerprint: *const u8,
+    handle: *const VoidAttachment,
+    now: u64,
+    out_message_id: *mut u64,
+) -> VoidStatus {
+    if engine.is_null() || fingerprint.is_null() || handle.is_null() || out_message_id.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    if !plausible_seconds(now) {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let handle = retain(handle);
+        let mut fp = [0u8; 32];
+        std::ptr::copy_nonoverlapping(fingerprint, fp.as_mut_ptr(), 32);
+        let Ok(mut guard) = (*engine).inner.lock() else {
+            return VoidStatus::Internal;
+        };
+        match guard.send_attachment(&fp, handle.attachment.clone(), now) {
+            Ok(id) => {
+                drop(guard);
+                (*engine).remember_attachment(&handle.attachment, false);
+                *out_message_id = id;
+                VoidStatus::Ok
+            }
+            Err(e) => client_status(e),
+        }
+    })
+}
+
+/// A handle to an attachment in the history, by the id
+/// [`void_engine_messages`] gives — to fetch one received here, or to look
+/// again at one sent from here.
+///
+/// # Safety
+/// `engine` must be valid, `id` 16 readable bytes, `out` a valid output
+/// pointer. Free the handle with [`void_attachment_free`].
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_attachment_open(
+    engine: *const VoidEngine,
+    id: *const u8,
+    out: *mut *mut VoidAttachment,
+) -> VoidStatus {
+    if engine.is_null() || id.is_null() || out.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let mut blob = [0u8; 16];
+        std::ptr::copy_nonoverlapping(id, blob.as_mut_ptr(), 16);
+        let Some(dir) = (*engine).attachments.clone() else {
+            return VoidStatus::Failed;
+        };
+        let Some(found) = (*engine).find_attachment(&blob) else {
+            return VoidStatus::Failed;
+        };
+        let handle = std::sync::Arc::new(VoidAttachment {
+            attachment: found.attachment,
+            incoming: found.incoming,
+            dir,
+            progress: void_client::attachment::Progress::new(),
+        });
+        *out = std::sync::Arc::into_raw(handle) as *mut VoidAttachment;
+        VoidStatus::Ok
+    })
+}
+
+/// Fetch a received attachment's blob from the relay, over a circuit of its
+/// own, into this device's sealed copy — every chunk checked as it arrives —
+/// then ask the relay to delete it.
+///
+/// **Blocks** for the whole download. Every chunk is fetched, padding
+/// included, so the relay learns no more about the file's size than the
+/// upload told it. `Ok` at once if the copy is already here. `Expired` if the
+/// relay no longer has the blob; `Failed` if what it sent did not
+/// authenticate, which nothing but a misbehaving relay produces.
+///
+/// # Safety
+/// `tor` and `handle` must be valid; `onion_address` NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn void_attachment_download(
+    tor: *const VoidTorHandle,
+    onion_address: *const c_char,
+    port: u16,
+    handle: *const VoidAttachment,
+) -> VoidStatus {
+    if tor.is_null() || onion_address.is_null() || handle.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let Ok(address) = CStr::from_ptr(onion_address).to_str() else {
+            return VoidStatus::BadArgument;
+        };
+        let handle = retain(handle);
+        if handle.has_whole_copy() {
+            return VoidStatus::Ok;
+        }
+        match (*tor).inner.open_isolated(address, port) {
+            Ok(mut stream) => download_attachment(&mut stream, &handle),
+            Err(_) => VoidStatus::Offline,
+        }
+    })
+}
+
+/// The body of [`void_attachment_download`], over any stream to the relay.
+fn download_attachment<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    handle: &VoidAttachment,
+) -> VoidStatus {
+    use std::io::Write;
+    use void_proto::attachment::open_chunk;
+    if create_private_dir(&handle.dir).is_err() {
+        return VoidStatus::Failed;
+    }
+    let a = &handle.attachment;
+    let blob = a.blob_id();
+    let partial = partial_copy_path(&handle.dir, &blob);
+    let Ok(file) = std::fs::File::create(&partial) else {
+        return VoidStatus::Failed;
+    };
+    let mut output = std::io::BufWriter::new(file);
+    let data = a.data_chunks();
+    let result = void_client::attachment::download(
+        stream,
+        &a.token,
+        a.chunks,
+        |index, sealed| {
+            if index >= data {
+                // Padding: fetched only so the relay cannot tell where the
+                // file ends. Nothing to keep.
+                return Ok(());
+            }
+            let mut opened = open_chunk(&a.key, &blob, index, a.chunks, sealed)
+                .map_err(|_| void_client::ClientError::Protocol)?;
+            void_crypto::Zeroize::zeroize(&mut opened);
+            output
+                .write_all(sealed)
+                .map_err(|_| void_client::ClientError::Storage)
+        },
+        &handle.progress,
+    );
+    let finished = result.and_then(|()| {
+        output
+            .flush()
+            .and_then(|()| output.get_ref().sync_all())
+            .map_err(|_| void_client::ClientError::Storage)
+    });
+    drop(output);
+    if let Err(e) = finished {
+        let _ = std::fs::remove_file(&partial);
+        return transfer_status(e);
+    }
+    if std::fs::rename(&partial, handle.sealed_copy()).is_err() {
+        return VoidStatus::Failed;
+    }
+    // The relay holds it no longer than it must. Best effort: if this fails,
+    // the blob expires on its own.
+    if handle.incoming {
+        let _ = void_client::attachment::delete(stream, &a.token);
+    }
+    VoidStatus::Ok
+}
+
+/// Open the attachment `id` from this device's sealed copy, into memory.
+///
+/// For showing an image. A file to hand to another app goes through
+/// [`void_engine_attachment_export`] instead. `Failed` if the copy is not
+/// here yet ([`void_attachment_download`] first) or does not authenticate.
+///
+/// # Safety
+/// `engine` must be valid, `id` 16 readable bytes, `out` a valid output
+/// pointer. Free the result with [`void_free_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_attachment_read(
+    engine: *const VoidEngine,
+    id: *const u8,
+    out: *mut VoidBytes,
+) -> VoidStatus {
+    if engine.is_null() || id.is_null() || out.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    *out = VoidBytes::empty();
+    guard(|| {
+        let mut plaintext = Vec::new();
+        match open_sealed_copy(&*engine, id, |chunk| {
+            plaintext.extend_from_slice(chunk);
+            Ok(())
+        }) {
+            Ok(()) => {
+                *out = VoidBytes::from_vec(plaintext);
+                VoidStatus::Ok
+            }
+            Err(status) => {
+                void_crypto::Zeroize::zeroize(&mut plaintext);
+                status
+            }
+        }
+    })
+}
+
+/// Write the attachment `id` out in the clear to `dest_path`, for handing to
+/// another app — a viewer, the share sheet. The platform owns that file from
+/// then on and should delete it when it is done.
+///
+/// # Safety
+/// `engine` must be valid, `id` 16 readable bytes, `dest_path`
+/// NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_attachment_export(
+    engine: *const VoidEngine,
+    id: *const u8,
+    dest_path: *const c_char,
+) -> VoidStatus {
+    if engine.is_null() || id.is_null() || dest_path.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        use std::io::Write;
+        let Ok(dest) = CStr::from_ptr(dest_path).to_str() else {
+            return VoidStatus::BadArgument;
+        };
+        let dest = std::path::Path::new(dest);
+        let Ok(file) = std::fs::File::create(dest) else {
+            return VoidStatus::Failed;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        }
+        let mut output = std::io::BufWriter::new(file);
+        let result = open_sealed_copy(&*engine, id, |chunk| {
+            output.write_all(chunk).map_err(|_| VoidStatus::Failed)
+        })
+        .and_then(|()| output.flush().map_err(|_| VoidStatus::Failed));
+        drop(output);
+        match result {
+            Ok(()) => VoidStatus::Ok,
+            Err(status) => {
+                let _ = std::fs::remove_file(dest);
+                status
+            }
+        }
+    })
+}
+
+/// Decrypt this device's sealed copy of attachment `id`, handing the file's
+/// bytes to `sink` a chunk at a time.
+unsafe fn open_sealed_copy(
+    engine: &VoidEngine,
+    id: *const u8,
+    mut sink: impl FnMut(&[u8]) -> Result<(), VoidStatus>,
+) -> Result<(), VoidStatus> {
+    use std::io::Read;
+    use void_proto::attachment::{open_chunk, SEALED_CHUNK_LEN};
+    let mut blob = [0u8; 16];
+    std::ptr::copy_nonoverlapping(id, blob.as_mut_ptr(), 16);
+    let dir = engine.attachments.as_ref().ok_or(VoidStatus::Failed)?;
+    let a = engine
+        .find_attachment(&blob)
+        .ok_or(VoidStatus::Failed)?
+        .attachment;
+    let file = std::fs::File::open(sealed_copy_path(dir, &blob)).map_err(|_| VoidStatus::Failed)?;
+    let mut input = std::io::BufReader::new(file);
+    let mut sealed = vec![0u8; SEALED_CHUNK_LEN];
+    for index in 0..a.data_chunks() {
+        input
+            .read_exact(&mut sealed)
+            .map_err(|_| VoidStatus::Failed)?;
+        let mut chunk =
+            open_chunk(&a.key, &blob, index, a.chunks, &sealed).map_err(|_| VoidStatus::Failed)?;
+        let result = sink(&chunk[..a.chunk_data_len(index)]);
+        void_crypto::Zeroize::zeroize(&mut chunk);
+        result?;
+    }
+    Ok(())
+}
+
+/// Remove sealed copies that no message points at any more — their messages
+/// expired — once they are a couple of hours old. Runs by itself when an
+/// engine opens and from the retrieval slot; exposed for a platform that
+/// wants to run it sooner.
+///
+/// # Safety
+/// `engine` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_engine_sweep_attachments(engine: *const VoidEngine) -> VoidStatus {
+    if engine.is_null() {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        sweep_attachments(&*engine);
+        VoidStatus::Ok
+    })
 }
 
 // --- calls ---------------------------------------------------------------
@@ -1656,10 +2550,39 @@ pub struct VoidCallHost {
     cancelled: std::sync::atomic::AtomicBool,
 }
 
+/// The receiving half of a call: the stream, the opener, and — in a video
+/// call — the depacketizer reassembling the other end's video units.
+type Receiving = (
+    void_tor::call::MediaReader,
+    void_proto::call::MediaOpener,
+    void_proto::video::Depacketizer,
+);
+
+/// Whole video units held for the platform before it is assumed to have
+/// stopped taking them.
+const MAX_WAITING_VIDEO_UNITS: usize = 30;
+
 /// One call's media connection, with its encryption attached.
+///
+/// A video call adds two lanes beside the audio, each behind its own lock so
+/// that nothing waits on the network to touch them: encoded units the camera
+/// produced, waiting to be cut into slices by the sending thread, and units
+/// the receiving thread reassembled, waiting for the platform's decoder. The
+/// flags the two ends tell each other — "send me a keyframe", "my camera is
+/// off" — cross between the threads as atomics, never as a lock one of them
+/// could be holding while it waits two seconds for a frame.
 pub struct VoidCallMedia {
+    mode: void_proto::call::MediaMode,
     sending: Mutex<(void_tor::call::MediaWriter, void_proto::call::MediaSealer)>,
-    receiving: Mutex<(void_tor::call::MediaReader, void_proto::call::MediaOpener)>,
+    receiving: Mutex<Receiving>,
+    outgoing_video: Mutex<void_proto::video::Packetizer>,
+    incoming_video: Mutex<std::collections::VecDeque<void_proto::video::VideoUnit>>,
+    /// This end is discarding video until a keyframe arrives, and says so.
+    awaiting_keyframe: std::sync::atomic::AtomicBool,
+    /// The other end asked for a keyframe since the platform last checked.
+    peer_wants_keyframe: std::sync::atomic::AtomicBool,
+    /// The other end says its camera is off.
+    peer_camera_off: std::sync::atomic::AtomicBool,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -1669,14 +2592,27 @@ impl VoidCallMedia {
         secret: &[u8; 32],
         role: void_proto::call::Role,
         call_id: [u8; 16],
+        video: bool,
     ) -> VoidCallMedia {
-        let (reader, writer) = socket.split();
-        let (sealer, opener) = void_proto::call::MediaStream::new(secret, role, call_id).split();
+        let mode = void_proto::call::MediaMode::for_call(video);
+        let (reader, writer) = socket.split(mode);
+        let (sealer, opener) =
+            void_proto::call::MediaStream::with_mode(secret, role, call_id, mode).split();
         VoidCallMedia {
+            mode,
             sending: Mutex::new((writer, sealer)),
-            receiving: Mutex::new((reader, opener)),
+            receiving: Mutex::new((reader, opener, void_proto::video::Depacketizer::new())),
+            outgoing_video: Mutex::new(void_proto::video::Packetizer::new()),
+            incoming_video: Mutex::new(std::collections::VecDeque::new()),
+            awaiting_keyframe: std::sync::atomic::AtomicBool::new(true),
+            peer_wants_keyframe: std::sync::atomic::AtomicBool::new(false),
+            peer_camera_off: std::sync::atomic::AtomicBool::new(false),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn is_video(&self) -> bool {
+        self.mode == void_proto::call::MediaMode::Video
     }
 
     fn is_closed(&self) -> bool {
@@ -1828,6 +2764,7 @@ pub unsafe extern "C" fn void_call_host_accept(
     host: *mut VoidCallHost,
     media_secret: *const u8,
     call_id: *const u8,
+    video: bool,
     out: *mut *mut VoidCallMedia,
 ) -> VoidStatus {
     if host.is_null() || media_secret.is_null() || call_id.is_null() || out.is_null() {
@@ -1845,7 +2782,8 @@ pub unsafe extern "C" fn void_call_host_accept(
 
         let status = match h.accept(&handle.cancelled) {
             Ok(socket) => {
-                let media = VoidCallMedia::new(socket, &secret, void_proto::call::Role::Caller, id);
+                let media =
+                    VoidCallMedia::new(socket, &secret, void_proto::call::Role::Caller, id, video);
                 *out = std::sync::Arc::into_raw(std::sync::Arc::new(media)) as *mut VoidCallMedia;
                 VoidStatus::Ok
             }
@@ -1894,7 +2832,9 @@ pub unsafe extern "C" fn void_call_host_free(host: *mut VoidCallHost) {
     }));
 }
 
-/// Dial the caller's onion service to join a call (the callee side).
+/// Dial the caller's onion service to join a call (the callee side). `video`
+/// must be what the offer said — both ends frame the call the same way, or no
+/// frame opens.
 ///
 /// # Safety
 /// `tor` must be valid. `onion_address` must be a valid, NUL-terminated UTF-8
@@ -1906,6 +2846,7 @@ pub unsafe extern "C" fn void_call_media_connect(
     port: u16,
     media_secret: *const u8,
     call_id: *const u8,
+    video: bool,
     out: *mut *mut VoidCallMedia,
 ) -> VoidStatus {
     if tor.is_null()
@@ -1927,7 +2868,8 @@ pub unsafe extern "C" fn void_call_media_connect(
 
         let status = match (*tor).inner.connect_call(address, port) {
             Ok(socket) => {
-                let media = VoidCallMedia::new(socket, &secret, void_proto::call::Role::Callee, id);
+                let media =
+                    VoidCallMedia::new(socket, &secret, void_proto::call::Role::Callee, id, video);
                 *out = std::sync::Arc::into_raw(std::sync::Arc::new(media)) as *mut VoidCallMedia;
                 VoidStatus::Ok
             }
@@ -1976,11 +2918,36 @@ pub unsafe extern "C" fn void_call_media_send(
             return VoidStatus::Internal;
         };
         let (writer, sealer) = &mut *sending;
-        let Ok(frame) = sealer.seal(frame_audio) else {
+        // In a video call every frame carries the next slice of the video
+        // lane, data or not, so the frame is one size either way.
+        let slice = if media.is_video() {
+            let Ok(mut lane) = media.outgoing_video.lock() else {
+                return VoidStatus::Internal;
+            };
+            lane.set_wants_keyframe(
+                media
+                    .awaiting_keyframe
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            );
+            lane.next_slice()
+        } else {
+            Vec::new()
+        };
+        let Ok(frame) = sealer.seal_av(frame_audio, &slice) else {
             return VoidStatus::BadArgument;
         };
         match writer.send_frame(&frame) {
-            Ok(_sent_or_dropped) => VoidStatus::Ok,
+            Ok(true) => VoidStatus::Ok,
+            Ok(false) => {
+                // Dropped: the circuit is backed up. If it carried video, the
+                // rest of that unit is worthless to the other end.
+                if media.is_video() {
+                    if let Ok(mut lane) = media.outgoing_video.lock() {
+                        lane.note_dropped(&slice);
+                    }
+                }
+                VoidStatus::Ok
+            }
             Err(_) => {
                 media.close();
                 VoidStatus::Offline
@@ -2013,13 +2980,19 @@ pub unsafe extern "C" fn void_call_media_recv(
         let Ok(mut receiving) = media.receiving.lock() else {
             return VoidMediaRecv::Closed;
         };
-        let (reader, opener) = &mut *receiving;
+        let (reader, opener, depacketizer) = &mut *receiving;
         match reader.recv_frame(&media.closed) {
-            Ok(Some(frame)) => match opener.open(&frame) {
-                Ok(audio) if audio.is_empty() => VoidMediaRecv::Silence,
-                Ok(audio) => {
-                    *out_audio = VoidBytes::from_vec(audio);
-                    VoidMediaRecv::Audio
+            Ok(Some(frame)) => match opener.open_av(&frame) {
+                Ok(opened) => {
+                    if media.is_video() {
+                        accept_video(&media, depacketizer, opened.seq, &opened.video);
+                    }
+                    if opened.audio.is_empty() {
+                        VoidMediaRecv::Silence
+                    } else {
+                        *out_audio = VoidBytes::from_vec(opened.audio);
+                        VoidMediaRecv::Audio
+                    }
                 }
                 // A frame that does not authenticate, or a replay: play
                 // nothing, keep listening.
@@ -2033,6 +3006,208 @@ pub unsafe extern "C" fn void_call_media_recv(
         }
     }))
     .unwrap_or(VoidMediaRecv::Closed)
+}
+
+/// Feed one opened frame's video slice to the depacketizer, move any whole
+/// units out to where the platform takes them, and publish what the other end
+/// said.
+fn accept_video(
+    media: &VoidCallMedia,
+    depacketizer: &mut void_proto::video::Depacketizer,
+    seq: u32,
+    slice: &[u8],
+) {
+    use std::sync::atomic::Ordering;
+    depacketizer.push(seq, slice);
+    if depacketizer.take_keyframe_request() {
+        media.peer_wants_keyframe.store(true, Ordering::SeqCst);
+    }
+    media
+        .peer_camera_off
+        .store(depacketizer.peer_camera_off(), Ordering::SeqCst);
+    if let Ok(mut waiting) = media.incoming_video.lock() {
+        while let Some(unit) = depacketizer.take_unit() {
+            waiting.push_back(unit);
+        }
+        if waiting.len() > MAX_WAITING_VIDEO_UNITS {
+            // Nobody is decoding. Throw it all away and start again from a
+            // keyframe rather than hand a decoder a gap later.
+            waiting.clear();
+            depacketizer.restart();
+        }
+    }
+    media
+        .awaiting_keyframe
+        .store(depacketizer.awaiting_keyframe(), Ordering::SeqCst);
+}
+
+/// Hand one encoded video unit to a video call's outgoing lane.
+///
+/// `data` is the platform encoder's output for one frame — H.264 Annex B,
+/// parameter sets in front of every keyframe, by agreement between the
+/// platforms; this crate never parses it. `rotation` is quarter turns
+/// clockwise to display it upright. Returns `Ok` when queued and `Failed`
+/// when dropped — the lane is a second behind, or the unit is too large — in
+/// which case the next unit must be a keyframe, as
+/// [`void_call_video_needs_keyframe`] then says. `BadArgument` in a voice
+/// call.
+///
+/// Call from the encoder's thread; it never waits on the network.
+///
+/// # Safety
+/// `media` must be valid and `data` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn void_call_video_push(
+    media: *const VoidCallMedia,
+    data: *const u8,
+    len: usize,
+    keyframe: bool,
+    rotation: u8,
+    timestamp_ms: u32,
+) -> VoidStatus {
+    if media.is_null() || data.is_null() || len == 0 {
+        return VoidStatus::BadArgument;
+    }
+    guard(|| {
+        let media = retain(media);
+        if !media.is_video() || rotation > 3 {
+            return VoidStatus::BadArgument;
+        }
+        if media.is_closed() {
+            return VoidStatus::Offline;
+        }
+        let unit = void_proto::video::VideoUnit {
+            keyframe,
+            rotation,
+            timestamp_ms,
+            data: std::slice::from_raw_parts(data, len).to_vec(),
+        };
+        let Ok(mut lane) = media.outgoing_video.lock() else {
+            return VoidStatus::Internal;
+        };
+        match lane.push(&unit) {
+            void_proto::video::Push::Queued => VoidStatus::Ok,
+            void_proto::video::Push::Dropped => VoidStatus::Failed,
+        }
+    })
+}
+
+/// Take the next whole video unit the other end sent, if one is waiting.
+/// Never blocks. Units come out in order, and never one whose reference was
+/// lost — after a gap, nothing until the next keyframe.
+///
+/// # Safety
+/// `media` must be valid; the outputs must be valid pointers. Free `out_data`
+/// with [`void_free_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn void_call_video_take(
+    media: *const VoidCallMedia,
+    out_data: *mut VoidBytes,
+    out_keyframe: *mut bool,
+    out_rotation: *mut u8,
+    out_timestamp_ms: *mut u32,
+) -> bool {
+    if media.is_null()
+        || out_data.is_null()
+        || out_keyframe.is_null()
+        || out_rotation.is_null()
+        || out_timestamp_ms.is_null()
+    {
+        return false;
+    }
+    *out_data = VoidBytes::empty();
+    catch_unwind(AssertUnwindSafe(|| {
+        let media = retain(media);
+        let Ok(mut waiting) = media.incoming_video.lock() else {
+            return false;
+        };
+        match waiting.pop_front() {
+            Some(unit) => {
+                *out_keyframe = unit.keyframe;
+                *out_rotation = unit.rotation;
+                *out_timestamp_ms = unit.timestamp_ms;
+                *out_data = VoidBytes::from_vec(unit.data);
+                true
+            }
+            None => false,
+        }
+    }))
+    .unwrap_or(false)
+}
+
+/// Whether the platform's next encoded frame should be a keyframe: something
+/// was dropped, or the other end asked and none is on its way. Ask before each
+/// frame is encoded.
+///
+/// # Safety
+/// `media` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_call_video_needs_keyframe(media: *const VoidCallMedia) -> bool {
+    if media.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let media = retain(media);
+        if !media.is_video() {
+            return false;
+        }
+        let asked = media
+            .peer_wants_keyframe
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        media
+            .outgoing_video
+            .lock()
+            .map(|lane| lane.needs_keyframe(asked))
+            .unwrap_or(false)
+    }))
+    .unwrap_or(false)
+}
+
+/// Tell the other end this end's camera is on or off, so it shows a
+/// placeholder rather than the last picture frozen. Inside the encryption, and
+/// the frames are the same size either way.
+///
+/// # Safety
+/// `media` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_call_video_set_camera(media: *const VoidCallMedia, on: bool) {
+    if media.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let media = retain(media);
+        let lane = media.outgoing_video.lock();
+        if let Ok(mut lane) = lane {
+            lane.set_camera_off(!on);
+        }
+    }));
+}
+
+/// Whether the other end says its camera is off.
+///
+/// # Safety
+/// `media` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn void_call_video_peer_camera_off(media: *const VoidCallMedia) -> bool {
+    if media.is_null() {
+        return false;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        retain(media)
+            .peer_camera_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }))
+    .unwrap_or(false)
+}
+
+/// What the user must also be told before a video call, as UTF-8 bytes. See
+/// `void_proto::call::VIDEO_CALL_DISCLOSURE`.
+///
+/// # Safety
+/// Free the result with [`void_free_bytes`].
+#[no_mangle]
+pub extern "C" fn void_call_video_disclosure() -> VoidBytes {
+    guard_bytes(|| VoidBytes::from_vec(void_proto::call::VIDEO_CALL_DISCLOSURE.as_bytes().to_vec()))
 }
 
 /// Close a call's media connection: a blocked [`void_call_media_recv`] returns
@@ -2101,7 +3276,8 @@ pub extern "C" fn void_call_disclosure() -> VoidBytes {
     guard_bytes(|| VoidBytes::from_vec(void_proto::call::CALL_DISCLOSURE.as_bytes().to_vec()))
 }
 
-/// Place a call to a contact whose onion service is already publishing.
+/// Place a call to a contact whose onion service is already publishing — a
+/// video call if `video`.
 ///
 /// Writes the call id (16 bytes) and media secret (32 bytes) the platform
 /// needs for [`void_call_host_accept`]. `now` is in seconds: the offer carries
@@ -2113,11 +3289,13 @@ pub extern "C" fn void_call_disclosure() -> VoidBytes {
 /// `onion_address` must be NUL-terminated UTF-8, and `out_call_id` /
 /// `out_media_secret` must point to 16 and 32 writable bytes.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn void_engine_place_call(
     engine: *mut VoidEngine,
     fingerprint: *const u8,
     onion_address: *const c_char,
     port: u16,
+    video: bool,
     now: u64,
     out_call_id: *mut u8,
     out_media_secret: *mut u8,
@@ -2142,7 +3320,7 @@ pub unsafe extern "C" fn void_engine_place_call(
         let Ok(mut engine_guard) = (*engine).inner.lock() else {
             return VoidStatus::Internal;
         };
-        match engine_guard.place_call(&fp, address, port, now) {
+        match engine_guard.place_call(&fp, address, port, video, now) {
             Ok(call) => {
                 std::ptr::copy_nonoverlapping(call.call_id.as_ptr(), out_call_id, 16);
                 std::ptr::copy_nonoverlapping(call.media_secret.as_ptr(), out_media_secret, 32);
@@ -2181,7 +3359,8 @@ pub unsafe extern "C" fn void_engine_mark_call_connected(
     })
 }
 
-/// Answer an incoming call, writing back what the media connection needs.
+/// Answer an incoming call, writing back what the media connection needs —
+/// including whether the offer was for a video call.
 ///
 /// # Safety
 /// As [`void_engine_place_call`], plus `out_address` receives the caller's
@@ -2194,6 +3373,7 @@ pub unsafe extern "C" fn void_engine_answer_call(
     out_media_secret: *mut u8,
     out_address: *mut VoidBytes,
     out_port: *mut u16,
+    out_video: *mut bool,
 ) -> VoidStatus {
     if engine.is_null()
         || fingerprint.is_null()
@@ -2201,6 +3381,7 @@ pub unsafe extern "C" fn void_engine_answer_call(
         || out_media_secret.is_null()
         || out_address.is_null()
         || out_port.is_null()
+        || out_video.is_null()
     {
         return VoidStatus::BadArgument;
     }
@@ -2216,6 +3397,7 @@ pub unsafe extern "C" fn void_engine_answer_call(
                 std::ptr::copy_nonoverlapping(call.media_secret.as_ptr(), out_media_secret, 32);
                 *out_address = VoidBytes::from_vec(call.onion_address.as_bytes().to_vec());
                 *out_port = call.port;
+                *out_video = call.video;
                 VoidStatus::Ok
             }
             Err(e) => client_status(e),
@@ -2261,6 +3443,7 @@ pub unsafe extern "C" fn void_engine_end_call(
 ///   u32 LE(address_len)
 ///   raw(address)          empty unless kind == 1
 ///   u16 LE(port)          0 unless kind == 1
+///   u8(flags)             bit 0: a video call (kinds 1 and 2)
 /// ```
 ///
 /// "Missed" is a call that never rang here: it arrived too late to be live,
@@ -2289,13 +3472,15 @@ fn encode_call_events(events: &[void_client::engine::CallEvent]) -> Vec<u8> {
     use void_client::engine::CallEvent;
     let mut out = Vec::new();
     for event in events {
-        let (kind, peer, call_id, reason, address, port): (
+        #[allow(clippy::type_complexity)]
+        let (kind, peer, call_id, reason, address, port, video): (
             u8,
             &[u8; 32],
             &[u8; 16],
             u8,
             &[u8],
             u16,
+            bool,
         ) = match event {
             CallEvent::Incoming(call) => (
                 1,
@@ -2304,8 +3489,9 @@ fn encode_call_events(events: &[void_client::engine::CallEvent]) -> Vec<u8> {
                 0,
                 call.onion_address.as_bytes(),
                 call.port,
+                call.video,
             ),
-            CallEvent::Answered(call) => (2, &call.peer, &call.call_id, 0, &[], 0),
+            CallEvent::Answered(call) => (2, &call.peer, &call.call_id, 0, &[], 0, call.video),
             CallEvent::Ended {
                 contact_fingerprint,
                 call_id,
@@ -2317,11 +3503,12 @@ fn encode_call_events(events: &[void_client::engine::CallEvent]) -> Vec<u8> {
                 VoidCallEndReason::from_proto(*reason),
                 &[],
                 0,
+                false,
             ),
             CallEvent::Missed {
                 contact_fingerprint,
                 call_id,
-            } => (4, contact_fingerprint, call_id, 0, &[], 0),
+            } => (4, contact_fingerprint, call_id, 0, &[], 0, false),
         };
         out.push(kind);
         out.extend_from_slice(peer);
@@ -2330,6 +3517,7 @@ fn encode_call_events(events: &[void_client::engine::CallEvent]) -> Vec<u8> {
         out.extend_from_slice(&(address.len() as u32).to_le_bytes());
         out.extend_from_slice(address);
         out.extend_from_slice(&port.to_le_bytes());
+        out.push(u8::from(video));
     }
     out
 }
@@ -2432,41 +3620,268 @@ mod tests {
 
     #[test]
     fn stored_message_encoding_matches_its_documented_layout() {
+        use void_proto::attachment::{Attachment, AttachmentSecrets};
         use void_store::model::{DeliveryState, Direction, StoredMessage};
-        let encoded = encode_stored_messages(&[
-            StoredMessage {
-                contact_fingerprint: [1u8; 32],
-                direction: Direction::Outgoing,
-                timestamp: 1_700_000_000,
-                body: "sent".to_string(),
-                delivery: DeliveryState::Deposited,
-            },
-            StoredMessage {
-                contact_fingerprint: [1u8; 32],
-                direction: Direction::Incoming,
-                timestamp: 1_700_000_060,
-                body: "got".to_string(),
-                delivery: DeliveryState::Received,
-            },
-        ]);
-        let mut pos = 0;
-        let mut decoded = Vec::new();
-        while pos < encoded.len() {
-            let direction = encoded[pos];
-            let delivery = encoded[pos + 1];
-            let timestamp = u64::from_le_bytes(encoded[pos + 2..pos + 10].try_into().unwrap());
-            let len = u32::from_le_bytes(encoded[pos + 10..pos + 14].try_into().unwrap()) as usize;
-            let text = std::str::from_utf8(&encoded[pos + 14..pos + 14 + len]).unwrap();
-            decoded.push((direction, delivery, timestamp, text.to_string()));
-            pos += 14 + len;
-        }
-        assert_eq!(
-            decoded,
-            vec![
-                (1, 1, 1_700_000_000, "sent".to_string()),
-                (2, 4, 1_700_000_060, "got".to_string()),
-            ]
+        let secrets = AttachmentSecrets::generate().unwrap();
+        let attachment =
+            Attachment::new(&secrets, 4321, "a.png", "image/png", 640, 480, "cap").unwrap();
+        let blob = attachment.blob_id();
+        let encoded = encode_stored_messages(
+            &[
+                (
+                    11,
+                    StoredMessage {
+                        contact_fingerprint: [1u8; 32],
+                        direction: Direction::Outgoing,
+                        timestamp: 1_700_000_000,
+                        body: "sent".to_string(),
+                        delivery: DeliveryState::Deposited,
+                        attachment: None,
+                    },
+                ),
+                (
+                    12,
+                    StoredMessage {
+                        contact_fingerprint: [1u8; 32],
+                        direction: Direction::Incoming,
+                        timestamp: 1_700_000_060,
+                        body: "cap".to_string(),
+                        delivery: DeliveryState::Received,
+                        attachment: Some(attachment),
+                    },
+                ),
+            ],
+            |id| *id == blob,
         );
+        // Decode it the way Swift and Kotlin do.
+        let mut pos = 0;
+        let mut take = |n: usize| {
+            let out = encoded[pos..pos + n].to_vec();
+            pos += n;
+            out
+        };
+        let mut decoded = Vec::new();
+        for _ in 0..2 {
+            let id = u64::from_le_bytes(take(8).try_into().unwrap());
+            let direction = take(1)[0];
+            let delivery = take(1)[0];
+            let timestamp = u64::from_le_bytes(take(8).try_into().unwrap());
+            let len = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+            let text = String::from_utf8(take(len)).unwrap();
+            let kind = take(1)[0];
+            let mut file = None;
+            if kind == 1 {
+                let file_id = take(16);
+                let size = u64::from_le_bytes(take(8).try_into().unwrap());
+                let width = u16::from_le_bytes(take(2).try_into().unwrap());
+                let height = u16::from_le_bytes(take(2).try_into().unwrap());
+                let name_len = u16::from_le_bytes(take(2).try_into().unwrap()) as usize;
+                let name = String::from_utf8(take(name_len)).unwrap();
+                let mime_len = u16::from_le_bytes(take(2).try_into().unwrap()) as usize;
+                let mime = String::from_utf8(take(mime_len)).unwrap();
+                let local = take(1)[0];
+                file = Some((file_id, size, width, height, name, mime, local));
+            }
+            decoded.push((id, direction, delivery, timestamp, text, kind, file));
+        }
+        assert_eq!(pos, encoded.len(), "nothing left over");
+        assert_eq!(
+            decoded[0],
+            (11, 1, 1, 1_700_000_000, "sent".to_string(), 0, None)
+        );
+        assert_eq!(
+            decoded[1],
+            (
+                12,
+                2,
+                4,
+                1_700_000_060,
+                "cap".to_string(),
+                1,
+                Some((
+                    blob.to_vec(),
+                    4321,
+                    640,
+                    480,
+                    "a.png".to_string(),
+                    "image/png".to_string(),
+                    1
+                ))
+            )
+        );
+    }
+
+    /// A data directory with a file to send in it.
+    fn file_to_send(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::ffi::CString {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::ffi::CString::new(path.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_prepared_attachment_is_sealed_on_disk_and_opens_again() {
+        let dir = temp_data_dir("attachment-roundtrip");
+        let file: Vec<u8> = (0..20_000u32).map(|i| (i * 7 % 256) as u8).collect();
+        unsafe {
+            let (status, engine) = open(&dir, &[5u8; 32]);
+            assert_eq!(status, VoidStatus::Ok);
+            let source = file_to_send(&dir.join("outbox"), "report.pdf", &file);
+            let mut handle: *mut VoidAttachment = std::ptr::null_mut();
+            assert_eq!(
+                void_engine_prepare_attachment(
+                    engine,
+                    source.as_ptr(),
+                    b"../report.pdf".as_ptr(),
+                    13,
+                    b"application/pdf".as_ptr(),
+                    15,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    &mut handle,
+                ),
+                VoidStatus::Ok
+            );
+            let mut id = [0u8; 16];
+            assert_eq!(void_attachment_id(handle, id.as_mut_ptr()), VoidStatus::Ok);
+            assert_eq!(
+                (*handle).attachment.name,
+                "report.pdf",
+                "the path was stripped"
+            );
+
+            // What is on disk is sealed: the file's bytes appear nowhere in it.
+            let sealed = std::fs::read(sealed_copy_path(&dir.join(ATTACHMENTS_DIR), &id)).unwrap();
+            assert_eq!(
+                sealed.len(),
+                (*handle).attachment.data_chunks() as usize
+                    * void_proto::attachment::SEALED_CHUNK_LEN
+            );
+            assert!(!sealed.windows(64).any(|w| w == &file[1000..1064]));
+            assert!((*handle).has_whole_copy());
+
+            // Until it is sent, no message points at it, so nothing opens it.
+            let mut out = VoidBytes::empty();
+            assert_eq!(
+                void_engine_attachment_read(engine, id.as_ptr(), &mut out),
+                VoidStatus::Failed
+            );
+            void_attachment_free(handle);
+            void_engine_free(engine);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_attachment_too_large_to_send_is_refused_before_anything_is_written() {
+        let dir = temp_data_dir("attachment-too-large");
+        unsafe {
+            let (_, engine) = open(&dir, &[6u8; 32]);
+            let path = dir.join("huge.bin");
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(void_attachment_max_bytes() + 1).unwrap();
+            let source = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut handle: *mut VoidAttachment = std::ptr::null_mut();
+            assert_eq!(
+                void_engine_prepare_attachment(
+                    engine,
+                    source.as_ptr(),
+                    b"huge.bin".as_ptr(),
+                    8,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    &mut handle,
+                ),
+                VoidStatus::TooLarge
+            );
+            assert!(handle.is_null());
+            let entries = std::fs::read_dir(dir.join(ATTACHMENTS_DIR))
+                .unwrap()
+                .count();
+            assert_eq!(entries, 0);
+            void_engine_free(engine);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hex_ids_roundtrip_and_strangers_are_ignored() {
+        let id = [0xABu8; 16];
+        assert_eq!(parse_hex_id(&hex_id(&id)), Some(id));
+        assert_eq!(parse_hex_id("not hex at all, not even close!!"), None);
+        assert_eq!(parse_hex_id("abcd"), None);
+    }
+
+    #[test]
+    fn duress_removes_every_sealed_attachment_too() {
+        let dir = temp_data_dir("attachment-duress");
+        unsafe {
+            let (_, engine) = open(&dir, &[7u8; 32]);
+            let source = file_to_send(&dir.join("outbox"), "a.txt", b"secret plans");
+            let mut handle: *mut VoidAttachment = std::ptr::null_mut();
+            assert_eq!(
+                void_engine_prepare_attachment(
+                    engine,
+                    source.as_ptr(),
+                    b"a.txt".as_ptr(),
+                    5,
+                    b"text/plain".as_ptr(),
+                    10,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    &mut handle,
+                ),
+                VoidStatus::Ok
+            );
+            void_attachment_free(handle);
+            assert_eq!(
+                std::fs::read_dir(dir.join(ATTACHMENTS_DIR))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            assert_eq!(void_engine_duress_destroy(engine), VoidStatus::Ok);
+            assert!(!dir.join(ATTACHMENTS_DIR).exists());
+            void_engine_free(engine);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn video_entry_points_refuse_null_and_voice_calls() {
+        unsafe {
+            let mut out = VoidBytes::empty();
+            let (mut keyframe, mut rotation, mut ts) = (false, 0u8, 0u32);
+            assert!(!void_call_video_take(
+                std::ptr::null(),
+                &mut out,
+                &mut keyframe,
+                &mut rotation,
+                &mut ts
+            ));
+            assert_eq!(
+                void_call_video_push(std::ptr::null(), [1u8].as_ptr(), 1, true, 0, 0),
+                VoidStatus::BadArgument
+            );
+            assert!(!void_call_video_needs_keyframe(std::ptr::null()));
+            assert!(!void_call_video_peer_camera_off(std::ptr::null()));
+            void_call_video_set_camera(std::ptr::null(), false);
+            let text = void_call_video_disclosure();
+            assert!(
+                std::str::from_utf8(std::slice::from_raw_parts(text.data, text.len))
+                    .unwrap()
+                    .contains("bigger stream")
+            );
+            void_free_bytes(text);
+        }
     }
 
     #[test]
@@ -2625,10 +4040,12 @@ mod tests {
         let a = void_client::engine::ReceivedMessage {
             contact_fingerprint: [7u8; 32],
             text: "hello".to_string(),
+            attachment: None,
         };
         let b = void_client::engine::ReceivedMessage {
             contact_fingerprint: [9u8; 32],
             text: "".to_string(),
+            attachment: None,
         };
         let encoded = encode_received_messages(&[a, b]);
 
@@ -2749,12 +4166,8 @@ mod tests {
             0,
         )
         .unwrap();
-        let alice: *mut VoidEngine = Box::into_raw(Box::new(VoidEngine {
-            inner: Mutex::new(alice_engine),
-        }));
-        let bob: *mut VoidEngine = Box::into_raw(Box::new(VoidEngine {
-            inner: Mutex::new(bob_engine),
-        }));
+        let alice: *mut VoidEngine = Box::into_raw(Box::new(VoidEngine::new(alice_engine, None)));
+        let bob: *mut VoidEngine = Box::into_raw(Box::new(VoidEngine::new(bob_engine, None)));
 
         unsafe {
             let now_secs = 1_000_000u64;
@@ -2900,6 +4313,305 @@ mod tests {
         }
     }
 
+    /// One end of an in-memory duplex byte stream, for running the relay
+    /// protocol without a socket.
+    struct Pipe {
+        rx: std::sync::mpsc::Receiver<Vec<u8>>,
+        tx: std::sync::mpsc::Sender<Vec<u8>>,
+        pending: Vec<u8>,
+    }
+
+    impl std::io::Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.is_empty() {
+                match self.rx.recv() {
+                    Ok(bytes) => self.pending = bytes,
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = buf.len().min(self.pending.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl std::io::Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.tx
+                .send(buf.to_vec())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A connection to `relay` served on its own thread, as an isolated
+    /// circuit would be.
+    fn relay_stream(relay: &std::sync::Arc<void_relay::server::Relay>) -> Pipe {
+        let (a_tx, b_rx) = std::sync::mpsc::channel();
+        let (b_tx, a_rx) = std::sync::mpsc::channel();
+        let mut server = Pipe {
+            rx: b_rx,
+            tx: b_tx,
+            pending: Vec::new(),
+        };
+        let relay = std::sync::Arc::clone(relay);
+        std::thread::spawn(move || {
+            let _ = void_relay::server::serve_stream(&relay, &mut server);
+        });
+        Pipe {
+            rx: a_rx,
+            tx: a_tx,
+            pending: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_file_crosses_the_boundary_end_to_end() {
+        // Two persisted engines and one relay. The file is sealed, uploaded,
+        // pointed at through the ratchet, fetched, checked, opened and
+        // exported — through the same functions the apps call, with only the
+        // Tor circuit replaced by an in-memory stream to the relay.
+        use std::sync::{Arc, Mutex};
+        use void_client::engine::{Engine, SecurityMode};
+        use void_client::transport::MemoryTransport;
+        use void_relay::server::{NoPush, Relay};
+        use void_relay::store::Config;
+        use void_store::db::{Database, FileBackend};
+
+        let relay = Arc::new(Relay::new(Config::default(), Box::new(NoPush)));
+        let clock = Arc::new(Mutex::new(1_000_000u64));
+        let alice_dir = temp_data_dir("file-e2e-alice");
+        let bob_dir = temp_data_dir("file-e2e-bob");
+        let persisted = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let vault = void_store::vault::SoftwareVault::from_raw([9u8; 32]);
+            let db = Database::create(
+                FileBackend::new(dir.join(DATABASE_FILE)),
+                &vault,
+                void_crypto::argon2::Params::TEST_ONLY_WEAK,
+            )
+            .unwrap();
+            let (identity, seeds) = Identity::generate_with_seeds().unwrap();
+            let engine = Engine::new_persisted(
+                identity,
+                &seeds,
+                Settings::default(),
+                Box::new(MemoryTransport::new(Arc::clone(&relay), Arc::clone(&clock))),
+                SecurityMode::InsecureForTesting,
+                0,
+                Box::new(db),
+            )
+            .unwrap();
+            Box::into_raw(Box::new(VoidEngine::new(
+                engine,
+                Some(dir.join(ATTACHMENTS_DIR)),
+            )))
+        };
+        let alice = persisted(&alice_dir);
+        let bob = persisted(&bob_dir);
+
+        unsafe {
+            // Connect them, the short way void-client's own tests do.
+            let (bundle, bob_queue) = (*bob).inner.lock().unwrap().create_bundle(b"r").unwrap();
+            let bob_fp = (*alice)
+                .inner
+                .lock()
+                .unwrap()
+                .start_conversation(&bundle, "Bob", "hi", 1_000_000)
+                .unwrap();
+            let mut t_ms = 1_000_000_000u64;
+            let tick = |engine: *mut VoidEngine, t: u64| {
+                let mut outcome = VoidTickOutcome::Waiting;
+                let mut msgs = VoidBytes::empty();
+                assert_eq!(
+                    void_engine_tick(engine, t, &mut outcome, &mut msgs),
+                    VoidStatus::Ok
+                );
+                void_free_bytes(msgs);
+                outcome
+            };
+            for _ in 0..40 {
+                tick(alice, t_ms);
+                t_ms += 5000;
+            }
+            let initial = {
+                use void_relay::protocol::{Delivery, Frame, FrameType, Retrieve};
+                let mut reassembler = void_proto::record::Reassembler::new(4);
+                let mut payload = None;
+                for _ in 0..64 {
+                    let ch = relay
+                        .handle(
+                            &Frame::new(FrameType::Challenge, bob_queue.queue_id().to_vec()),
+                            0,
+                        )
+                        .unwrap();
+                    let mut challenge = [0u8; 32];
+                    challenge.copy_from_slice(&ch.body);
+                    let resp = relay
+                        .handle(
+                            &Frame::new(
+                                FrameType::Retrieve,
+                                Retrieve {
+                                    queue_id: bob_queue.queue_id(),
+                                    challenge,
+                                    retrieval_public: bob_queue.retrieval_public(),
+                                    proof: bob_queue.prove_retrieval(&challenge),
+                                }
+                                .encode(),
+                            ),
+                            0,
+                        )
+                        .unwrap();
+                    let d = Delivery::decode(&resp.body).unwrap();
+                    if d.sealed.is_empty() {
+                        break;
+                    }
+                    let rec = void_proto::envelope::open(
+                        &bob_queue.deposit_key(),
+                        &void_proto::envelope::Deposit {
+                            queue_id: bob_queue.queue_id(),
+                            sealed: d.sealed,
+                        },
+                    )
+                    .unwrap();
+                    if let Ok(Some(p)) = reassembler.push(&rec) {
+                        payload = Some(p);
+                        break;
+                    }
+                }
+                payload.unwrap()
+            };
+            let (alice_fp, _) = (*bob)
+                .inner
+                .lock()
+                .unwrap()
+                .accept_conversation(bundle.queue.queue_id, &initial, 1_000_000)
+                .unwrap();
+
+            // Alice seals and uploads a file of several windows' worth.
+            let file: Vec<u8> = (0..300_000u32)
+                .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+                .collect();
+            let source = file_to_send(&alice_dir.join("outbox"), "big.bin", &file);
+            let mut sending: *mut VoidAttachment = std::ptr::null_mut();
+            assert_eq!(
+                void_engine_prepare_attachment(
+                    alice,
+                    source.as_ptr(),
+                    b"big.bin".as_ptr(),
+                    7,
+                    b"application/octet-stream".as_ptr(),
+                    24,
+                    0,
+                    0,
+                    b"the data".as_ptr(),
+                    8,
+                    &mut sending,
+                ),
+                VoidStatus::Ok
+            );
+            let mut id = [0u8; 16];
+            void_attachment_id(sending, id.as_mut_ptr());
+            let mut up = relay_stream(&relay);
+            assert_eq!(upload_attachment(&mut up, &*sending), VoidStatus::Ok);
+            let (mut done, mut total) = (0u32, 0u32);
+            void_attachment_progress(sending, &mut done, &mut total);
+            assert_eq!(done, total);
+            assert!(
+                total >= (*sending).attachment.data_chunks(),
+                "padding went up too"
+            );
+            let mut message_id = 0u64;
+            assert_eq!(
+                void_engine_send_attachment(
+                    alice,
+                    bob_fp.as_ptr(),
+                    sending,
+                    t_ms / 1000,
+                    &mut message_id
+                ),
+                VoidStatus::Ok
+            );
+            void_attachment_free(sending);
+
+            // The sender's history shows it, and the sealed copy is local.
+            let history = void_engine_messages(alice, bob_fp.as_ptr());
+            let bytes = std::slice::from_raw_parts(history.data, history.len).to_vec();
+            void_free_bytes(history);
+            assert!(bytes.windows(16).any(|w| w == id));
+            assert_eq!(*bytes.last().unwrap(), 1, "alice holds her own sealed copy");
+
+            // The pointer travels; Bob's history shows a file not yet here.
+            for _ in 0..60 {
+                tick(alice, t_ms);
+                tick(bob, t_ms);
+                t_ms += 5000;
+            }
+            let history = void_engine_messages(bob, alice_fp.as_ptr());
+            let bytes = std::slice::from_raw_parts(history.data, history.len).to_vec();
+            void_free_bytes(history);
+            assert!(bytes.windows(16).any(|w| w == id), "bob has the pointer");
+            assert_eq!(*bytes.last().unwrap(), 0, "but not the file yet");
+            let mut out = VoidBytes::empty();
+            assert_eq!(
+                void_engine_attachment_read(bob, id.as_ptr(), &mut out),
+                VoidStatus::Failed
+            );
+
+            // Bob fetches it, every chunk checked, and the relay forgets it.
+            let mut fetching: *mut VoidAttachment = std::ptr::null_mut();
+            assert_eq!(
+                void_engine_attachment_open(bob, id.as_ptr(), &mut fetching),
+                VoidStatus::Ok
+            );
+            assert!((*fetching).incoming);
+            let mut down = relay_stream(&relay);
+            assert_eq!(download_attachment(&mut down, &*fetching), VoidStatus::Ok);
+            void_attachment_free(fetching);
+            assert_eq!(
+                relay.metrics().unwrap().blobs,
+                0,
+                "deleted from the relay once fetched"
+            );
+
+            let mut out = VoidBytes::empty();
+            assert_eq!(
+                void_engine_attachment_read(bob, id.as_ptr(), &mut out),
+                VoidStatus::Ok
+            );
+            assert_eq!(std::slice::from_raw_parts(out.data, out.len), &file[..]);
+            void_free_bytes(out);
+
+            let dest = bob_dir.join("exported.bin");
+            let dest_c = std::ffi::CString::new(dest.to_str().unwrap()).unwrap();
+            assert_eq!(
+                void_engine_attachment_export(bob, id.as_ptr(), dest_c.as_ptr()),
+                VoidStatus::Ok
+            );
+            assert_eq!(std::fs::read(&dest).unwrap(), file);
+
+            // A tampered sealed copy is refused, never shown.
+            let path = sealed_copy_path(&bob_dir.join(ATTACHMENTS_DIR), &id);
+            let mut sealed = std::fs::read(&path).unwrap();
+            sealed[5000] ^= 1;
+            std::fs::write(&path, &sealed).unwrap();
+            let mut out = VoidBytes::empty();
+            assert_eq!(
+                void_engine_attachment_read(bob, id.as_ptr(), &mut out),
+                VoidStatus::Failed
+            );
+
+            void_engine_free(alice);
+            void_engine_free(bob);
+        }
+        let _ = std::fs::remove_dir_all(&alice_dir);
+        let _ = std::fs::remove_dir_all(&bob_dir);
+    }
+
     #[test]
     fn an_invitations_status_and_link_cross_the_boundary() {
         let relay = b"relay.onion:9443";
@@ -2979,6 +4691,7 @@ mod tests {
                     std::ptr::null_mut(),
                     [0u8; 32].as_ptr(),
                     [0u8; 16].as_ptr(),
+                    false,
                     &mut media
                 ),
                 VoidStatus::BadArgument
@@ -3090,18 +4803,43 @@ mod tests {
                 reason: void_proto::call::EndReason::Busy,
             },
         ]);
-        // Every event without an address is exactly the fixed 56 bytes Swift
+        // Every event without an address is exactly the fixed 57 bytes Swift
         // and Kotlin parse: kind, fingerprint, call id, reason, u32 address
-        // length, u16 port.
-        assert_eq!(encoded.len(), 2 * 56);
-        let (missed, ended) = encoded.split_at(56);
+        // length, u16 port, flags.
+        assert_eq!(encoded.len(), 2 * 57);
+        let (missed, ended) = encoded.split_at(57);
         assert_eq!(missed[0], 4);
         assert_eq!(&missed[1..33], &[7u8; 32]);
         assert_eq!(&missed[33..49], &[9u8; 16]);
         assert_eq!(missed[49], 0);
         assert_eq!(ended[0], 3);
         assert_eq!(ended[49], 5, "busy");
-        assert_eq!(&ended[50..56], &[0u8; 6]);
+        assert_eq!(&ended[50..57], &[0u8; 7]);
+    }
+
+    #[test]
+    fn a_video_call_says_so_in_its_events() {
+        use void_client::engine::{ActiveCall, CallEvent};
+        let call = ActiveCall {
+            call_id: [3u8; 16],
+            media_secret: [4u8; 32],
+            role: void_proto::call::Role::Callee,
+            peer: [5u8; 32],
+            onion_address: String::from("abc.onion"),
+            port: 9999,
+            video: true,
+            answered: false,
+            started_at: 0,
+        };
+        let encoded = encode_call_events(&[CallEvent::Incoming(call)]);
+        // kind, fingerprint, id, reason, address length, address, port, flags.
+        assert_eq!(encoded.len(), 1 + 32 + 16 + 1 + 4 + 9 + 2 + 1);
+        assert_eq!(encoded[0], 1);
+        assert_eq!(*encoded.last().unwrap(), 1, "bit 0: video");
+        assert!(
+            !encoded.windows(32).any(|w| w == [4u8; 32]),
+            "the media secret never rides an event"
+        );
     }
 
     #[test]

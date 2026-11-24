@@ -118,6 +118,8 @@ enum VoidError: Error, LocalizedError, Equatable {
     case alreadyConnected
     case ownInvite
     case wrongRelay
+    case tooLarge
+    case cancelled
 
     init(_ status: VoidStatus) {
         switch status.rawValue {
@@ -130,6 +132,8 @@ enum VoidError: Error, LocalizedError, Equatable {
         case 8: self = .alreadyConnected
         case 9: self = .ownInvite
         case 10: self = .wrongRelay
+        case 11: self = .tooLarge
+        case 12: self = .cancelled
         default: self = .failed
         }
     }
@@ -155,6 +159,12 @@ enum VoidError: Error, LocalizedError, Equatable {
         case .wrongRelay:
             return "This invitation uses a different Void server from this app, so it can't be "
                 + "opened here."
+        case .tooLarge:
+            let limit = ByteCountFormatter.string(
+                fromByteCount: Int64(VoidCore.maxAttachmentBytes), countStyle: .file)
+            return "That file is too big to send. Void sends files up to \(limit)."
+        case .cancelled:
+            return "Cancelled."
         case .badArgument, .failed, .internalError:
             return "Something went wrong. Nothing was sent."
         }
@@ -570,21 +580,49 @@ final class VoidCore: @unchecked Sendable {
         let bytes = fingerprint.withUnsafeBytes {
             void_engine_messages(handle, $0.bindMemory(to: UInt8.self).baseAddress)
         }
-        var reader = ByteReader(CoreBuffer(bytes).array)
+        return Self.parseMessages(CoreBuffer(bytes).array)
+    }
+
+    /// Parse `void_engine_messages`'s layout. Stops at the first thing that
+    /// does not parse rather than trapping: dropping a tail is safe.
+    static func parseMessages(_ bytes: [UInt8]) -> [StoredMessage] {
+        var reader = ByteReader(bytes)
         var out: [StoredMessage] = []
         while !reader.isAtEnd {
-            guard let direction = reader.u8(),
+            guard let id = reader.u64(),
+                let direction = reader.u8(),
                 let delivery = reader.u8(),
                 let timestamp = reader.u64(),
                 let length = reader.u32(),
-                let text = reader.string(Int(length))
+                let text = reader.string(Int(length)),
+                let kind = reader.u8()
             else { break }
+            var attachment: AttachmentInfo?
+            if kind == 1 {
+                guard let fileId = reader.data(16),
+                    let size = reader.u64(),
+                    let width = reader.u16(),
+                    let height = reader.u16(),
+                    let nameLength = reader.u16(),
+                    let name = reader.string(Int(nameLength)),
+                    let mimeLength = reader.u16(),
+                    let mime = reader.string(Int(mimeLength)),
+                    let local = reader.u8()
+                else { break }
+                attachment = AttachmentInfo(
+                    id: fileId, size: size, width: Int(width), height: Int(height),
+                    name: name, mime: mime, isLocal: local == 1)
+            } else if kind != 0 {
+                break
+            }
             out.append(
                 StoredMessage(
+                    id: id,
                     isOutgoing: direction == 1,
                     delivery: DeliveryState(code: delivery),
                     timestamp: Date(timeIntervalSince1970: TimeInterval(timestamp)),
-                    text: text
+                    text: text,
+                    attachment: attachment
                 )
             )
         }
@@ -698,10 +736,15 @@ enum InviteFailure: Equatable {
 
 /// One message from the stored history.
 struct StoredMessage: Equatable {
+    /// The engine's record id: stable for the message's life.
+    let id: UInt64
     let isOutgoing: Bool
     let delivery: DeliveryState
     let timestamp: Date
+    /// The message, or a file's caption.
     let text: String
+    /// The file it carries, if it carries one.
+    let attachment: AttachmentInfo?
 }
 
 // MARK: - Trust state

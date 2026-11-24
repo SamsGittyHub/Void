@@ -13,6 +13,7 @@ struct VoidApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(box: appState)
+                .tint(Theme.accent)
                 // FR-STOR-06: the app switcher's snapshot is a screenshot
                 // iOS takes and caches to disk. Covering the content
                 // whenever the scene is not `.active` — not just
@@ -28,10 +29,8 @@ private extension View {
         overlay {
             if isCovered {
                 ZStack {
-                    Color(.systemBackground).ignoresSafeArea()
-                    Image(systemName: "lock.shield.fill")
-                        .font(.system(size: 44))
-                        .foregroundStyle(.secondary)
+                    Theme.callBackground.ignoresSafeArea()
+                    VoidMark(size: 84)
                 }
                 .transition(.opacity)
             }
@@ -105,22 +104,30 @@ private struct RootView: View {
         case .ready(let state):
             MainView().environmentObject(state)
         case .unlocking:
-            VStack(spacing: 12) {
-                ProgressView()
-                Text("Unlocking…")
-                    .foregroundStyle(.secondary)
+            ZStack {
+                Theme.callBackground.ignoresSafeArea()
+                VStack(spacing: 22) {
+                    VoidMark(size: 96)
+                    ProgressView().tint(.white)
+                    Text("Unlocking…")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
             }
         case .locked(let message):
-            VStack(spacing: 16) {
-                Image(systemName: "lock.fill")
-                    .font(.largeTitle)
-                    .foregroundStyle(.secondary)
-                Text(message)
-                    .multilineTextAlignment(.center)
-                Button("Unlock") { box.unlock() }
-                    .buttonStyle(.borderedProminent)
+            ZStack {
+                Theme.callBackground.ignoresSafeArea()
+                VStack(spacing: 20) {
+                    VoidMark(size: 96)
+                    Text(message)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                    Button("Unlock") { box.unlock() }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .frame(maxWidth: 220)
+                }
+                .padding(32)
             }
-            .padding(32)
         case .failed(let message):
             VStack(spacing: 12) {
                 Image(systemName: "exclamationmark.triangle.fill")
@@ -148,28 +155,13 @@ private struct MainView: View {
             }
         } else {
             TabView {
-                ConversationListView(
-                    conversations: $state.conversations,
-                    messagesByFingerprint: $state.messagesByFingerprint,
-                    isOffline: state.isOffline,
-                    myWords: state.fingerprintWords,
-                    onNewContact: { state.showingNewContact = true },
-                    onSend: { fingerprint, text in state.send(to: fingerprint, text: text) },
-                    onVerificationResult: { fingerprint, matched in
-                        state.handleVerificationResult(fingerprint: fingerprint, matched: matched)
-                    },
-                    onAcknowledgeKeyChange: { state.acknowledgeKeyChange(fingerprint: $0) },
-                    onRename: { fingerprint, name in state.renameContact(fingerprint, to: name) },
-                    onCall: { state.requestCall(to: $0) },
-                    onOpen: { state.openConversation($0) },
-                    onClose: { state.closeConversation($0) }
-                )
-                .tabItem { Label("Conversations", systemImage: "bubble.left.and.bubble.right") }
+                ConversationListView()
+                    .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
 
                 NavigationStack {
-                    KeyStorageView(backing: state.backing)
+                    SecurityHomeView()
                 }
-                .tabItem { Label("Security", systemImage: "lock.shield") }
+                .tabItem { Label("Security", systemImage: "lock.shield.fill") }
             }
             .overlay(alignment: .top) {
                 NoticeBanner(text: state.notice) { state.notice = nil }
@@ -222,6 +214,7 @@ private struct CallContainer: View {
                 CallDisclosureView(
                     contactName: disclosureName(pending.fingerprint),
                     isAnswering: pending.isAnswering,
+                    isVideo: pending.isVideo,
                     onContinue: { state.confirmDisclosure() },
                     onCancel: { state.cancelDisclosure() }
                 )
@@ -229,20 +222,23 @@ private struct CallContainer: View {
                 if call.phase == .incoming {
                     IncomingCallView(
                         contactName: name(call.fingerprint),
+                        fingerprint: call.fingerprint,
+                        isVideo: call.video,
                         isVerified: trust(call.fingerprint) == .verified,
                         onAnswer: { state.requestAnswer() },
                         onDecline: { state.hangUp() }
                     )
                 } else {
                     CallView(
+                        call: call,
                         contactName: name(call.fingerprint),
-                        phase: call.phase,
                         isMuted: $state.isMuted,
                         onHangUp: { state.hangUp() }
                     )
                 }
             }
         }
+        .animation(.easeInOut(duration: 0.25), value: state.activeCall?.phase)
     }
 
     private func disclosureName(_ fingerprint: Data) -> String {
@@ -268,20 +264,27 @@ private struct NoticeBanner: View {
     var body: some View {
         Group {
             if let text {
-                Text(text)
-                    .font(.subheadline)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(.thinMaterial, in: Capsule())
-                    .padding(.top, 8)
-                    .padding(.horizontal, 16)
-                    .onTapGesture(perform: onDismiss)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .accessibilityAddTraits(.isStaticText)
+                HStack(spacing: 10) {
+                    Image(systemName: "bell.fill")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.accent)
+                    Text(text)
+                        .font(.subheadline.weight(.medium))
+                        .multilineTextAlignment(.leading)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 11)
+                .background(.regularMaterial, in: Capsule())
+                .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
+                .padding(.top, 8)
+                .padding(.horizontal, 16)
+                .onTapGesture(perform: onDismiss)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .accessibilityAddTraits(.isStaticText)
+                .accessibilityIdentifier("noticeBanner")
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: text)
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: text)
     }
 }
 
@@ -346,19 +349,46 @@ private struct NewContactView: View {
     @ViewBuilder private var showCode: some View {
         if let invite = state.shownInvite {
             Section {
-                QRCodeImage(content: invite.link)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 240)
-                    .accessibilityIdentifier("inviteQRCode")
-                Text(status(of: invite))
-                    .font(.subheadline)
-                    .foregroundStyle(invite.joinedName == nil ? .secondary : .primary)
-                ShareLink(item: invite.link) {
-                    Label("Share link", systemImage: "square.and.arrow.up")
+                VStack(spacing: 16) {
+                    QRCodeImage(content: invite.link)
+                        .padding(14)
+                        .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(.white))
+                        .frame(width: 250, height: 250)
+                        .shadow(color: Theme.accent.opacity(0.25), radius: 18, y: 8)
+                        .accessibilityIdentifier("inviteQRCode")
+                    HStack(spacing: 8) {
+                        if invite.joinedName != nil {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.verified)
+                        } else if invite.uploadRemaining != 0 && !invite.expired {
+                            ProgressView().controlSize(.small)
+                        } else if !invite.expired {
+                            Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(Theme.accent)
+                        }
+                        Text(status(of: invite))
+                            .font(.subheadline)
+                            .foregroundStyle(invite.joinedName == nil ? .secondary : .primary)
+                            .multilineTextAlignment(.center)
+                            .accessibilityIdentifier("inviteStatus")
+                    }
+                    HStack(spacing: 10) {
+                        ShareLink(item: invite.link) {
+                            Label("Share link", systemImage: "square.and.arrow.up")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button {
+                            UIPasteboard.general.string = invite.link
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .controlSize(.large)
                 }
-                Button("Copy link") {
-                    UIPasteboard.general.string = invite.link
-                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .listRowBackground(Color.clear)
             } footer: {
                 Text("One code is for one person, and it works for 24 hours. Anyone who has it can use it, so send the link only to them.")
             }
@@ -394,9 +424,14 @@ private struct NewContactView: View {
             }
 
             Section {
-                Button("Create a code") {
+                Button {
                     state.createInvite(for: contactLabel)
+                } label: {
+                    Label("Create a code", systemImage: "qrcode")
                 }
+                .buttonStyle(PrimaryButtonStyle())
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
                 .accessibilityIdentifier("createInviteButton")
             }
         }
@@ -453,10 +488,17 @@ private struct NewContactView: View {
                     )
                 }
                 Section {
-                    Button("Connect") {
+                    Button {
                         state.confirmOpenedInvite(name: confirmName, firstMessage: confirmMessage)
+                    } label: {
+                        Label("Connect", systemImage: "person.crop.circle.badge.plus")
                     }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
                     .accessibilityIdentifier("confirmInviteButton")
+                }
+                Section {
                     Button("Cancel", role: .cancel) {
                         confirmName = ""
                         confirmMessage = ""
@@ -478,16 +520,22 @@ private struct NewContactView: View {
                 } label: {
                     Label("Scan their code", systemImage: "qrcode.viewfinder")
                 }
+                .buttonStyle(PrimaryButtonStyle())
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
             }
             Section {
                 TextField("void://…", text: $pastedLink)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .font(.callout.monospaced())
+                    .accessibilityIdentifier("pasteLinkField")
                 Button("Open") {
                     state.openInvite(pastedLink)
                     pastedLink = ""
                 }
                 .disabled(pastedLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityIdentifier("openLinkButton")
             } header: {
                 Text("Or paste their link")
             }

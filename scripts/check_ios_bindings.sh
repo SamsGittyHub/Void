@@ -2,16 +2,18 @@
 # Checks the iOS app's Swift against the real Rust core — on Linux, without
 # Apple's SDKs (D-029). What that can and cannot cover:
 #
-#   1. VoidCore.swift, VoidCall.swift, CoreQueue.swift and RelayConfig.swift —
-#      the Swift that calls the core — type-check against the header cbindgen
+#   1. VoidCore.swift, VoidCall.swift, VoidAttachment.swift, CoreQueue.swift and
+#      RelayConfig.swift — the Swift that calls the core — type-check against the header cbindgen
 #      generates from the current source, which is the header the app builds
 #      against. A wrong argument type or order fails here.
 #   2. The same files are compiled with tools/app-bindings/swift/BindingsCheck.swift
 #      and run against libvoid_ffi.so: engines, invitations, error mapping, the
 #      milliseconds guard, persistence with the right key and a wrong one.
 #   3. AppState.swift and CallAudio.swift type-check against minimal stand-ins
-#      for Combine and AVFoundation (tools/app-bindings/swift/stubs). That checks
-#      their logic, not their use of the SDKs.
+#      for Combine and AVFoundation (tools/app-bindings/swift/stubs), and
+#      AppState against CallVideo's interface (CallVideo.swift needs
+#      VideoToolbox and UIKit). That checks their logic, not their use of the
+#      SDKs.
 #   4. Every Swift file in the app and its tests parses.
 #
 # Not covered: SwiftUI, AVFoundation, Security, or anything else that needs an
@@ -36,10 +38,10 @@ cbindgen --quiet --crate void-ffi --config crates/void-ffi/cbindgen.toml --outpu
 printf 'module VoidFFI {\n    header "VoidFFI.h"\n    export *\n}\n' > "$WORK/ffi/module.modulemap"
 
 # The app reaches the header through a bridging header; here it is a module.
-for f in VoidCore RelayConfig CoreQueue VoidCall Models AppDirectories AppState CallAudio; do
+for f in VoidCore RelayConfig CoreQueue VoidCall VoidAttachment Models AppDirectories AppState CallAudio; do
   { echo "import VoidFFI"; cat "ios/Void/$f.swift"; } > "$WORK/src/$f.swift"
 done
-CORE=("$WORK/src/VoidCore.swift" "$WORK/src/RelayConfig.swift" "$WORK/src/CoreQueue.swift" "$WORK/src/VoidCall.swift")
+CORE=("$WORK/src/VoidCore.swift" "$WORK/src/RelayConfig.swift" "$WORK/src/CoreQueue.swift" "$WORK/src/VoidCall.swift" "$WORK/src/VoidAttachment.swift")
 
 for m in SwiftUI AVFoundation; do
   (cd "$WORK/mods" && "$SWIFTC" -emit-module -parse-as-library -swift-version 5 -module-name "$m" \
@@ -53,7 +55,8 @@ echo "Type-checking the Swift that calls the core, against the generated header�
 
 echo "Type-checking AppState.swift and CallAudio.swift against stand-ins…"
 "${TYPECHECK[@]}" "${CORE[@]}" "$WORK/src/Models.swift" "$WORK/src/AppDirectories.swift" \
-  "$WORK/src/AppState.swift" tools/app-bindings/swift/stubs/CallAudioInterface.swift
+  "$WORK/src/AppState.swift" tools/app-bindings/swift/stubs/CallAudioInterface.swift \
+  tools/app-bindings/swift/stubs/CallVideoInterface.swift
 "${TYPECHECK[@]}" "${CORE[@]}" "$WORK/src/Models.swift" "$WORK/src/CallAudio.swift"
 
 echo "Running the Swift wrapper against the real core…"

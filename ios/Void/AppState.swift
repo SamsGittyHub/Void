@@ -17,8 +17,17 @@
 //
 //  Engine calls go through `CoreQueue`, never the main thread: a tick holds
 //  the engine's lock while it waits on the network. Tor bootstrap, the relay
-//  circuit, and call media run on their own threads, because none of them
-//  needs the engine's lock while it waits.
+//  circuit, call media, and file transfers run on their own threads, because
+//  none of them needs the engine's lock while it waits.
+//
+//  ## Files (D-032)
+//
+//  A file is sealed by the core, uploaded over a circuit of its own, and only
+//  then sent — its pointer goes through the ratchet like any message. Until
+//  the pointer is queued it is a placeholder here, with its progress; after,
+//  it is in the engine's history like everything else. Received files under
+//  `autoDownloadLimit` are fetched as soon as their pointer arrives; larger
+//  ones wait for a tap.
 //
 //  ## What this does not yet do
 //
@@ -89,20 +98,48 @@ final class AppState: ObservableObject {
     @Published private(set) var activeCall: CallSession?
     /// A call waiting on the user reading the disclosure.
     @Published var pendingDisclosure: PendingCall?
+    /// A video call's pictures, while one runs.
+    @Published private(set) var callVideo: CallVideo?
+    /// What the other end's video is doing.
+    @Published private(set) var remoteVideo = RemoteVideoState()
+    /// Quarter turns the other end's picture asks for.
+    @Published private(set) var remoteRotation = 0
+    /// Whether this end's camera is on, in a video call.
+    @Published private(set) var isCameraOn = false
+    /// What the call has carried, refreshed every second while it runs.
+    @Published private(set) var callStats = CallStats()
+    @Published private(set) var videoStats = CallVideo.VideoStats()
+
+    /// Files still being sealed or uploaded, by contact — not in the engine's
+    /// history until their pointer is sent.
+    @Published private(set) var pendingUploads: [Data: [MessageItem]] = [:]
+    /// Downloads in progress or failed, by attachment id.
+    @Published private(set) var downloads: [Data: TransferProgress] = [:]
+
+    /// Received files up to this size are fetched as soon as they arrive.
+    /// Larger ones wait for a tap: a transfer is a burst anyone watching the
+    /// connection can see, and its size is roughly the file's.
+    static let autoDownloadLimit: UInt64 = 12 * 1024 * 1024
 
     /// Which direction the pending call goes, so the disclosure can say so.
     enum PendingCall: Equatable {
-        case placing(Data)
-        case answering(Data)
+        case placing(Data, video: Bool)
+        case answering(Data, video: Bool)
 
         var isAnswering: Bool {
             if case .answering = self { return true }
             return false
         }
 
+        var isVideo: Bool {
+            switch self {
+            case .placing(_, let video), .answering(_, let video): return video
+            }
+        }
+
         var fingerprint: Data {
             switch self {
-            case .placing(let fp), .answering(let fp): return fp
+            case .placing(let fp, _), .answering(let fp, _): return fp
             }
         }
     }
@@ -121,6 +158,23 @@ final class AppState: ObservableObject {
 
     private var callHost: CallHost?
     private var callAudio: CallAudio?
+    private var statsTask: Task<Void, Never>?
+    /// Uploads in flight, by placeholder id, so one can be cancelled or retried.
+    private var uploads: [String: UploadJob] = [:]
+    /// Downloads in flight, by attachment id.
+    private var downloadHandles: [Data: AttachmentTransfer] = [:]
+    private var progressTask: Task<Void, Never>?
+
+    /// An upload this device started: what it is for, and how far it got.
+    private final class UploadJob {
+        let fingerprint: Data
+        let placeholderId: String
+        var transfer: AttachmentTransfer?
+        init(fingerprint: Data, placeholderId: String) {
+            self.fingerprint = fingerprint
+            self.placeholderId = placeholderId
+        }
+    }
 
     /// Contacts the user found did not match when comparing codes. The engine
     /// has no state for a user's verdict — its key-changed state is for a key
@@ -143,6 +197,8 @@ final class AppState: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-uiTestsSkipOnboarding") {
             protectionAcknowledged = true
         }
+        // Anything opened for viewing last time and not cleaned up.
+        TempFiles.removeAll()
         Task { await loadStoredState() }
         connectTor()
         startTicking()
@@ -194,7 +250,7 @@ final class AppState: ObservableObject {
             switch outcome {
             case .retrieved(let messages):
                 changed.formUnion(messages.map(\.fingerprint))
-            case .deposited:
+            case .deposited, .refused:
                 // A message may just have moved to "Sent".
                 changed.formUnion(core.contacts.map(\.fingerprint))
             default:
@@ -255,6 +311,7 @@ final class AppState: ObservableObject {
                     conversations[index].unread += 1
                 }
             }
+            sortConversations()
         }
         for (id, remaining) in update.inviteUploads where shownInvite?.id == id {
             shownInvite?.uploadRemaining = remaining
@@ -270,32 +327,64 @@ final class AppState: ObservableObject {
     private func applyContacts(_ contacts: [VoidCore.ContactSummary]) {
         conversations = contacts.map { contact in
             let existing = conversations.first { $0.id == contact.fingerprint }
+            let last = messagesByFingerprint[contact.fingerprint]?.last
             return ConversationSummary(
                 id: contact.fingerprint,
                 name: contact.name,
                 trust: mismatched.contains(contact.fingerprint) ? .keyChanged : contact.trust,
-                lastMessage: messagesByFingerprint[contact.fingerprint]?.last?.text
-                    ?? existing?.lastMessage ?? "",
-                unread: existing?.unread ?? 0
+                lastMessage: last?.preview ?? existing?.lastMessage ?? "",
+                unread: existing?.unread ?? 0,
+                lastActivity: last?.timestamp ?? existing?.lastActivity
             )
+        }
+        sortConversations()
+    }
+
+    /// Most recent first; contacts with no messages yet, by name, after.
+    private func sortConversations() {
+        conversations.sort { a, b in
+            switch (a.lastActivity, b.lastActivity) {
+            case let (x?, y?): return x > y
+            case (.some, .none): return true
+            case (.none, .some): return false
+            case (.none, .none):
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            }
         }
     }
 
     private func applyHistory(_ history: [StoredMessage], for fingerprint: Data) {
-        messagesByFingerprint[fingerprint] = history.enumerated().map { index, message in
+        let items = history.map { message in
             MessageItem(
-                id: UInt64(index),
+                id: "m\(message.id)",
                 text: message.text,
                 isOutgoing: message.isOutgoing,
                 delivery: message.delivery,
-                timestamp: message.timestamp
+                timestamp: message.timestamp,
+                attachment: message.attachment,
+                transfer: message.attachment.flatMap { downloads[$0.id] }
             )
         }
+        messagesByFingerprint[fingerprint] = items
         if let index = conversations.firstIndex(where: { $0.id == fingerprint }),
-            let last = history.last
+            let last = items.last
         {
-            conversations[index].lastMessage = last.text
+            conversations[index].lastMessage = last.preview
+            conversations[index].lastActivity = last.timestamp
         }
+        // Fetch what arrived, if it is small enough to fetch unasked.
+        for item in items {
+            guard let attachment = item.attachment, !item.isOutgoing, !attachment.isLocal,
+                attachment.size <= Self.autoDownloadLimit, downloads[attachment.id] == nil
+            else { continue }
+            download(attachment, from: fingerprint)
+        }
+    }
+
+    /// Everything a conversation shows: the engine's history, then any file
+    /// of ours still on its way to the relay.
+    func items(for fingerprint: Data) -> [MessageItem] {
+        (messagesByFingerprint[fingerprint] ?? []) + (pendingUploads[fingerprint] ?? [])
     }
 
     private func refreshContacts() async {
@@ -547,15 +636,20 @@ final class AppState: ObservableObject {
     func send(to fingerprint: Data, text: String) {
         // Shown at once as "Waiting to send", then replaced by the stored copy.
         var items = messagesByFingerprint[fingerprint] ?? []
-        items.append(
-            MessageItem(
-                id: UInt64.max - UInt64(items.count),
-                text: text,
-                isOutgoing: true,
-                delivery: .queued,
-                timestamp: Date()
-            ))
+        let pending = MessageItem(
+            id: "q\(UUID().uuidString)",
+            text: text,
+            isOutgoing: true,
+            delivery: .queued,
+            timestamp: Date()
+        )
+        items.append(pending)
         messagesByFingerprint[fingerprint] = items
+        if let index = conversations.firstIndex(where: { $0.id == fingerprint }) {
+            conversations[index].lastMessage = pending.preview
+            conversations[index].lastActivity = pending.timestamp
+            sortConversations()
+        }
         Task {
             do {
                 let history = try await worker.attempt { core -> [StoredMessage] in
@@ -566,6 +660,277 @@ final class AppState: ObservableObject {
             } catch {
                 lastError = error.localizedDescription
                 applyHistory(await worker.run { $0.messages(with: fingerprint) }, for: fingerprint)
+            }
+        }
+    }
+
+    // MARK: Files (D-032)
+
+    /// A file the user chose to send, already written somewhere private — a
+    /// photo re-encoded without its metadata, a copy of a document.
+    struct OutgoingFile {
+        let url: URL
+        let name: String
+        let mime: String
+        var width = 0
+        var height = 0
+        var caption = ""
+        /// Whether `url` is Void's own copy, to delete once sealed.
+        var deleteAfterSealing = true
+    }
+
+    /// Seal, upload, then send a file. Shows at once as a placeholder with its
+    /// progress; becomes an ordinary message in the history once its pointer
+    /// is queued.
+    func sendFile(_ file: OutgoingFile, to fingerprint: Data) {
+        let placeholderId = "p\(UUID().uuidString)"
+        let size = (try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(UInt64.init) ?? 0
+        guard size <= VoidCore.maxAttachmentBytes else {
+            lastError = VoidError.tooLarge.localizedDescription
+            if file.deleteAfterSealing { try? FileManager.default.removeItem(at: file.url) }
+            return
+        }
+        let placeholder = MessageItem(
+            id: placeholderId,
+            text: file.caption,
+            isOutgoing: true,
+            delivery: .queued,
+            timestamp: Date(),
+            attachment: AttachmentInfo(
+                id: Data(), size: size, width: file.width, height: file.height,
+                name: file.name, mime: file.mime, isLocal: false),
+            transfer: TransferProgress(direction: .upload, fraction: 0)
+        )
+        pendingUploads[fingerprint, default: []].append(placeholder)
+        let job = UploadJob(fingerprint: fingerprint, placeholderId: placeholderId)
+        uploads[placeholderId] = job
+        if let index = conversations.firstIndex(where: { $0.id == fingerprint }) {
+            conversations[index].lastMessage = placeholder.preview
+            conversations[index].lastActivity = placeholder.timestamp
+            sortConversations()
+        }
+
+        let core = worker.core
+        CoreThread.detach(name: "app.void.attachment-seal", qos: .userInitiated) { [weak self] in
+            let sealed = Result {
+                try core.prepareAttachment(
+                    fileAt: file.url, name: file.name, mime: file.mime, width: file.width,
+                    height: file.height, caption: file.caption)
+            }
+            if file.deleteAfterSealing {
+                try? FileManager.default.removeItem(at: file.url)
+            }
+            Task { @MainActor in self?.sealed(sealed, job: job) }
+        }
+    }
+
+    private func sealed(_ result: Result<AttachmentTransfer, Error>, job: UploadJob) {
+        switch result {
+        case .failure(let error):
+            failUpload(job, error.localizedDescription)
+        case .success(let transfer):
+            job.transfer = transfer
+            updatePlaceholder(job) { item in
+                item.attachment = item.attachment.map {
+                    AttachmentInfo(
+                        id: transfer.id, size: $0.size, width: $0.width, height: $0.height,
+                        name: $0.name, mime: $0.mime, isLocal: true)
+                }
+            }
+            upload(job)
+        }
+    }
+
+    /// Upload, or try again after a failure. Chunks the relay already holds
+    /// are acknowledged, not sent twice.
+    private func upload(_ job: UploadJob) {
+        guard let transfer = job.transfer else { return }
+        guard let tor else {
+            failUpload(job, "Waiting for the network. Try again once Void is connected.")
+            return
+        }
+        updatePlaceholder(job) { $0.transfer = TransferProgress(direction: .upload, fraction: 0) }
+        watchProgress()
+        CoreThread.detach(name: "app.void.attachment-upload", qos: .userInitiated) { [weak self] in
+            let uploaded = Result { try transfer.upload(tor: tor) }
+            Task { @MainActor in self?.uploaded(uploaded, job: job) }
+        }
+    }
+
+    private func uploaded(_ result: Result<Void, Error>, job: UploadJob) {
+        guard uploads[job.placeholderId] != nil, let transfer = job.transfer else { return }
+        if case .failure(let error) = result {
+            failUpload(job, Self.transferFailure(error, upload: true))
+            return
+        }
+        let fingerprint = job.fingerprint
+        Task {
+            do {
+                let history = try await worker.attempt { core -> [StoredMessage] in
+                    try core.sendAttachment(transfer, to: fingerprint, now: Clock.nowSeconds)
+                    return core.messages(with: fingerprint)
+                }
+                uploads[job.placeholderId] = nil
+                pendingUploads[fingerprint]?.removeAll { $0.id == job.placeholderId }
+                applyHistory(history, for: fingerprint)
+            } catch {
+                failUpload(job, error.localizedDescription)
+            }
+        }
+    }
+
+    private func failUpload(_ job: UploadJob, _ message: String) {
+        updatePlaceholder(job) { item in
+            item.transfer = TransferProgress(
+                direction: .upload, fraction: item.transfer?.fraction ?? 0, failure: message)
+        }
+    }
+
+    private func updatePlaceholder(_ job: UploadJob, _ change: (inout MessageItem) -> Void) {
+        guard var items = pendingUploads[job.fingerprint],
+            let index = items.firstIndex(where: { $0.id == job.placeholderId })
+        else { return }
+        change(&items[index])
+        pendingUploads[job.fingerprint] = items
+    }
+
+    /// Try a failed upload again.
+    func retryUpload(_ placeholderId: String) {
+        guard let job = uploads[placeholderId] else { return }
+        if job.transfer == nil {
+            discardUpload(placeholderId)
+        } else {
+            upload(job)
+        }
+    }
+
+    /// Give up on an upload. Nothing was sent; the sealed copy goes with the
+    /// next sweep, since no message points at it.
+    func discardUpload(_ placeholderId: String) {
+        guard let job = uploads.removeValue(forKey: placeholderId) else { return }
+        job.transfer?.cancel()
+        pendingUploads[job.fingerprint]?.removeAll { $0.id == placeholderId }
+    }
+
+    /// Fetch a received file over a circuit of its own.
+    func download(_ attachment: AttachmentInfo, from fingerprint: Data) {
+        if let existing = downloads[attachment.id], existing.failure == nil { return }
+        guard let tor else {
+            setDownload(attachment.id, fingerprint, TransferProgress(
+                direction: .download, fraction: 0, failure: "Waiting for the network."))
+            return
+        }
+        setDownload(attachment.id, fingerprint, TransferProgress(direction: .download, fraction: 0))
+        let id = attachment.id
+        Task {
+            let transfer = await worker.run { $0.openAttachment(id: id) }
+            guard let transfer else {
+                setDownload(id, fingerprint, TransferProgress(
+                    direction: .download, fraction: 0, failure: "This file is no longer here."))
+                return
+            }
+            downloadHandles[id] = transfer
+            watchProgress()
+            CoreThread.detach(name: "app.void.attachment-download", qos: .userInitiated) { [weak self] in
+                let fetched = Result { try transfer.download(tor: tor) }
+                Task { @MainActor in self?.downloaded(fetched, id: id, from: fingerprint) }
+            }
+        }
+    }
+
+    private func downloaded(_ result: Result<Void, Error>, id: Data, from fingerprint: Data) {
+        downloadHandles[id] = nil
+        switch result {
+        case .success:
+            downloads[id] = nil
+            Task { applyHistory(await worker.run { $0.messages(with: fingerprint) }, for: fingerprint) }
+        case .failure(let error):
+            setDownload(id, fingerprint, TransferProgress(
+                direction: .download, fraction: 0, failure: Self.transferFailure(error, upload: false)))
+        }
+    }
+
+    private func setDownload(_ id: Data, _ fingerprint: Data, _ progress: TransferProgress?) {
+        downloads[id] = progress
+        guard var items = messagesByFingerprint[fingerprint] else { return }
+        for index in items.indices where items[index].attachment?.id == id {
+            items[index].transfer = progress
+        }
+        messagesByFingerprint[fingerprint] = items
+    }
+
+    /// While anything is moving, read its progress four times a second.
+    private func watchProgress() {
+        guard progressTask == nil else { return }
+        progressTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard let self else { return }
+                if !self.refreshProgress() {
+                    self.progressTask = nil
+                    return
+                }
+            }
+        }
+    }
+
+    /// Returns whether anything is still moving.
+    private func refreshProgress() -> Bool {
+        var moving = false
+        for job in uploads.values {
+            guard let transfer = job.transfer else { continue }
+            let fraction = transfer.fraction
+            updatePlaceholder(job) { item in
+                if item.transfer?.failure == nil {
+                    item.transfer?.fraction = fraction
+                    moving = true
+                }
+            }
+        }
+        for (id, transfer) in downloadHandles {
+            moving = true
+            let fraction = transfer.fraction
+            for (fingerprint, items) in messagesByFingerprint
+            where items.contains(where: { $0.attachment?.id == id }) {
+                setDownload(id, fingerprint, TransferProgress(direction: .download, fraction: fraction))
+            }
+        }
+        return moving
+    }
+
+    private static func transferFailure(_ error: Error, upload: Bool) -> String {
+        switch error as? VoidError {
+        case .offline?:
+            return "Couldn't reach the relay. Try again in a moment."
+        case .expired?:
+            return "The relay no longer has this file. Ask them to send it again."
+        case .cancelled?:
+            return "Cancelled."
+        default:
+            return upload ? "The relay didn't take the file. Try again later." : "This file didn't arrive intact."
+        }
+    }
+
+    /// The bytes of a file this phone holds — for showing an image. Off the
+    /// core queue: opening never needs the engine's lock once its key is known.
+    func attachmentData(_ attachment: AttachmentInfo) async -> Data? {
+        let core = worker.core
+        return await withCheckedContinuation { continuation in
+            CoreThread.detach(name: "app.void.attachment-read", qos: .userInitiated) {
+                continuation.resume(returning: core.readAttachment(id: attachment.id))
+            }
+        }
+    }
+
+    /// A file written out in the clear for a viewer or the share sheet. The
+    /// caller removes it with `TempFiles.remove` when done.
+    func exportAttachment(_ attachment: AttachmentInfo) async -> URL? {
+        let core = worker.core
+        let url = TempFiles.path(named: attachment.name)
+        return await withCheckedContinuation { continuation in
+            CoreThread.detach(name: "app.void.attachment-export", qos: .userInitiated) {
+                let written = (try? core.exportAttachment(id: attachment.id, to: url)) != nil
+                continuation.resume(returning: written ? url : nil)
             }
         }
     }
@@ -640,19 +1005,24 @@ final class AppState: ObservableObject {
     /// a call's traffic shape is nothing like messaging's — land on whoever is
     /// on the call, not on whoever started it. Warning only the caller would
     /// leave the person who answers uninformed about their own exposure.
-    func requestCall(to fingerprint: Data) {
+    func requestCall(to fingerprint: Data, video: Bool = false) {
         guard activeCall == nil else { return }
-        pendingDisclosure = .placing(fingerprint)
+        pendingDisclosure = .placing(fingerprint, video: video)
     }
 
     /// Ask for the disclosure before answering. See `requestCall`.
     func requestAnswer() {
         guard let call = activeCall, call.phase == .incoming else { return }
-        pendingDisclosure = .answering(call.fingerprint)
+        pendingDisclosure = .answering(call.fingerprint, video: call.video)
     }
 
-    /// The user read the disclosure and chose to go ahead. The microphone is
-    /// asked for here — the moment they chose to talk — and not at launch.
+    /// Whether a video call may use the camera, decided when the user chose
+    /// the call. A refusal means the call goes ahead with the camera off.
+    private var cameraAllowed = false
+
+    /// The user read the disclosure and chose to go ahead. The microphone — and
+    /// for a video call, the camera — is asked for here, the moment they chose
+    /// to talk, and not at launch.
     func confirmDisclosure() {
         guard let pending = pendingDisclosure else { return }
         pendingDisclosure = nil
@@ -665,9 +1035,23 @@ final class AppState: ObservableObject {
                 }
                 return
             }
-            switch pending {
-            case .placing(let fingerprint): self.placeCall(to: fingerprint)
-            case .answering: self.answerCall()
+            let go = { [weak self] (camera: Bool) in
+                guard let self else { return }
+                self.cameraAllowed = camera
+                switch pending {
+                case .placing(let fingerprint, let video): self.placeCall(to: fingerprint, video: video)
+                case .answering: self.answerCall()
+                }
+            }
+            if pending.isVideo {
+                CallVideo.requestCamera { allowed in
+                    if !allowed {
+                        self.show(notice: "The camera is off. You can allow it in Settings.")
+                    }
+                    go(allowed)
+                }
+            } else {
+                go(false)
             }
         }
     }
@@ -687,13 +1071,14 @@ final class AppState: ObservableObject {
     /// The service is published off the main thread because it talks to the
     /// network, and the offer is queued the moment the address exists — the
     /// descriptor finishes uploading while the offer travels.
-    private func placeCall(to fingerprint: Data) {
+    private func placeCall(to fingerprint: Data, video: Bool) {
         guard activeCall == nil else { return }
         guard let tor else {
             lastError = "Void isn't connected yet. Calls need the network."
             return
         }
-        activeCall = CallSession(fingerprint: fingerprint, callId: Data(), role: .caller, phase: .publishing)
+        activeCall = CallSession(
+            fingerprint: fingerprint, callId: Data(), role: .caller, phase: .publishing, video: video)
         let worker = self.worker
         CoreThread.detach(name: "app.void.call-publish", qos: .userInitiated) { [weak self] in
             let host = CallHost(tor: tor, keyDirectory: AppDirectories.callKeys())
@@ -708,7 +1093,7 @@ final class AppState: ObservableObject {
                     let placed = try await worker.attempt {
                         try $0.placeCall(
                             to: fingerprint, address: host.address, port: VoidCore.callPort,
-                            now: Clock.nowSeconds)
+                            video: video, now: Clock.nowSeconds)
                     }
                     guard var call = self.activeCall, call.fingerprint == fingerprint else {
                         // Hung up while the offer was being queued. The hang-up
@@ -720,7 +1105,7 @@ final class AppState: ObservableObject {
                     call.callId = placed.callId
                     call.phase = .ringing
                     self.activeCall = call
-                    self.waitForCallee(host: host, placed: placed, fingerprint: fingerprint)
+                    self.waitForCallee(host: host, placed: placed, fingerprint: fingerprint, video: video)
                 } catch {
                     self.finishCall(summary: "Couldn't call them. \(error.localizedDescription)")
                 }
@@ -731,9 +1116,11 @@ final class AppState: ObservableObject {
     /// Accept on our service from the moment the offer is queued, not once the
     /// relayed answer arrives (D-028): the callee dials the moment they
     /// answer, and their first authenticated frame is the answer.
-    private func waitForCallee(host: CallHost, placed: (callId: Data, mediaSecret: Data), fingerprint: Data) {
+    private func waitForCallee(
+        host: CallHost, placed: (callId: Data, mediaSecret: Data), fingerprint: Data, video: Bool
+    ) {
         CoreThread.detach(name: "app.void.call-accept", qos: .userInitiated) { [weak self] in
-            let media = host.accept(mediaSecret: placed.mediaSecret, callId: placed.callId)
+            let media = host.accept(mediaSecret: placed.mediaSecret, callId: placed.callId, video: video)
             Task { @MainActor in
                 guard let self, self.activeCall?.callId == placed.callId else {
                     media?.close()
@@ -770,7 +1157,8 @@ final class AppState: ObservableObject {
                         address: answered.address,
                         port: answered.port,
                         mediaSecret: answered.mediaSecret,
-                        callId: answered.callId
+                        callId: answered.callId,
+                        video: answered.video
                     )
                     Task { @MainActor in
                         guard let self, self.activeCall?.callId == answered.callId else {
@@ -805,6 +1193,14 @@ final class AppState: ObservableObject {
         audio.onDropped = { [weak self] connectionClosed in
             Task { @MainActor in self?.mediaDropped(callId: callId, connectionClosed: connectionClosed) }
         }
+        var video: CallVideo?
+        if media.isVideo {
+            let pictures = CallVideo(media: media)
+            pictures.onRemoteState = { [weak self] state in self?.remoteVideo = state }
+            pictures.onRemoteRotation = { [weak self] turns in self?.remoteRotation = turns }
+            audio.afterReceive = { [weak pictures] in pictures?.drainRemote() }
+            video = pictures
+        }
         do {
             try audio.start()
         } catch {
@@ -813,13 +1209,53 @@ final class AppState: ObservableObject {
             return
         }
         callAudio = audio
+        if let video {
+            remoteVideo = RemoteVideoState()
+            remoteRotation = 0
+            video.start(cameraAllowed: cameraAllowed)
+            isCameraOn = video.isCameraOn
+            callVideo = video
+        }
+        watchCallStats()
     }
+
+    /// Refresh the call's counts once a second while it runs.
+    private func watchCallStats() {
+        statsTask?.cancel()
+        statsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, let audio = self.callAudio else { return }
+                self.callStats = audio.currentStats
+                if let video = self.callVideo {
+                    self.videoStats = video.stats
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    /// Turn the camera on or off during a video call. The other end is told,
+    /// and the stream stays the same size on the wire either way.
+    func toggleCamera() {
+        guard let video = callVideo else { return }
+        video.setCamera(on: !video.isCameraOn)
+        isCameraOn = video.isCameraOn
+    }
+
+    /// Switch between the front and back cameras.
+    func flipCamera() {
+        callVideo?.flipCamera()
+        objectWillChange.send()
+    }
+
+    var isFrontCamera: Bool { callVideo?.isFrontCamera ?? true }
 
     /// The first authenticated frame arrived. For the caller that is the
     /// answer: the ring stops now, not a mailbox delay later.
     private func mediaConnected(callId: Data, fingerprint: Data, role: CallRole) {
         guard var call = activeCall, call.callId == callId else { return }
         call.phase = .active
+        call.connectedAt = Date()
         activeCall = call
         if role == .caller {
             Task { _ = await worker.run { $0.markCallConnected(fingerprint) } }
@@ -840,11 +1276,12 @@ final class AppState: ObservableObject {
 
     private func handle(_ event: CallEvent) {
         switch event {
-        case .incoming(let fingerprint, let callId, _, _):
+        case .incoming(let fingerprint, let callId, _, _, let video):
             // The engine already answers a second offer "busy"; this is the
             // UI's own guard on the same rule.
             guard activeCall == nil else { break }
-            activeCall = CallSession(fingerprint: fingerprint, callId: callId, role: .callee, phase: .incoming)
+            activeCall = CallSession(
+                fingerprint: fingerprint, callId: callId, role: .callee, phase: .incoming, video: video)
         case .answered(_, let callId):
             // Usually the callee's media got here first and the call is already
             // active; the relayed answer then changes nothing.
@@ -888,6 +1325,11 @@ final class AppState: ObservableObject {
 
     /// Tear down local call state. Always safe to call twice.
     private func finishCall(summary: String) {
+        statsTask?.cancel()
+        statsTask = nil
+        callVideo?.stop()
+        callVideo = nil
+        isCameraOn = false
         callAudio?.stop()
         callAudio = nil
         callHost?.cancel()

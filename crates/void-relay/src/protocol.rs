@@ -22,6 +22,7 @@
 //! is the price of the property, and NFR-PERF-03's budget was computed with it
 //! (see `void_proto::record`).
 
+use void_proto::attachment::SEALED_CHUNK_LEN;
 use void_proto::envelope::SEALED_RECORD_SIZE;
 use void_proto::wire::{Reader, Writer};
 
@@ -42,6 +43,15 @@ const _: () = assert!(
     SEALED_RECORD_SIZE + 32 < FRAME_BODY_CAPACITY,
     "a sealed record plus a queue id must fit in one frame"
 );
+
+const _: () = assert!(
+    BLOB_PUT_LEN <= FRAME_BODY_CAPACITY,
+    "a sealed attachment chunk, its token, index and count must fit in one frame"
+);
+
+/// Bytes of a `BlobPut` body: token, index, count, sealed chunk. Exactly a
+/// frame body: `void_proto::attachment::CHUNK_LEN` was chosen so that it is.
+pub const BLOB_PUT_LEN: usize = 32 + 4 + 4 + SEALED_CHUNK_LEN;
 
 /// Frame types.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +78,15 @@ pub enum FrameType {
     Padding = 8,
     /// Client → relay: register for push wake signals.
     WakeRegister = 9,
+    /// Client → relay: store one sealed chunk of an attachment's blob (D-032).
+    BlobPut = 10,
+    /// Client → relay: fetch one sealed chunk of a blob.
+    BlobGet = 11,
+    /// Relay → client: here is that chunk.
+    BlobChunk = 12,
+    /// Client → relay: delete a blob. Always acknowledged, whether or not there
+    /// was one, so the answer says nothing about what the relay held.
+    BlobDelete = 13,
 }
 
 impl FrameType {
@@ -86,6 +105,10 @@ impl FrameType {
             7 => FrameType::Refuse,
             8 => FrameType::Padding,
             9 => FrameType::WakeRegister,
+            10 => FrameType::BlobPut,
+            11 => FrameType::BlobGet,
+            12 => FrameType::BlobChunk,
+            13 => FrameType::BlobDelete,
             _ => return Err(RelayError::Malformed),
         })
     }
@@ -237,6 +260,82 @@ impl Retrieve {
     }
 }
 
+/// The body of a `BlobPut` frame.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BlobPut {
+    /// Names the blob; the relay keys it by a hash of this.
+    pub token: [u8; 32],
+    /// Which chunk.
+    pub index: u32,
+    /// How many chunks the blob has.
+    pub count: u32,
+    /// The sealed chunk, exactly `SEALED_CHUNK_LEN` bytes.
+    pub sealed: Vec<u8>,
+}
+
+impl BlobPut {
+    /// Encode.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(BLOB_PUT_LEN);
+        w.raw(&self.token)
+            .u32(self.index)
+            .u32(self.count)
+            .raw(&self.sealed);
+        w.finish()
+    }
+
+    /// Decode.
+    pub fn decode(bytes: &[u8]) -> RelayResult<BlobPut> {
+        if bytes.len() != BLOB_PUT_LEN {
+            return Err(RelayError::Malformed);
+        }
+        let mut r = Reader::new(bytes);
+        let token = r.array::<32>().map_err(|_| RelayError::Malformed)?;
+        let index = r.u32().map_err(|_| RelayError::Malformed)?;
+        let count = r.u32().map_err(|_| RelayError::Malformed)?;
+        let sealed = r
+            .raw(SEALED_CHUNK_LEN)
+            .map_err(|_| RelayError::Malformed)?
+            .to_vec();
+        r.finish().map_err(|_| RelayError::Malformed)?;
+        Ok(BlobPut {
+            token,
+            index,
+            count,
+            sealed,
+        })
+    }
+}
+
+/// The body of a `BlobGet` frame.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BlobGet {
+    /// Names the blob.
+    pub token: [u8; 32],
+    /// Which chunk.
+    pub index: u32,
+}
+
+impl BlobGet {
+    /// Encode.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(36);
+        w.raw(&self.token).u32(self.index);
+        w.finish()
+    }
+
+    /// Decode.
+    pub fn decode(bytes: &[u8]) -> RelayResult<BlobGet> {
+        let mut r = Reader::new(bytes);
+        let token = r.array::<32>().map_err(|_| RelayError::Malformed)?;
+        let index = r.u32().map_err(|_| RelayError::Malformed)?;
+        r.finish().map_err(|_| RelayError::Malformed)?;
+        Ok(BlobGet { token, index })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +348,10 @@ mod tests {
             (FrameType::Ack, vec![]),
             (FrameType::Refuse, vec![]),
             (FrameType::Retrieve, vec![0u8; 144]),
+            (FrameType::BlobPut, vec![0u8; BLOB_PUT_LEN]),
+            (FrameType::BlobGet, vec![0u8; 36]),
+            (FrameType::BlobChunk, vec![0u8; SEALED_CHUNK_LEN]),
+            (FrameType::BlobDelete, vec![0u8; 32]),
         ];
         for (kind, body) in bodies {
             let f = Frame::new(kind, body);
@@ -340,6 +443,25 @@ mod tests {
         };
         assert_eq!(Retrieve::decode(&r.encode()).unwrap(), r);
         assert!(Retrieve::decode(&r.encode()[..70]).is_err());
+    }
+
+    #[test]
+    fn blob_frames_roundtrip_and_a_put_fills_a_frame_exactly() {
+        let put = BlobPut {
+            token: [1u8; 32],
+            index: 7,
+            count: 9,
+            sealed: vec![5u8; SEALED_CHUNK_LEN],
+        };
+        assert_eq!(put.encode().len(), FRAME_BODY_CAPACITY);
+        assert_eq!(BlobPut::decode(&put.encode()).unwrap(), put);
+        assert!(BlobPut::decode(&put.encode()[..100]).is_err());
+        let get = BlobGet {
+            token: [2u8; 32],
+            index: 3,
+        };
+        assert_eq!(BlobGet::decode(&get.encode()).unwrap(), get);
+        assert!(BlobGet::decode(&[0u8; 35]).is_err());
     }
 
     #[test]

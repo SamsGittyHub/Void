@@ -76,6 +76,23 @@ class CallAudio(
     /** Whether the microphone is muted. Muting sends silence on the same cadence. */
     @Volatile var muted: Boolean = false
 
+    /**
+     * Called on the receiving thread after every receive, whatever it
+     * produced — where a video call takes the frames that arrived with it, on
+     * the thread that already holds them. Set before [start].
+     */
+    var afterReceive: (() -> Unit)? = null
+
+    /** What the call has carried so far, for the call screen's details. */
+    class Stats {
+        @Volatile var sentAudio = 0
+        @Volatile var sentSilence = 0
+        @Volatile var receivedAudio = 0
+        @Volatile var receivedSilence = 0
+    }
+
+    val stats = Stats()
+
     /** Called once, from the receiving thread, on the first authenticated frame. Set before [start]. */
     var onConnected: (() -> Unit)? = null
 
@@ -356,6 +373,7 @@ class CallAudio(
         val silence = ByteArray(0)
         while (running) {
             val packet = if (muted) null else encoded.poll()
+            if (packet == null) stats.sentSilence++ else stats.sentAudio++
             if (!media.send(packet ?: silence)) {
                 // Refused because the connection is gone: whichever of the two
                 // threads notices first, a closed connection means the same.
@@ -381,15 +399,19 @@ class CallAudio(
         val info = MediaCodec.BufferInfo()
         var lastHeard = System.nanoTime()
         while (running) {
-            when (val received = media.receive()) {
+            val received = media.receive()
+            afterReceive?.invoke()
+            when (received) {
                 is MediaReceive.Audio -> {
                     lastHeard = System.nanoTime()
+                    stats.receivedAudio++
                     announceConnected()
                     feed(codec, received.frame, received.frame.size)
                     drainDecoder(codec, info)
                 }
                 MediaReceive.Silence -> {
                     lastHeard = System.nanoTime()
+                    stats.receivedSilence++
                     announceConnected()
                 }
                 MediaReceive.Nothing -> {

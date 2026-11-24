@@ -14,6 +14,7 @@
 //! [`Contact::can_send`] able to enforce it in one place.
 
 use void_crypto::Zeroize;
+use void_proto::attachment::Attachment;
 use void_proto::identity::IdentityPublic;
 use void_proto::wire::{Reader, Writer};
 
@@ -283,10 +284,15 @@ pub struct StoredMessage {
     /// Unix seconds. Local clock only; never taken from the peer, because a
     /// peer-supplied timestamp is a channel we would have to trust.
     pub timestamp: u64,
-    /// The message body.
+    /// The message body — for a message carrying a file, its caption.
     pub body: String,
     /// Delivery state.
     pub delivery: DeliveryState,
+    /// The file this message carries, if any (D-032): where its sealed blob
+    /// is parked and the key that opens it. The key is what turns the sealed
+    /// copy on disk back into the file, so destroying this record — or the
+    /// vault key under the whole database — destroys the file with it.
+    pub attachment: Option<Attachment>,
 }
 
 impl Drop for StoredMessage {
@@ -312,6 +318,10 @@ impl Drop for StoredMessage {
 
 impl StoredMessage {
     /// Encode for storage.
+    ///
+    /// A message with no attachment encodes exactly as it did before
+    /// attachments existed; one with an attachment appends it, so records
+    /// written by an older build still decode.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -323,6 +333,11 @@ impl StoredMessage {
             .u64(self.timestamp)
             .u8(self.delivery.to_byte())
             .bytes32(self.body.as_bytes());
+        if let Some(attachment) = &self.attachment {
+            let mut encoded = attachment.encode();
+            w.u8(1).bytes32(&encoded);
+            encoded.zeroize();
+        }
         w.finish()
     }
 
@@ -340,6 +355,17 @@ impl StoredMessage {
         let body = r
             .bytes32_max(1024 * 1024)
             .map_err(|_| StoreError::Corrupt)?;
+        let attachment = if r.remaining() == 0 {
+            None
+        } else {
+            match r.u8().map_err(|_| StoreError::Corrupt)? {
+                1 => Some(
+                    Attachment::decode(r.bytes32_max(16 * 1024).map_err(|_| StoreError::Corrupt)?)
+                        .map_err(|_| StoreError::Corrupt)?,
+                ),
+                _ => return Err(StoreError::Corrupt),
+            }
+        };
         r.finish().map_err(|_| StoreError::Corrupt)?;
         Ok(StoredMessage {
             contact_fingerprint,
@@ -347,6 +373,7 @@ impl StoredMessage {
             timestamp,
             body: String::from_utf8(body.to_vec()).map_err(|_| StoreError::Corrupt)?,
             delivery,
+            attachment,
         })
     }
 }
@@ -559,12 +586,52 @@ mod tests {
             timestamp: 999,
             body: "hello \u{1F600}".to_string(),
             delivery: DeliveryState::Queued,
+            attachment: None,
         };
         let enc = m.encode();
         let decoded = StoredMessage::decode(&enc).unwrap();
         assert_eq!(decoded.body, m.body);
         assert_eq!(decoded.delivery, DeliveryState::Queued);
+        assert!(decoded.attachment.is_none());
         assert!(StoredMessage::decode(&enc[..10]).is_err());
+    }
+
+    #[test]
+    fn a_message_with_an_attachment_roundtrips_and_one_without_is_unchanged() {
+        use void_proto::attachment::AttachmentSecrets;
+        let secrets = AttachmentSecrets::generate().unwrap();
+        let attachment = Attachment::new(
+            &secrets,
+            70_000,
+            "plan.pdf",
+            "application/pdf",
+            0,
+            0,
+            "the plan",
+        )
+        .unwrap();
+        let with = StoredMessage {
+            contact_fingerprint: [1u8; 32],
+            direction: Direction::Incoming,
+            timestamp: 5,
+            body: "the plan".to_string(),
+            delivery: DeliveryState::Received,
+            attachment: Some(attachment.clone()),
+        };
+        let decoded = StoredMessage::decode(&with.encode()).unwrap();
+        assert_eq!(decoded.attachment.as_ref(), Some(&attachment));
+
+        // A record written before attachments existed is exactly the prefix
+        // one without an attachment still writes.
+        let mut without = with.clone();
+        without.attachment = None;
+        assert!(with.encode().starts_with(&without.encode()));
+        let mut junk = without.encode();
+        junk.push(9);
+        assert!(
+            StoredMessage::decode(&junk).is_err(),
+            "an unknown trailer is corruption"
+        );
     }
 
     #[test]

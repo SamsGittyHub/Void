@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use void_crypto::{rand, Zeroize};
+use void_proto::attachment::{Attachment, BlobId};
 use void_proto::call::{CallAnswer, CallEnd, CallOffer, CallSignal, EndReason, Role};
 use void_proto::content::Content;
 use void_proto::envelope::{self, Deposit};
@@ -1628,7 +1629,7 @@ impl Engine {
         let stored = if first_message.is_empty() {
             None
         } else {
-            self.store_outgoing_message(fingerprint, first_message, now, message_id)
+            self.store_outgoing_message(fingerprint, first_message, now, message_id, None)
         };
         self.enqueue(
             fingerprint,
@@ -1678,7 +1679,9 @@ impl Engine {
         // exceptions to remember, is the point.
         let text = match Content::decode(&plaintext).map_err(|_| ClientError::Protocol)? {
             Content::Text(t) => t,
-            Content::Call(_) => return Err(ClientError::Protocol),
+            // A handshake's first message is text or nothing: a call or a file
+            // from someone who is not yet a contact is not something to accept.
+            _ => return Err(ClientError::Protocol),
         };
 
         // Everything verified. Only now does anything change.
@@ -1699,7 +1702,7 @@ impl Engine {
         // An empty first message is how someone connects without saying
         // anything yet. It is not a message, so it is neither stored nor shown.
         if !text.is_empty() {
-            self.store_incoming_message(fingerprint, &text, now);
+            self.store_incoming_message(fingerprint, &text, now, None);
         }
         Ok((fingerprint, text))
     }
@@ -1892,7 +1895,53 @@ impl Engine {
         self.persist_session(*fingerprint)?;
 
         let message_id = new_message_id()?;
-        let stored = self.store_outgoing_message(*fingerprint, text, now, message_id);
+        let stored = self.store_outgoing_message(*fingerprint, text, now, message_id, None);
+        self.enqueue(
+            *fingerprint,
+            &deposit_key,
+            &payload,
+            message_id,
+            stored,
+            false,
+        )?;
+        Ok(message_id)
+    }
+
+    /// Send a file whose sealed blob is already parked on the relay (D-032).
+    ///
+    /// The platform seals the file and uploads it first — over a circuit of
+    /// its own, at the circuit's speed — and only then calls this, so the
+    /// pointer can never reach the recipient before what it points at. What
+    /// goes through the ratchet is the [`Attachment`]: the blob's token and
+    /// key, its size, its name. One record, like any short message, and on the
+    /// same constant-rate schedule.
+    ///
+    /// The key-change block applies exactly as it does to text: it is checked
+    /// here, before anything is encrypted.
+    pub fn send_attachment(
+        &mut self,
+        fingerprint: &[u8; 32],
+        attachment: Attachment,
+        now: u64,
+    ) -> ClientResult<u64> {
+        let session = self
+            .sessions
+            .get_mut(fingerprint)
+            .ok_or(ClientError::NoSuchContact)?;
+        if !session.contact.can_send() {
+            return Err(ClientError::ContactKeyChanged);
+        }
+        let mut plaintext = Content::Attachment(attachment.clone()).encode();
+        let encrypted = session.established.ratchet.encrypt(&plaintext);
+        plaintext.zeroize();
+        let payload = encrypted.map_err(|_| ClientError::Protocol)?.encode();
+        let deposit_key = session.established.send_queue.deposit_key();
+        self.persist_session(*fingerprint)?;
+
+        let message_id = new_message_id()?;
+        let caption = attachment.caption.clone();
+        let stored =
+            self.store_outgoing_message(*fingerprint, &caption, now, message_id, Some(attachment));
         self.enqueue(
             *fingerprint,
             &deposit_key,
@@ -1947,6 +1996,7 @@ impl Engine {
         fingerprint: &[u8; 32],
         onion_address: &str,
         port: u16,
+        video: bool,
         now: u64,
     ) -> ClientResult<ActiveCall> {
         // One call at a time, with anyone: there is one microphone, and the
@@ -1954,7 +2004,8 @@ impl Engine {
         if !self.calls.is_empty() {
             return Err(ClientError::CallInProgress);
         }
-        let offer = CallOffer::new(onion_address, port, now).map_err(|_| ClientError::Protocol)?;
+        let offer =
+            CallOffer::new(onion_address, port, now, video).map_err(|_| ClientError::Protocol)?;
         let active = ActiveCall {
             call_id: offer.call_id,
             media_secret: offer.media_secret,
@@ -1962,6 +2013,7 @@ impl Engine {
             peer: *fingerprint,
             onion_address: String::from(onion_address),
             port,
+            video,
             answered: false,
             started_at: now,
         };
@@ -2141,16 +2193,20 @@ impl Engine {
         text: &str,
         now: u64,
         message_id: u64,
+        attachment: Option<Attachment>,
     ) -> Option<u64> {
         self.persisted.as_ref()?;
         let expiry = self.message_expiry(&fingerprint, now);
-        let msg = self.stored_message(fingerprint, text, Direction::Outgoing, now);
-        let payload = msg.encode();
+        let mut msg = self.stored_message(fingerprint, text, Direction::Outgoing, now);
+        msg.attachment = attachment;
+        let mut payload = msg.encode();
+        let inserted = self
+            .persisted
+            .as_mut()
+            .and_then(|p| p.store.insert(Kind::Message, expiry, &payload).ok());
+        payload.zeroize();
+        let id = inserted?;
         let persisted = self.persisted.as_mut()?;
-        let id = persisted
-            .store
-            .insert(Kind::Message, expiry, &payload)
-            .ok()?;
         persisted.outgoing_messages.insert(message_id, id);
         let _ = persisted.store.flush();
         Some(id)
@@ -2158,15 +2214,23 @@ impl Engine {
 
     /// Store an incoming message (NFR-REL-04). A no-op if no store is
     /// attached.
-    fn store_incoming_message(&mut self, fingerprint: [u8; 32], text: &str, now: u64) {
+    fn store_incoming_message(
+        &mut self,
+        fingerprint: [u8; 32],
+        text: &str,
+        now: u64,
+        attachment: Option<Attachment>,
+    ) {
         if self.persisted.is_none() {
             return;
         }
         let expiry = self.message_expiry(&fingerprint, now);
-        let msg = self.stored_message(fingerprint, text, Direction::Incoming, now);
-        let payload = msg.encode();
+        let mut msg = self.stored_message(fingerprint, text, Direction::Incoming, now);
+        msg.attachment = attachment;
+        let mut payload = msg.encode();
         let persisted = self.persisted.as_mut().expect("checked above");
         let _ = persisted.store.insert(Kind::Message, expiry, &payload);
+        payload.zeroize();
         let _ = persisted.store.flush();
     }
 
@@ -2411,10 +2475,27 @@ impl Engine {
         self.persist_session(*fingerprint)?;
         match decrypted {
             Some(Content::Text(text)) => {
-                self.store_incoming_message(*fingerprint, &text, now_ms / 1000);
+                self.store_incoming_message(*fingerprint, &text, now_ms / 1000, None);
                 Ok(Some(ReceivedMessage {
                     contact_fingerprint: *fingerprint,
                     text,
+                    attachment: None,
+                }))
+            }
+            Some(Content::Attachment(attachment)) => {
+                // Stored with its key, which is what turns the sealed copy the
+                // platform fetches into the file. The text is the caption.
+                let caption = attachment.caption.clone();
+                self.store_incoming_message(
+                    *fingerprint,
+                    &caption,
+                    now_ms / 1000,
+                    Some(attachment.clone()),
+                );
+                Ok(Some(ReceivedMessage {
+                    contact_fingerprint: *fingerprint,
+                    text: caption,
+                    attachment: Some(attachment),
                 }))
             }
             Some(Content::Call(signal)) => {
@@ -2476,6 +2557,7 @@ impl Engine {
                     peer: fingerprint,
                     onion_address: offer.onion_address.clone(),
                     port: offer.port,
+                    video: offer.video,
                     answered: false,
                     // Rung from when it arrived here, not when it was sent: the
                     // callee gets the full ring whatever the mailbox delay was.
@@ -2646,6 +2728,59 @@ impl Engine {
             .collect())
     }
 
+    /// [`Engine::messages`], each with the id of the record that holds it —
+    /// stable for as long as the message exists, so an interface can tell a
+    /// message it already shows from a new one.
+    pub fn messages_with_ids(
+        &self,
+        fingerprint: &[u8; 32],
+    ) -> ClientResult<Vec<(u64, StoredMessage)>> {
+        let Some(persisted) = &self.persisted else {
+            return Ok(Vec::new());
+        };
+        let records = persisted
+            .store
+            .list(Kind::Message)
+            .map_err(|_| ClientError::Storage)?;
+        Ok(records
+            .iter()
+            .filter_map(|r| StoredMessage::decode(&r.payload).ok().map(|m| (r.id, m)))
+            .filter(|(_, m)| &m.contact_fingerprint == fingerprint)
+            .collect())
+    }
+
+    /// The stored attachment whose blob is `blob`, with the contact it was
+    /// sent to or received from — what the platform needs to fetch it, or to
+    /// open the copy it already has.
+    #[must_use]
+    pub fn attachment(&self, blob: &BlobId) -> Option<(Attachment, [u8; 32], Direction)> {
+        let persisted = self.persisted.as_ref()?;
+        let records = persisted.store.list(Kind::Message).ok()?;
+        records.iter().find_map(|r| {
+            let m = StoredMessage::decode(&r.payload).ok()?;
+            let a = m.attachment.as_ref()?;
+            (a.blob_id() == *blob).then(|| (a.clone(), m.contact_fingerprint, m.direction))
+        })
+    }
+
+    /// Every blob a stored message still points at. Anything the platform
+    /// holds that is not in here belongs to a message that expired, and its
+    /// sealed copy can go.
+    #[must_use]
+    pub fn attachment_ids(&self) -> Vec<BlobId> {
+        let Some(persisted) = &self.persisted else {
+            return Vec::new();
+        };
+        let Ok(records) = persisted.store.list(Kind::Message) else {
+            return Vec::new();
+        };
+        records
+            .iter()
+            .filter_map(|r| StoredMessage::decode(&r.payload).ok())
+            .filter_map(|m| m.attachment.as_ref().map(Attachment::blob_id))
+            .collect()
+    }
+
     /// How many messages are waiting to be sent.
     #[must_use]
     pub fn outbox_len(&self) -> usize {
@@ -2676,6 +2811,7 @@ impl Engine {
                 Direction::Outgoing => DeliveryState::Queued,
                 Direction::Incoming => DeliveryState::Received,
             },
+            attachment: None,
         }
     }
 
@@ -2736,8 +2872,12 @@ pub enum TickOutcome {
 pub struct ReceivedMessage {
     /// Who sent it.
     pub contact_fingerprint: [u8; 32],
-    /// The text.
+    /// The text — for a file, its caption.
     pub text: String,
+    /// The file it carries, if any: where its blob is parked and the key that
+    /// opens it. Stored with the message, so the platform can fetch it later
+    /// through [`Engine::attachment`].
+    pub attachment: Option<Attachment>,
 }
 
 /// A call this engine is party to.
@@ -2761,6 +2901,8 @@ pub struct ActiveCall {
     pub onion_address: String,
     /// The virtual port that service listens on.
     pub port: u16,
+    /// Whether this is a video call (`void_proto::call::MediaMode`).
+    pub video: bool,
     /// Whether the call has been answered: for the callee, once they answer;
     /// for the caller, once the callee's media authenticates or their relayed
     /// answer arrives, whichever is first.
@@ -2782,6 +2924,7 @@ impl core::fmt::Debug for ActiveCall {
             .field("call_id", &self.call_id)
             .field("role", &self.role)
             .field("onion_address", &self.onion_address)
+            .field("video", &self.video)
             .field("answered", &self.answered)
             .field("media_secret", &"<redacted>")
             .finish()

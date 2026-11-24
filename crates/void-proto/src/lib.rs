@@ -35,12 +35,15 @@
 //! | [`queue`] | FR-MSG-04, FR-ABUSE-02, FR-ABUSE-03 |
 //! | [`invite`] | FR-DISC-01, FR-DISC-02 |
 //! | [`wake`] | FR-NOTIF-03 |
+//! | [`call`], [`video`] | D-024, D-033 — calls, voice and video |
+//! | [`attachment`] | D-032 — files, parked on the relay as sealed blobs |
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 extern crate alloc;
 
+pub mod attachment;
 pub mod call;
 pub mod content;
 pub mod envelope;
@@ -51,6 +54,7 @@ pub mod invite;
 pub mod queue;
 pub mod ratchet;
 pub mod record;
+pub mod video;
 pub mod wake;
 pub mod wire;
 
@@ -123,4 +127,4 @@ pub type Result<T> = core::result::Result<T, ProtoError>;
 /// The protocol version this build speaks — the `v` in
 /// [`handshake::PROTOCOL_ID`], which is the value that actually keeps
 /// incompatible clients from talking.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;

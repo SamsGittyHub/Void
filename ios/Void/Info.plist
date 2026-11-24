@@ -17,25 +17,26 @@
 	<key>CFBundleDisplayName</key>
 	<string>Void</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 
 	<!-- FR-DIST-03: Void's cryptography goes well past the TLS-only export
 	     exemption (ML-KEM, ML-DSA, XChaCha20-Poly1305, Argon2id implemented
-	     or used directly, not merely HTTPS to a server). `true` here is the
-	     honest answer, not the convenient one — it routes App Store Connect
-	     through the standard export-compliance questionnaire on submission
-	     rather than skipping it. That questionnaire is a distribution-time
-	     step for whoever submits the build; this key only states the fact
-	     the questionnaire is triggered by. -->
-	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
+	     or used directly, not merely HTTPS to a server). ITSAppUsesNonExemptEncryption
+	     is deliberately absent, not set to NO: with it set to YES, App Store
+	     Connect refuses an upload that lacks the ITSEncryptionExportComplianceCode
+	     it issues once export documentation is approved; with it absent, App
+	     Store Connect asks the export-compliance questions for each build,
+	     and whoever distributes answers them. Setting it to NO to skip the
+	     questions would be a false declaration. -->
 
-	<!-- FR-DISC-01: QR scanning for contact establishment. -->
+	<!-- FR-DISC-01: QR scanning for contact establishment; D-033: video
+	     calls. Asked for when the user scans a code or chooses a video call,
+	     never at launch. -->
 	<key>NSCameraUsageDescription</key>
-	<string>Void uses the camera to scan a contact's invite code. Nothing else. No photo is
-	saved, and Void does not use the camera anywhere else in the app.</string>
+	<string>Void uses the camera to scan a contact's invite code, and on video calls you
+	place or answer. Nothing is recorded or saved.</string>
 
 	<!-- D-024: calls. Without this key iOS terminates the app the first time
 	     it touches the microphone. Asked for when the user chooses to call or
@@ -58,11 +59,27 @@
 		<string>audio</string>
 	</array>
 
+	<!-- The relay this build reaches: its onion address, which is its public
+	     key (FR-TRANS-04). From the VOID_RELAY_ONION build setting in
+	     project.yml, so a build can be pointed at another relay without
+	     editing source: xcodebuild VOID_RELAY_ONION=<address>.onion -->
+	<key>VoidRelayOnion</key>
+	<string>$(VOID_RELAY_ONION)</string>
+
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- iPad multitasking requires every orientation; App Store Connect
+	     refuses an iPad build without them. -->
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>

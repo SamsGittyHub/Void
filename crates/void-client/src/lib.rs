@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod attachment;
 pub mod engine;
 pub mod scheduler;
 pub mod transport;
@@ -69,6 +70,14 @@ pub enum ClientError {
     CallInProgress,
     /// No call is in progress with that contact.
     NoSuchCall,
+    /// The relay would not take an attachment's blob: it is full, or the
+    /// token names a different blob.
+    AttachmentRefused,
+    /// The relay does not hold the attachment's blob: it expired, or its
+    /// upload was never finished.
+    AttachmentUnavailable,
+    /// A transfer was cancelled.
+    Cancelled,
     /// System entropy was unavailable.
     Entropy,
     /// The local encrypted store failed to read, write, or authenticate a
@@ -99,6 +108,9 @@ impl core::fmt::Display for ClientError {
             ClientError::NoSuchInvite => "no such invitation",
             ClientError::CallInProgress => "already on a call with this contact",
             ClientError::NoSuchCall => "no call in progress with this contact",
+            ClientError::AttachmentRefused => "the relay would not take this file",
+            ClientError::AttachmentUnavailable => "the relay no longer has this file",
+            ClientError::Cancelled => "cancelled",
             ClientError::Entropy => "system entropy unavailable",
             ClientError::Storage => "local storage failed to read, write, or authenticate",
         };

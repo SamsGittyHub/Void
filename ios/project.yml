@@ -24,6 +24,10 @@ settings:
     "CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]": YES
     "CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]": YES
     DEVELOPMENT_TEAM: 377HB985YB
+    # The development relay — scripts/run_dev_relay.sh runs it on a developer
+    # machine and prints this address. Read at run time from Info.plist
+    # (RelayConfig.swift). Not a production endpoint: there is none yet.
+    VOID_RELAY_ONION: viptz6o5rgzml3ky6v5oddli4kchyrhkqfgqrh44b3ijikzggh4pbmid.onion
 
 targets:
   Void:
@@ -46,9 +50,15 @@ targets:
         # the real files and leave them alone.
         INFOPLIST_FILE: Void/Info.plist
         CODE_SIGN_ENTITLEMENTS: Void/Void.entitlements
+        # The icon and accent live in Void/Assets.xcassets; the icon is drawn
+        # by tools/icon/make_icon.swift.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     dependencies:
+      # A static library: linked into the app, never copied into it (App
+      # Store Connect rejects a bundle with a stray .a in Frameworks/).
       - framework: VoidFFI.xcframework
-        embed: true
+        embed: false
       # void-tor's Arti bootstrap uses rusqlite for Tor's own consensus/state
       # storage (arti-client, not void-store) and links against the
       # system's SQLite rather than vendoring one.

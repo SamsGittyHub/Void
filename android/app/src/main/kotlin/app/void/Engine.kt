@@ -223,6 +223,8 @@ class Engine private constructor(private var handle: Long) {
         val mediaSecret: ByteArray,
         val address: String,
         val port: Int,
+        /** A video call: fixed by the offer, at both ends. */
+        val video: Boolean,
     )
 
     /**
@@ -230,23 +232,68 @@ class Engine private constructor(private var handle: Long) {
      * `now` is in seconds: the offer carries it, so one that reaches the
      * callee too late to be live shows as missed instead of ringing.
      */
-    fun placeCall(fingerprint: ByteArray, onionAddress: String, port: Int, now: Long): CallCredentials {
+    fun placeCall(fingerprint: ByteArray, onionAddress: String, port: Int, video: Boolean, now: Long): CallCredentials {
         val callId = ByteArray(16)
         val secret = ByteArray(32)
-        if (!VoidCore.enginePlaceCall(handle, fingerprint, onionAddress, port, now, callId, secret)) {
+        if (!VoidCore.enginePlaceCall(handle, fingerprint, onionAddress, port, video, now, callId, secret)) {
             throw VoidException(VoidStatus.FAILED)
         }
-        return CallCredentials(callId, secret, onionAddress, port)
+        return CallCredentials(callId, secret, onionAddress, port, video)
     }
 
     /** Answer an incoming call, returning what the media connection needs. */
     fun answerCall(fingerprint: ByteArray): CallCredentials {
         val callId = ByteArray(16)
         val secret = ByteArray(32)
-        val address = VoidCore.engineAnswerCall(handle, fingerprint, callId, secret)
+        val portAndVideo = IntArray(2)
+        val address = VoidCore.engineAnswerCall(handle, fingerprint, callId, secret, portAndVideo)
         if (address.isEmpty()) throw VoidException(VoidStatus.FAILED)
-        // Every call's service listens on the one fixed port.
-        return CallCredentials(callId, secret, address, VoidCore.callPort())
+        return CallCredentials(callId, secret, address, portAndVideo[0], portAndVideo[1] == 1)
+    }
+
+    // --- attachments (D-032) ---------------------------------------------------
+
+    /**
+     * Seal the file at [file] for sending, under a key made for it alone, into
+     * the core's own directory. Reads the file once; delete it afterwards. Does
+     * not wait on the engine, so it is safe off the engine thread.
+     */
+    fun prepareAttachment(
+        file: File,
+        name: String,
+        mime: String,
+        width: Int,
+        height: Int,
+        caption: String,
+    ): AttachmentTransfer {
+        val status = IntArray(1)
+        val transfer = VoidCore.enginePrepareAttachment(
+            handle, file.absolutePath, name, mime, width, height, caption, status,
+        )
+        if (transfer == 0L) {
+            throw VoidException(VoidStatus.from(status[0]).takeIf { it != VoidStatus.OK } ?: VoidStatus.FAILED)
+        }
+        return AttachmentTransfer(transfer)
+    }
+
+    /** Send an uploaded file: its pointer goes through the ratchet like any message. */
+    fun sendAttachment(transfer: AttachmentTransfer, fingerprint: ByteArray, now: Long) {
+        val status = VoidStatus.from(VoidCore.engineSendAttachment(handle, fingerprint, transfer.handle, now))
+        if (status != VoidStatus.OK) throw VoidException(status)
+    }
+
+    /** A handle to a file in the history, to fetch it; null if no message points at it. */
+    fun openAttachment(id: ByteArray): AttachmentTransfer? =
+        VoidCore.engineAttachmentOpen(handle, id).takeIf { it != 0L }?.let { AttachmentTransfer(it) }
+
+    /** A file this phone holds, opened into memory; null if not here or not intact. */
+    fun readAttachment(id: ByteArray): ByteArray? =
+        VoidCore.engineAttachmentRead(handle, id).takeIf { it.isNotEmpty() }
+
+    /** Write a file out in the clear, for a viewer or the share sheet. The caller owns it after. */
+    fun exportAttachment(id: ByteArray, dest: File) {
+        val status = VoidStatus.from(VoidCore.engineAttachmentExport(handle, id, dest.absolutePath))
+        if (status != VoidStatus.OK) throw VoidException(status)
     }
 
     /**
@@ -324,7 +371,7 @@ class CallHost private constructor(private val handle: Long) {
             if (freed || releaseRequested) return null
             accepting = true
         }
-        val media = VoidCore.callHostAccept(handle, credentials.mediaSecret, credentials.callId)
+        val media = VoidCore.callHostAccept(handle, credentials.mediaSecret, credentials.callId, credentials.video)
         synchronized(lock) {
             accepting = false
             if (releaseRequested && !freed) {
@@ -332,7 +379,7 @@ class CallHost private constructor(private val handle: Long) {
                 VoidCore.callHostFree(handle)
             }
         }
-        return if (media != 0L) CallMedia(media) else null
+        return if (media != 0L) CallMedia(media, credentials.video) else null
     }
 
     /**
@@ -371,7 +418,7 @@ class CallHost private constructor(private val handle: Long) {
  * the order of teardown: [close], join the threads that use it, then [free].
  * [CallAudio.stop] does exactly that.
  */
-class CallMedia internal constructor(private val handle: Long) {
+class CallMedia internal constructor(private val handle: Long, val isVideo: Boolean) {
     /** Encrypt and send one encoded frame; empty is silence. False once the connection is gone. */
     fun send(audio: ByteArray): Boolean = VoidCore.callMediaSend(handle, audio)
 
@@ -393,6 +440,37 @@ class CallMedia internal constructor(private val handle: Long) {
     /** Release the handle. Only after every thread using it has finished. */
     fun free() = VoidCore.callMediaFree(handle)
 
+    // --- video (D-033) ---
+
+    /** Queue one encoded unit; false if dropped — encode a keyframe next. Never waits on the network. */
+    fun pushVideo(unit: VideoUnit): Boolean =
+        VoidCore.callVideoPush(handle, unit.data, unit.keyframe, unit.rotation, unit.timestampMs) == 0
+
+    /** The next whole unit the other end sent, if one is waiting. */
+    fun takeVideo(): VideoUnit? {
+        val framed = VoidCore.callVideoTake(handle)
+        if (framed.size < 6) return null
+        val timestamp = (framed[2].toInt() and 0xff) or
+            ((framed[3].toInt() and 0xff) shl 8) or
+            ((framed[4].toInt() and 0xff) shl 16) or
+            ((framed[5].toInt() and 0xff) shl 24)
+        return VideoUnit(
+            data = framed.copyOfRange(6, framed.size),
+            keyframe = framed[0].toInt() and 1 != 0,
+            rotation = framed[1].toInt() and 3,
+            timestampMs = timestamp,
+        )
+    }
+
+    /** Whether the next encoded frame should be a keyframe. */
+    val videoNeedsKeyframe: Boolean get() = VoidCore.callVideoNeedsKeyframe(handle)
+
+    /** Tell the other end the camera is on or off. */
+    fun setCamera(on: Boolean) = VoidCore.callVideoSetCamera(handle, on)
+
+    /** Whether the other end says its camera is off. */
+    val peerCameraOff: Boolean get() = VoidCore.callVideoPeerCameraOff(handle)
+
     companion object {
         /** Dial the caller's service (the callee side). Blocks. */
         fun connect(tor: TorHandle, credentials: Engine.CallCredentials): CallMedia? {
@@ -402,8 +480,9 @@ class CallMedia internal constructor(private val handle: Long) {
                 credentials.port,
                 credentials.mediaSecret,
                 credentials.callId,
+                credentials.video,
             )
-            return if (media != 0L) CallMedia(media) else null
+            return if (media != 0L) CallMedia(media, credentials.video) else null
         }
     }
 }
@@ -445,6 +524,64 @@ class VoidException(val status: VoidStatus) : Exception() {
             VoidStatus.WRONG_RELAY ->
                 "This invitation uses a different Void server from this app, so it can't be " +
                     "opened here."
+            VoidStatus.TOO_LARGE -> {
+                val mb = VoidCore.attachmentMaxBytes() / (1024 * 1024)
+                "That file is too big to send. Void sends files up to $mb MB."
+            }
+            VoidStatus.CANCELLED -> "Cancelled."
             else -> "Something went wrong. Nothing was sent."
         }
+}
+
+/** One encoded video frame, as it crosses the core. H.264 Annex B by agreement between the apps. */
+class VideoUnit(val data: ByteArray, val keyframe: Boolean, val rotation: Int, val timestampMs: Int)
+
+/**
+ * One file being sent or fetched. Frees its handle exactly once.
+ *
+ * Upload and download block for the whole transfer, so they run on a thread of
+ * their own; [progress] can be read from any thread meanwhile.
+ */
+class AttachmentTransfer internal constructor(internal val handle: Long) {
+    /** Its relay address. */
+    val id: ByteArray = VoidCore.attachmentId(handle)
+
+    private val lock = Any()
+    private var freed = false
+
+    /** How far along, from 0 to 1. */
+    val fraction: Float
+        get() {
+            val packed = VoidCore.attachmentProgress(handle)
+            val done = (packed ushr 32).toInt()
+            val total = (packed and 0xffffffffL).toInt()
+            return if (total == 0) 0f else done.toFloat() / total
+        }
+
+    fun cancel() = VoidCore.attachmentCancel(handle)
+
+    /** Park the sealed file on the relay. Blocks; safe to run again after a failure. */
+    fun upload(tor: TorHandle) {
+        val status = VoidStatus.from(
+            VoidCore.attachmentUpload(tor.handle, RelayConfig.ONION_ADDRESS, RelayConfig.PORT, handle),
+        )
+        if (status != VoidStatus.OK) throw VoidException(status)
+    }
+
+    /** Fetch a received file from the relay, every chunk checked, then let the relay forget it. Blocks. */
+    fun download(tor: TorHandle) {
+        val status = VoidStatus.from(
+            VoidCore.attachmentDownload(tor.handle, RelayConfig.ONION_ADDRESS, RelayConfig.PORT, handle),
+        )
+        if (status != VoidStatus.OK) throw VoidException(status)
+    }
+
+    /** Release the handle; its key is wiped once nothing is using it. Safe twice. */
+    fun free() {
+        synchronized(lock) {
+            if (freed) return
+            freed = true
+        }
+        VoidCore.attachmentFree(handle)
+    }
 }

@@ -35,6 +35,17 @@
 import AVFoundation
 import Foundation
 
+/// What a call has carried so far, for the call screen's details and for the
+/// end-to-end tests that cannot listen.
+struct CallStats: Equatable {
+    var sentAudio = 0
+    var sentSilence = 0
+    var receivedAudio = 0
+    var receivedSilence = 0
+    var played = 0
+    var echoCancellation = false
+}
+
 final class CallAudio: @unchecked Sendable {
     private let media: CallMedia
     private let engine = AVAudioEngine()
@@ -60,6 +71,16 @@ final class CallAudio: @unchecked Sendable {
     private var heardFrom = false
     private var interruptionObserver: NSObjectProtocol?
     private let threads = DispatchGroup()
+    private var stats = CallStats()
+
+    /// Counts so far. Any thread.
+    var currentStats: CallStats { lock.withLock { stats } }
+
+    /// Called on the receiving thread after every receive, whatever it
+    /// produced — where a video call takes the frames that arrived with it, on
+    /// the thread that already holds them, so video adds no thread of its own
+    /// to the network side. Set before `start`.
+    var afterReceive: (@Sendable () -> Void)?
 
     /// Called once, on the receiving thread, when the first authenticated
     /// frame arrives — audio or silence. For the caller, that is the answer.
@@ -155,7 +176,10 @@ final class CallAudio: @unchecked Sendable {
 
         // Echo cancellation: without it the other person hears themselves a
         // second later, which on a line with this much delay is unusable.
-        try engine.inputNode.setVoiceProcessingEnabled(true)
+        // Where the hardware has none to give — the Simulator — the call goes
+        // ahead without it rather than not at all.
+        let echoCancellation = (try? engine.inputNode.setVoiceProcessingEnabled(true)) != nil
+        lock.withLock { stats.echoCancellation = echoCancellation }
 
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
@@ -283,6 +307,9 @@ final class CallAudio: @unchecked Sendable {
                 return next
             }
             let payload = frame.flatMap(encode) ?? Data()
+            lock.withLock {
+                if payload.isEmpty { stats.sentSilence += 1 } else { stats.sentAudio += 1 }
+            }
             if !media.send(payload) {
                 // Refused because the connection is gone: whichever of the two
                 // threads notices first, a closed connection means the same.
@@ -345,13 +372,17 @@ final class CallAudio: @unchecked Sendable {
     private func receiveLoop() {
         var lastHeard = Date()
         while isRunning {
-            switch media.receive() {
+            let received = media.receive()
+            afterReceive?()
+            switch received {
             case .audio(let frame):
                 lastHeard = Date()
+                lock.withLock { stats.receivedAudio += 1 }
                 announceConnected()
                 play(frame)
             case .silence:
                 lastHeard = Date()
+                lock.withLock { stats.receivedSilence += 1 }
                 announceConnected()
             case .nothing:
                 if Date().timeIntervalSince(lastHeard) > Self.dropAfterSeconds {
@@ -420,7 +451,10 @@ final class CallAudio: @unchecked Sendable {
             player.stop()
             player.play()
         }
-        lock.withLock { scheduledFrames += 1 }
+        lock.withLock {
+            scheduledFrames += 1
+            stats.played += 1
+        }
         player.scheduleBuffer(pcm) { [weak self] in
             guard let self else { return }
             self.lock.withLock { self.scheduledFrames = max(0, self.scheduledFrames - 1) }

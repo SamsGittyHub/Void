@@ -1386,6 +1386,189 @@ longer crashes.
 
 ---
 
+## D-032 — Files travel beside a message: sealed, padded, and parked on the relay
+
+**The constraint.** A message leaves the phone as one 1,024-byte record per
+five-second slot whether or not there is anything to send (D-015). That rate
+is the defence against traffic analysis, and it is about 200 bytes a second: a
+1 MB photo would take an hour and a half, and `MAX_FRAGMENTS` caps a message at
+about half a megabyte anyway. Files cannot go that way.
+
+**Decided** (PROTOCOL.md §9, §13a, §13c).
+
+- **A file is a blob on the relay; only a pointer goes through the ratchet.**
+  The sender seals the file in 1,984-byte chunks under a key made for that file
+  alone, each chunk bound to its index, the chunk count and the blob by the
+  AEAD's associated data, and uploads them. The pointer (token, key, real
+  size, chunk count, name, media type, dimensions, caption) is message content
+  kind 3: a record or two, like a short message, and to the relay
+  indistinguishable from one.
+- **The chunk count is padded** with Padmé (Nikitin et al., PETS 2019), with a
+  floor of eight chunks, so every file up to 15.5 KiB looks the same and a
+  larger one leaks O(log log n) bits of its size for at most 12% more bytes.
+  The limit is 48 MiB.
+- **Four relay frames carry blobs**: `BlobPut`, `BlobGet`, `BlobChunk`,
+  `BlobDelete`, still 2,048 bytes each (`CHUNK_LEN` was chosen so a sealed
+  chunk with its token, index and count fills a frame body exactly). A client
+  sends them on a Tor stream of their own over an isolated circuit, 48 frames
+  in flight, at whatever speed the circuit allows.
+- **The relay keys a blob by a hash of its token,** so its table holds
+  addresses, not the capability that names them. Chunks are write-once and the
+  first fixes the count; an upload unfinished after an hour is deleted, and
+  every blob after seven days; the store holds at most 1 GiB, counted as chunks
+  arrive rather than as blobs are announced (`--blob-ttl-days`,
+  `--blob-capacity-mb`). Blobs live in memory, like queues.
+- **The recipient fetches every chunk, padding included, then deletes the
+  blob,** so a download is the size of the upload. The apps fetch a file of up
+  to 12 MB as soon as its pointer arrives and wait for a tap above that.
+- **Files at rest stay sealed.** Both ends keep the chunks as they travelled,
+  under `attachments/` in the app's private data directory; the key lives only
+  in the encrypted database. Destroying the vault key therefore leaves every
+  kept file unreadable even before duress deletes the directory, which it
+  also does. Files no message points at any more are swept every ten minutes.
+- **A name from the other end is hostile input.** It is cut to its last path
+  component, with control and bidirectional-override characters removed, and a
+  media type that is not `type/subtype` becomes `application/octet-stream`: on
+  decode, whatever the sender did. The iOS app re-encodes a photo as JPEG at
+  most 2,048 pixels on a side before sending it, which drops its location and
+  camera metadata.
+- A file to a contact whose key changed is blocked, as a message is.
+
+**What it costs, said rather than hidden.**
+
+- **A transfer is visible on the sender's connection** as a burst about the
+  padded size of the file, and on the recipient's when they fetch it. The
+  constant-rate lane covers messages, not files. The send sheet says so: "Files
+  travel to the relay encrypted, over a connection of their own. Someone
+  watching your connection can see that you sent something about this size."
+- **A relay that logs can link a blob to its pointer by time.** The upload and
+  the deposit of its pointer happen seconds apart, and so do the recipient's
+  retrieval and download. Isolated circuits take away the circuit as a link,
+  not the clock. This joins the retrieval-shape item under "Open".
+- The recipient downloads the padding too, and a blob nobody collects occupies
+  the relay for a week. A full relay refuses uploads, which the sender sees as
+  a send that failed and can be retried.
+
+**Reversal.** Additive: a client that never sends kind 3 never touches the blob
+frames. Kind 3 is half of why `PROTOCOL_ID` is now `v4` (D-033 is the other
+half): a `v3` client cannot read an attachment, so the two must not complete a
+handshake at all.
+
+**Enforced by.** In `void-proto`: `a_relay_cannot_reorder_truncate_or_move_chunks`,
+`a_chunk_round_trips_and_every_sealed_chunk_is_one_size`,
+`padding_hides_small_files_entirely`, `padme_matches_the_published_examples`,
+`the_blob_id_is_not_the_token`, `a_decoded_name_is_sanitised_whatever_the_sender_did`.
+In `void-relay`: `the_table_holds_the_id_not_the_token`,
+`a_chunk_cannot_be_replaced_but_can_be_resent`,
+`capacity_counts_bytes_that_arrived_not_bytes_announced`,
+`unfinished_uploads_and_expired_blobs_are_swept`,
+`deleting_is_silent_about_whether_there_was_anything`. In `void-client`:
+`a_blob_crosses_the_relay_and_opens_at_the_other_end`,
+`an_interrupted_upload_can_simply_run_again`,
+`an_attachment_pointer_is_indistinguishable_from_a_message_to_the_relay`,
+`an_attachment_to_a_contact_whose_key_changed_is_blocked`,
+`an_attachment_and_its_key_survive_a_restart_at_both_ends`. In `void-ffi`:
+`a_file_crosses_the_boundary_end_to_end` (two engines and a relay, a file in at
+one end and the same bytes out at the other),
+`duress_removes_every_sealed_attachment_too`,
+`an_attachment_too_large_to_send_is_refused_before_anything_is_written`.
+
+---
+
+## D-033 — Video calls: the voice call's lane, bigger, and still one size
+
+**Decided** (PROTOCOL.md §13b).
+
+- **A video call is a call whose offer says so.** The offer gains a flags byte,
+  inside the ciphertext like the rest of it; bit 0 is video, and an offer with
+  any other bit set is refused rather than read as a voice call. Both ends then
+  use the video frame size for the whole call.
+- **Video does not get packets of its own.** Every 20 ms frame carries its 120
+  bytes of audio and a 560-byte video slice, sealed together: 704 bytes on the
+  wire against a voice call's 142, about 282 kbit/s each way. An encoder's
+  output tracks motion the way a variable-bitrate voice codec tracks speech,
+  so the encoded stream is cut into slices and padded, and when there is
+  nothing to send (between frames, or with the camera off) the slice is empty
+  and the frame is the size it always is. Turning the camera off is a flag
+  inside the encryption, so the other end shows a placeholder rather than a
+  frozen picture, and nothing on the wire changes.
+- **The core does not know the codec,** as it does not know Opus. A unit of
+  video is opaque bytes with a keyframe flag, a rotation and a timestamp. The
+  apps agree on H.264 in Annex B form, with the parameter sets before every
+  keyframe so a receiver can start at any keyframe.
+- **Loss costs pictures, never the call.** The media writer drops frames
+  rather than queue behind a stalled circuit (D-028), so a unit can lose a
+  slice. The receiver notices any gap in frame sequence numbers, discards the
+  broken unit and everything after it until a keyframe (a decoder fed a frame
+  whose reference is missing shows garbage), and asks for a keyframe in its own
+  slices. The sender makes one unless one is queued, in flight, or less than a
+  second old, so two ends cannot ask each other into a loop; and a sender a
+  second behind drops delta frames and makes a keyframe. Anything malformed in
+  a slice is loss too, never an error that could end the call.
+- **iOS** encodes with VideoToolbox (H.264 baseline, 360×480 at 15 frames a
+  second, about 150 kbit/s on average and capped at 22 KB/s, under the lane's
+  27.6 KB/s) and shows the picture with `AVSampleBufferDisplayLayer`. The
+  Simulator has no camera, so there the app sends a moving test pattern.
+- **Android** has the same design over Camera2 and MediaCodec, written with
+  this change but not yet built or run.
+- **The disclosure grows.** Before a video call, in both directions, the app
+  shows `VIDEO_CALL_DISCLOSURE` after D-024's: "On a video call they see what
+  your camera sees until you turn it off. A video call is a bigger stream than
+  a voice call, and someone watching your connection can tell the two apart.
+  Turning your camera off does not change what they see: the stream stays the
+  same size either way."
+
+**What it costs.** A video call is distinguishable from a voice call by its
+rate to anyone watching either end's connection, and the disclosure says so.
+The picture is small and soft: a 224 kbit/s video lane is what an onion
+circuit sustains comfortably, and several times that is not. Turning the
+camera off saves no bandwidth, by design. Latency is the voice call's (D-028),
+plus a frame or two of encoding.
+
+**Reversal.** An offer without the flag is a voice call, and the voice path is
+unchanged; dropping video means never setting the bit. The flags byte is the
+other half of `v4`.
+
+**Enforced by.** In `void-proto`: `a_video_frame_carries_audio_and_a_slice_at_one_size`,
+`the_two_modes_cannot_open_each_others_frames`, `the_video_flag_travels_in_the_offer`,
+`the_video_disclosure_says_what_is_true`, `every_slice_fits_the_lane_whatever_is_queued`,
+`camera_off_travels_in_every_slice`,
+`a_dropped_frame_mid_unit_loses_the_unit_and_asks_for_a_keyframe`,
+`keyframe_requests_are_held_off_while_one_is_on_its_way`,
+`hostile_slices_cost_pictures_never_the_call`, and the rest of `video::tests`.
+In `void-client`: `a_video_offer_rings_as_a_video_call`. In `void-ffi`:
+`a_video_call_says_so_in_its_events`, `video_entry_points_refuse_null_and_voice_calls`.
+
+---
+
+## D-034 — The iOS app's look, and the relay it talks to is configuration
+
+**The look.** One palette, avatar and set of controls (`ios/Void/Theme.swift`)
+across every screen: a chats list with search and the connection's state in
+words, a conversation with day separators, grouped bubbles, delivery state in
+words and a menu for photos and files, call screens that carry video, and a
+Security tab. Two rules hold throughout. FR-UI-03: security state is words,
+never only a colour or an icon to learn — a badge says "Verified", "Not
+verified" or "Code changed", and colour only reinforces it. NFR-COMP-04: every
+control has a spoken label, and decoration (avatars, the mark) is hidden from
+VoiceOver. An avatar's colours come from the contact's fingerprint, stable and
+different between contacts, and are decoration only: comparing people is what
+the security code is for. The icon, an eclipse, is drawn by
+`tools/icon/make_icon.swift`, so it can be rebuilt from source.
+
+**The relay address** was a constant in `RelayConfig.swift`. It is now the
+`VOID_RELAY_ONION` build setting in `ios/project.yml`, carried through
+Info.plist and read at run time; Android's `RelayConfig.kt` holds the same
+address. `scripts/run_dev_relay.sh` runs a development relay on one machine
+with its onion key in `.dev-relay/` (gitignored), so the address survives
+restarts. It is a development relay, not a deployment: PRD §13.3 is still open.
+
+**A physical device.** The app was built, signed with a development profile,
+installed on an iPad Air (M3) running iPadOS 27.2.1, and launched, from Xcode
+26.6. That is all this entry claims about hardware.
+
+---
+
 ## Open, and deliberately so
 
 **PRD §13.3 — who runs the relays.** Not resolved. The code supports any
@@ -1422,3 +1605,10 @@ contacts a client has. The usual remedies — a stream per queue through Arti's
 isolation tokens, spreading retrievals across slots, or separate relays for
 sending and receiving — each cost latency or bandwidth, and choosing between
 them is a threat-model decision this entry records rather than makes.
+
+**Blob timing (D-032).** The same kind of exposure, for files: a relay that
+logs can pair a blob's upload with the deposit of its pointer seconds later,
+and a retrieval with the download that follows it. Isolated circuits remove
+the circuit as the link but not the clock. Delaying the pointer, or the
+download, by a random interval would blunt it at the cost of the file arriving
+later; that choice is recorded here rather than made.

@@ -173,6 +173,62 @@ impl TorHandle {
         };
         Ok(TorTransport::from_stream(bridged, onion_address))
     }
+
+    /// Open a stream to `onion_address` on `port` over circuits shared with
+    /// nothing else this client has opened or will open — for moving an
+    /// attachment's blob (D-032, `void_client::attachment`).
+    ///
+    /// Isolation is the point. The messaging circuit carries one fixed-size
+    /// frame per emission slot for the whole session, and a burst of blob
+    /// traffic on it would both delay that and tie the blob to it. Arti's
+    /// isolated client handle shares directory state with this one but never a
+    /// circuit, so the relay sees a stream with no connection to the one that
+    /// collects this client's queues. What the two still share, and the relay
+    /// could match on, is timing; D-032 says so.
+    pub fn open_isolated(
+        &self,
+        onion_address: &str,
+        port: u16,
+    ) -> Result<IsolatedStream, TorError> {
+        let client = Arc::new(self.client.isolated_client());
+        let target = onion_address.to_string();
+        let data_stream = self
+            .runtime
+            .block_on(async move {
+                tokio::time::timeout(CONNECT_TIMEOUT, client.connect((target.as_str(), port))).await
+            })
+            .map_err(|_| TorError::Connect(String::from("timed out opening a circuit")))?
+            .map_err(|e| TorError::Connect(e.to_string()))?;
+        Ok(IsolatedStream {
+            inner: BlockingCircuit {
+                handle: self.runtime.handle().clone(),
+                inner: data_stream,
+            },
+        })
+    }
+}
+
+/// A blocking stream over circuits of its own, from
+/// [`TorHandle::open_isolated`]. Reads and writes bytes; what they mean is
+/// `void_client::attachment`'s business.
+pub struct IsolatedStream {
+    inner: BlockingCircuit,
+}
+
+impl Read for IsolatedStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for IsolatedStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Bridges an Arti `DataStream` (async) to blocking `std::io::Read` / `Write`

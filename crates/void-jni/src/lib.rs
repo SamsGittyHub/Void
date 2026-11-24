@@ -1165,6 +1165,7 @@ pub extern "system" fn Java_app_void_VoidCore_callHostAccept(
     host: jlong,
     media_secret: JByteArray,
     call_id: JByteArray,
+    video: jboolean,
 ) -> jlong {
     let env = &mut env;
     guard(0, || {
@@ -1179,6 +1180,7 @@ pub extern "system" fn Java_app_void_VoidCore_callHostAccept(
                 host as *mut void_ffi::VoidCallHost,
                 secret.as_ptr(),
                 id.as_ptr(),
+                video != JNI_FALSE,
                 &mut out,
             ) == VoidStatus::Ok
             {
@@ -1227,6 +1229,7 @@ pub extern "system" fn Java_app_void_VoidCore_callMediaConnect(
     port: jint,
     media_secret: JByteArray,
     call_id: JByteArray,
+    video: jboolean,
 ) -> jlong {
     let env = &mut env;
     guard(0, || {
@@ -1247,6 +1250,7 @@ pub extern "system" fn Java_app_void_VoidCore_callMediaConnect(
                 port as u16,
                 secret.as_ptr(),
                 id.as_ptr(),
+                video != JNI_FALSE,
                 &mut out,
             ) == VoidStatus::Ok
             {
@@ -1382,6 +1386,7 @@ pub extern "system" fn Java_app_void_VoidCore_enginePlaceCall(
     fingerprint: JByteArray,
     onion_address: JString,
     port: jint,
+    video: jboolean,
     now: jlong,
     out_call_id: JByteArray,
     out_media_secret: JByteArray,
@@ -1404,6 +1409,7 @@ pub extern "system" fn Java_app_void_VoidCore_enginePlaceCall(
                 fp.as_ptr(),
                 addr_c.as_ptr(),
                 port as u16,
+                video != JNI_FALSE,
                 now as u64,
                 call_id.as_mut_ptr(),
                 secret.as_mut_ptr(),
@@ -1426,7 +1432,8 @@ pub extern "system" fn Java_app_void_VoidCore_enginePlaceCall(
 }
 
 /// Answers a call. Writes the call id and media secret as `enginePlaceCall`
-/// does, and returns the caller's onion address, or an empty string on failure.
+/// does, `outPortAndVideo[0]` the port and `[1]` 1 for a video call, and
+/// returns the caller's onion address, or an empty string on failure.
 #[no_mangle]
 pub extern "system" fn Java_app_void_VoidCore_engineAnswerCall(
     mut env: JNIEnv,
@@ -1435,6 +1442,7 @@ pub extern "system" fn Java_app_void_VoidCore_engineAnswerCall(
     fingerprint: JByteArray,
     out_call_id: JByteArray,
     out_media_secret: JByteArray,
+    out_port_and_video: JIntArray,
 ) -> jstring {
     let env = &mut env;
     guard(std::ptr::null_mut(), || {
@@ -1446,6 +1454,7 @@ pub extern "system" fn Java_app_void_VoidCore_engineAnswerCall(
         let mut secret = [0u8; 32];
         let mut address = empty_bytes();
         let mut port: u16 = 0;
+        let mut video = false;
         let ok = unsafe {
             void_ffi::void_engine_answer_call(
                 engine as *mut VoidEngine,
@@ -1454,6 +1463,7 @@ pub extern "system" fn Java_app_void_VoidCore_engineAnswerCall(
                 secret.as_mut_ptr(),
                 &mut address,
                 &mut port,
+                &mut video,
             ) == VoidStatus::Ok
         };
         if !ok {
@@ -1464,6 +1474,9 @@ pub extern "system" fn Java_app_void_VoidCore_engineAnswerCall(
             .is_err()
             || env
                 .set_byte_array_region(&out_media_secret, 0, &to_jbytes(&secret))
+                .is_err()
+            || env
+                .set_int_array_region(&out_port_and_video, 0, &[port as jint, jint::from(video)])
                 .is_err()
         {
             unsafe { void_ffi::void_free_bytes(address) };
@@ -1550,6 +1563,484 @@ pub extern "system" fn Java_app_void_VoidCore_engineTakeCallEvents(
             env,
             void_ffi::void_engine_take_call_events(engine as *mut VoidEngine),
         )
+    })
+}
+
+// --- video calls (D-033) ---------------------------------------------------
+//
+// Encoded video units cross as byte arrays, the same way encoded audio does.
+// Kotlin pushes what its encoder produced and takes what the other end sent;
+// the lanes, the keyframe bookkeeping and the padding are all void-ffi's.
+
+/// Queues one encoded video unit (H.264 Annex B). Returns the `VoidStatus`:
+/// 0 queued, 2 dropped — encode a keyframe next — and 1 for a voice call.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callVideoPush(
+    mut env: JNIEnv,
+    _class: JClass,
+    media: jlong,
+    data: JByteArray,
+    keyframe: jboolean,
+    rotation: jint,
+    timestamp_ms: jint,
+) -> jint {
+    let env = &mut env;
+    guard(VoidStatus::Internal as jint, || {
+        let unit = read_bytes(env, &data);
+        if media == 0 || unit.is_empty() || !(0..=3).contains(&rotation) {
+            return VoidStatus::BadArgument as jint;
+        }
+        unsafe {
+            void_ffi::void_call_video_push(
+                media as *const void_ffi::VoidCallMedia,
+                unit.as_ptr(),
+                unit.len(),
+                keyframe != JNI_FALSE,
+                rotation as u8,
+                timestamp_ms as u32,
+            ) as jint
+        }
+    })
+}
+
+/// Takes the next whole video unit the other end sent, or returns an empty
+/// array if none is waiting. Framed as `u8(flags: bit 0 keyframe) ||
+/// u8(rotation) || u32 LE(timestamp_ms) || data`, one array per unit.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callVideoTake(
+    mut env: JNIEnv,
+    _class: JClass,
+    media: jlong,
+) -> jbyteArray {
+    let env = &mut env;
+    guard(std::ptr::null_mut(), || unsafe {
+        if media == 0 {
+            return bytes_to_jbytearray(env, empty_bytes());
+        }
+        let mut data = empty_bytes();
+        let (mut keyframe, mut rotation, mut timestamp) = (false, 0u8, 0u32);
+        let got = void_ffi::void_call_video_take(
+            media as *const void_ffi::VoidCallMedia,
+            &mut data,
+            &mut keyframe,
+            &mut rotation,
+            &mut timestamp,
+        );
+        if !got {
+            void_ffi::void_free_bytes(data);
+            return bytes_to_jbytearray(env, empty_bytes());
+        }
+        let mut framed = Vec::with_capacity(6 + data.len);
+        framed.push(u8::from(keyframe));
+        framed.push(rotation);
+        framed.extend_from_slice(&timestamp.to_le_bytes());
+        if !data.data.is_null() && data.len > 0 {
+            framed.extend_from_slice(std::slice::from_raw_parts(data.data, data.len));
+        }
+        void_ffi::void_free_bytes(data);
+        env.byte_array_from_slice(&framed)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Whether the next encoded frame should be a keyframe.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callVideoNeedsKeyframe(
+    _env: JNIEnv,
+    _class: JClass,
+    media: jlong,
+) -> jboolean {
+    guard(JNI_FALSE, || unsafe {
+        if media != 0
+            && void_ffi::void_call_video_needs_keyframe(media as *const void_ffi::VoidCallMedia)
+        {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
+/// Tells the other end this camera is on or off.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callVideoSetCamera(
+    _env: JNIEnv,
+    _class: JClass,
+    media: jlong,
+    on: jboolean,
+) {
+    guard((), || unsafe {
+        if media != 0 {
+            void_ffi::void_call_video_set_camera(
+                media as *const void_ffi::VoidCallMedia,
+                on != JNI_FALSE,
+            );
+        }
+    })
+}
+
+/// Whether the other end says its camera is off.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callVideoPeerCameraOff(
+    _env: JNIEnv,
+    _class: JClass,
+    media: jlong,
+) -> jboolean {
+    guard(JNI_FALSE, || unsafe {
+        if media != 0
+            && void_ffi::void_call_video_peer_camera_off(media as *const void_ffi::VoidCallMedia)
+        {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_callVideoDisclosure(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let env = &mut env;
+    guard(std::ptr::null_mut(), || unsafe {
+        bytes_to_jstring(env, void_ffi::void_call_video_disclosure())
+    })
+}
+
+// --- attachments (D-032) ---------------------------------------------------
+//
+// A file crosses as a path. The token and key stay in void-ffi's handle and
+// the encrypted database; Kotlin holds a handle and a 16-byte id. Upload and
+// download block for the whole transfer — call them off the main thread.
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachmentMaxBytes(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    guard(0, || void_ffi::void_attachment_max_bytes() as jlong)
+}
+
+/// Seals the file at `path` for sending. Returns the handle, or 0;
+/// `outStatus[0]` gets the `VoidStatus` (11 means too large).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_app_void_VoidCore_enginePrepareAttachment(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine: jlong,
+    path: JString,
+    name: JString,
+    mime: JString,
+    width: jint,
+    height: jint,
+    caption: JString,
+    out_status: JIntArray,
+) -> jlong {
+    let env = &mut env;
+    guard(0, || {
+        let path = read_string(env, &path);
+        let name = read_string(env, &name);
+        let mime = read_string(env, &mime);
+        let caption = read_string(env, &caption);
+        let (status, handle) = match std::ffi::CString::new(path) {
+            Ok(path_c) if engine != 0 => unsafe {
+                let mut out: *mut void_ffi::VoidAttachment = std::ptr::null_mut();
+                let status = void_ffi::void_engine_prepare_attachment(
+                    engine as *const VoidEngine,
+                    path_c.as_ptr(),
+                    name.as_ptr(),
+                    name.len(),
+                    mime.as_ptr(),
+                    mime.len(),
+                    width.clamp(0, i32::from(u16::MAX)) as u16,
+                    height.clamp(0, i32::from(u16::MAX)) as u16,
+                    caption.as_ptr(),
+                    caption.len(),
+                    &mut out,
+                );
+                (status, out as jlong)
+            },
+            _ => (VoidStatus::BadArgument, 0),
+        };
+        let _ = env.set_int_array_region(&out_status, 0, &[status as jint]);
+        if status == VoidStatus::Ok {
+            handle
+        } else {
+            0
+        }
+    })
+}
+
+/// The attachment's 16-byte id, or an empty array.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachmentId(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jbyteArray {
+    let env = &mut env;
+    guard(std::ptr::null_mut(), || {
+        let mut id = [0u8; 16];
+        let ok = handle != 0
+            && unsafe {
+                void_ffi::void_attachment_id(
+                    handle as *const void_ffi::VoidAttachment,
+                    id.as_mut_ptr(),
+                ) == VoidStatus::Ok
+            };
+        let bytes: &[u8] = if ok { &id } else { &[] };
+        env.byte_array_from_slice(bytes)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Transfer progress packed into one long: chunks done in the high 32 bits,
+/// chunks in all in the low 32. Safe from any thread.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachmentProgress(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    guard(0, || unsafe {
+        if handle == 0 {
+            return 0;
+        }
+        let (mut done, mut total) = (0u32, 0u32);
+        void_ffi::void_attachment_progress(
+            handle as *const void_ffi::VoidAttachment,
+            &mut done,
+            &mut total,
+        );
+        ((u64::from(done) << 32) | u64::from(total)) as jlong
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachmentCancel(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    guard((), || unsafe {
+        if handle != 0 {
+            void_ffi::void_attachment_cancel(handle as *const void_ffi::VoidAttachment);
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachmentFree(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    guard((), || unsafe {
+        if handle != 0 {
+            void_ffi::void_attachment_free(handle as *mut void_ffi::VoidAttachment);
+        }
+    })
+}
+
+fn transfer(
+    env: &mut JNIEnv,
+    tor: jlong,
+    onion_address: &JString,
+    port: jint,
+    handle: jlong,
+    run: unsafe extern "C" fn(
+        *const VoidTorHandle,
+        *const std::os::raw::c_char,
+        u16,
+        *const void_ffi::VoidAttachment,
+    ) -> VoidStatus,
+) -> jint {
+    let address = read_string(env, onion_address);
+    let Ok(addr_c) = std::ffi::CString::new(address) else {
+        return VoidStatus::BadArgument as jint;
+    };
+    if tor == 0 || handle == 0 {
+        return VoidStatus::BadArgument as jint;
+    }
+    unsafe {
+        run(
+            tor as *const VoidTorHandle,
+            addr_c.as_ptr(),
+            port as u16,
+            handle as *const void_ffi::VoidAttachment,
+        ) as jint
+    }
+}
+
+/// Uploads a prepared attachment over its own circuit. Blocks. Returns the
+/// `VoidStatus`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachmentUpload(
+    mut env: JNIEnv,
+    _class: JClass,
+    tor: jlong,
+    onion_address: JString,
+    port: jint,
+    handle: jlong,
+) -> jint {
+    let env = &mut env;
+    guard(VoidStatus::Internal as jint, || {
+        transfer(
+            env,
+            tor,
+            &onion_address,
+            port,
+            handle,
+            void_ffi::void_attachment_upload,
+        )
+    })
+}
+
+/// Downloads a received attachment over its own circuit. Blocks. Returns the
+/// `VoidStatus` (7 means the relay no longer has it).
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_attachmentDownload(
+    mut env: JNIEnv,
+    _class: JClass,
+    tor: jlong,
+    onion_address: JString,
+    port: jint,
+    handle: jlong,
+) -> jint {
+    let env = &mut env;
+    guard(VoidStatus::Internal as jint, || {
+        transfer(
+            env,
+            tor,
+            &onion_address,
+            port,
+            handle,
+            void_ffi::void_attachment_download,
+        )
+    })
+}
+
+/// Sends an uploaded attachment's pointer. Returns the `VoidStatus`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_engineSendAttachment(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine: jlong,
+    fingerprint: JByteArray,
+    handle: jlong,
+    now: jlong,
+) -> jint {
+    let env = &mut env;
+    guard(VoidStatus::Internal as jint, || {
+        let fp = read_bytes(env, &fingerprint);
+        if engine == 0 || handle == 0 || fp.len() != 32 {
+            return VoidStatus::BadArgument as jint;
+        }
+        let mut message_id = 0u64;
+        unsafe {
+            void_ffi::void_engine_send_attachment(
+                engine as *mut VoidEngine,
+                fp.as_ptr(),
+                handle as *const void_ffi::VoidAttachment,
+                now as u64,
+                &mut message_id,
+            ) as jint
+        }
+    })
+}
+
+/// A handle to an attachment in the history by its id, or 0.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_engineAttachmentOpen(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine: jlong,
+    id: JByteArray,
+) -> jlong {
+    let env = &mut env;
+    guard(0, || {
+        let id = read_bytes(env, &id);
+        if engine == 0 || id.len() != 16 {
+            return 0;
+        }
+        unsafe {
+            let mut out: *mut void_ffi::VoidAttachment = std::ptr::null_mut();
+            if void_ffi::void_engine_attachment_open(
+                engine as *const VoidEngine,
+                id.as_ptr(),
+                &mut out,
+            ) == VoidStatus::Ok
+            {
+                out as jlong
+            } else {
+                0
+            }
+        }
+    })
+}
+
+/// Opens an attachment's local sealed copy into memory, or returns an empty
+/// array if it is not here or does not authenticate.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_engineAttachmentRead(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine: jlong,
+    id: JByteArray,
+) -> jbyteArray {
+    let env = &mut env;
+    guard(std::ptr::null_mut(), || {
+        let id = read_bytes(env, &id);
+        if engine == 0 || id.len() != 16 {
+            return unsafe { bytes_to_jbytearray(env, empty_bytes()) };
+        }
+        unsafe {
+            let mut out = empty_bytes();
+            if void_ffi::void_engine_attachment_read(
+                engine as *const VoidEngine,
+                id.as_ptr(),
+                &mut out,
+            ) != VoidStatus::Ok
+            {
+                void_ffi::void_free_bytes(out);
+                return bytes_to_jbytearray(env, empty_bytes());
+            }
+            bytes_to_jbytearray(env, out)
+        }
+    })
+}
+
+/// Writes an attachment out in the clear to `destPath`. Returns the
+/// `VoidStatus`.
+#[no_mangle]
+pub extern "system" fn Java_app_void_VoidCore_engineAttachmentExport(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine: jlong,
+    id: JByteArray,
+    dest_path: JString,
+) -> jint {
+    let env = &mut env;
+    guard(VoidStatus::Internal as jint, || {
+        let id = read_bytes(env, &id);
+        let dest = read_string(env, &dest_path);
+        let Ok(dest_c) = std::ffi::CString::new(dest) else {
+            return VoidStatus::BadArgument as jint;
+        };
+        if engine == 0 || id.len() != 16 {
+            return VoidStatus::BadArgument as jint;
+        }
+        unsafe {
+            void_ffi::void_engine_attachment_export(
+                engine as *const VoidEngine,
+                id.as_ptr(),
+                dest_c.as_ptr(),
+            ) as jint
+        }
     })
 }
 

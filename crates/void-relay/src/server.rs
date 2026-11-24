@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use void_proto::queue::QueueId;
 use void_proto::wake::{WakeRegistration, MAX_PUSH_DELAY_SECONDS};
 
-use crate::protocol::{Delivery, Frame, FrameType, Retrieve, FRAME_SIZE};
+use crate::blobs::BlobStore;
+use crate::protocol::{BlobGet, BlobPut, Delivery, Frame, FrameType, Retrieve, FRAME_SIZE};
 use crate::store::{Config, QueueStore};
 use crate::{RelayError, RelayResult};
 
@@ -47,6 +48,9 @@ impl PushSender for NoPush {
 /// seized relay yields no key material of any kind.
 pub struct Relay {
     store: Mutex<QueueStore>,
+    /// Attachments' sealed blobs, behind their own lock: a file streaming in
+    /// must not hold up anyone's messages.
+    blobs: Mutex<BlobStore>,
     push: Box<dyn PushSender>,
     shutdown: AtomicBool,
 }
@@ -57,6 +61,7 @@ impl Relay {
     pub fn new(config: Config, push: Box<dyn PushSender>) -> Relay {
         Relay {
             store: Mutex::new(QueueStore::new(config)),
+            blobs: Mutex::new(BlobStore::new(config.blobs)),
             push,
             shutdown: AtomicBool::new(false),
         }
@@ -72,6 +77,9 @@ impl Relay {
             FrameType::Challenge => self.handle_challenge(request, now),
             FrameType::Retrieve => self.handle_retrieve(request, now),
             FrameType::WakeRegister => self.handle_wake_register(request, now),
+            FrameType::BlobPut => self.handle_blob_put(request, now),
+            FrameType::BlobGet => self.handle_blob_get(request, now),
+            FrameType::BlobDelete => self.handle_blob_delete(request),
             // A client sending cover traffic gets cover traffic back, so the
             // exchange looks like any other.
             FrameType::Padding => Frame::padding(),
@@ -79,8 +87,38 @@ impl Relay {
             FrameType::ChallengeReply
             | FrameType::Delivery
             | FrameType::Ack
-            | FrameType::Refuse => Err(RelayError::Malformed),
+            | FrameType::Refuse
+            | FrameType::BlobChunk => Err(RelayError::Malformed),
         }
+    }
+
+    fn handle_blob_put(&self, request: &Frame, now: u64) -> RelayResult<Frame> {
+        let put = BlobPut::decode(&request.body)?;
+        let mut blobs = self.blobs.lock().map_err(|_| RelayError::Io)?;
+        match blobs.put(&put.token, put.index, put.count, &put.sealed, now) {
+            Ok(()) => Ok(Frame::new(FrameType::Ack, Vec::new())),
+            Err(_) => Ok(Frame::new(FrameType::Refuse, Vec::new())),
+        }
+    }
+
+    fn handle_blob_get(&self, request: &Frame, now: u64) -> RelayResult<Frame> {
+        let get = BlobGet::decode(&request.body)?;
+        let blobs = self.blobs.lock().map_err(|_| RelayError::Io)?;
+        match blobs.get(&get.token, get.index, now) {
+            Ok(sealed) => Ok(Frame::new(FrameType::BlobChunk, sealed)),
+            Err(_) => Ok(Frame::new(FrameType::Refuse, Vec::new())),
+        }
+    }
+
+    fn handle_blob_delete(&self, request: &Frame) -> RelayResult<Frame> {
+        if request.body.len() != 32 {
+            return Err(RelayError::Malformed);
+        }
+        let mut token = [0u8; 32];
+        token.copy_from_slice(&request.body);
+        let mut blobs = self.blobs.lock().map_err(|_| RelayError::Io)?;
+        blobs.delete(&token);
+        Ok(Frame::new(FrameType::Ack, Vec::new()))
     }
 
     fn handle_deposit(&self, request: &Frame, now: u64) -> RelayResult<Frame> {
@@ -176,20 +214,30 @@ impl Relay {
         store.register_wake(queue_id, wake_id, epoch)
     }
 
-    /// Run the retention sweep.
+    /// Run the retention sweep, over queues and blobs.
     pub fn sweep(&self, now: u64, epoch: u64) -> RelayResult<usize> {
-        let mut store = self.store.lock().map_err(|_| RelayError::Io)?;
-        Ok(store.sweep(now, epoch))
+        let records = {
+            let mut store = self.store.lock().map_err(|_| RelayError::Io)?;
+            store.sweep(now, epoch)
+        };
+        let mut blobs = self.blobs.lock().map_err(|_| RelayError::Io)?;
+        Ok(records + blobs.sweep(now))
     }
 
     /// Operational metrics. Deliberately aggregate only: there is no per-queue
     /// reporting, because a relay operator who can watch one queue's activity
     /// has a surveillance capability the design promises not to build.
     pub fn metrics(&self) -> RelayResult<Metrics> {
-        let store = self.store.lock().map_err(|_| RelayError::Io)?;
+        let (queues, records) = {
+            let store = self.store.lock().map_err(|_| RelayError::Io)?;
+            (store.queue_count(), store.record_count())
+        };
+        let blobs = self.blobs.lock().map_err(|_| RelayError::Io)?;
         Ok(Metrics {
-            queues: store.queue_count(),
-            records: store.record_count(),
+            queues,
+            records,
+            blobs: blobs.blob_count(),
+            blob_bytes: blobs.held_bytes(),
         })
     }
 
@@ -212,6 +260,10 @@ pub struct Metrics {
     pub queues: usize,
     /// Records currently held.
     pub records: usize,
+    /// Attachment blobs currently held.
+    pub blobs: usize,
+    /// Sealed bytes held across every blob.
+    pub blob_bytes: usize,
 }
 
 /// Current Unix time in seconds.
@@ -225,6 +277,14 @@ pub fn now() -> u64 {
 
 /// Serve one connection: read frames, handle them, write responses.
 pub fn serve_connection(relay: &Relay, stream: &mut TcpStream) -> RelayResult<()> {
+    serve_stream(relay, stream)
+}
+
+/// Serve any duplex byte stream: read frames, handle them, write responses, in
+/// order. A client may write several frames before reading their responses —
+/// attachment transfers do, to keep a slow circuit full — and gets the
+/// responses in the order it wrote the requests.
+pub fn serve_stream<S: Read + Write>(relay: &Relay, stream: &mut S) -> RelayResult<()> {
     let mut buf = vec![0u8; FRAME_SIZE];
     loop {
         // A shutdown must actually stop serving, not merely stop accepting.
@@ -573,6 +633,69 @@ mod tests {
         assert_eq!(r.sweep(1000 + ttl + 1, 0).unwrap(), 1);
         assert_eq!(r.metrics().unwrap().records, 0);
         assert_eq!(r.metrics().unwrap().queues, 0);
+    }
+
+    #[test]
+    fn a_blob_goes_in_and_comes_out_through_frames() {
+        use crate::protocol::{BlobGet, BlobPut};
+        use void_proto::attachment::SEALED_CHUNK_LEN;
+        let r = relay();
+        let token = [8u8; 32];
+        for index in 0..3u32 {
+            let put = BlobPut {
+                token,
+                index,
+                count: 3,
+                sealed: vec![index as u8; SEALED_CHUNK_LEN],
+            };
+            let resp = r
+                .handle(&Frame::new(FrameType::BlobPut, put.encode()), 0)
+                .unwrap();
+            assert_eq!(resp.kind, FrameType::Ack);
+        }
+        assert_eq!(r.metrics().unwrap().blobs, 1);
+        assert_eq!(
+            r.metrics().unwrap().records,
+            0,
+            "blobs are not queue records"
+        );
+
+        let get = |index: u32| {
+            r.handle(
+                &Frame::new(FrameType::BlobGet, BlobGet { token, index }.encode()),
+                0,
+            )
+            .unwrap()
+        };
+        let chunk = get(2);
+        assert_eq!(chunk.kind, FrameType::BlobChunk);
+        assert_eq!(chunk.body, vec![2u8; SEALED_CHUNK_LEN]);
+        assert_eq!(get(3).kind, FrameType::Refuse);
+
+        // Every answer is one frame size, a chunk or a refusal alike.
+        for f in [chunk, get(9)] {
+            assert_eq!(f.encode().unwrap().len(), FRAME_SIZE);
+        }
+
+        let deleted = r
+            .handle(&Frame::new(FrameType::BlobDelete, token.to_vec()), 0)
+            .unwrap();
+        assert_eq!(deleted.kind, FrameType::Ack);
+        assert_eq!(get(0).kind, FrameType::Refuse);
+        // Deleting what is not there is acknowledged just the same.
+        let again = r
+            .handle(&Frame::new(FrameType::BlobDelete, token.to_vec()), 0)
+            .unwrap();
+        assert_eq!(again.kind, FrameType::Ack);
+        assert_eq!(r.metrics().unwrap().blob_bytes, 0);
+    }
+
+    #[test]
+    fn a_blob_chunk_from_a_client_is_malformed() {
+        let r = relay();
+        assert!(r
+            .handle(&Frame::new(FrameType::BlobChunk, vec![]), 0)
+            .is_err());
     }
 
     #[test]

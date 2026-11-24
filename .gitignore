@@ -30,3 +30,10 @@ android/build/
 tools/app-bindings/kotlin/.gradle/
 tools/app-bindings/kotlin/.kotlin/
 tools/app-bindings/kotlin/build/
+
+# The development relay's onion key and Tor state (scripts/run_dev_relay.sh).
+# A private key: never committed.
+.dev-relay/
+
+# The two-phone end-to-end test's logs and screenshots (scripts/run_ios_e2e.sh).
+.e2e/

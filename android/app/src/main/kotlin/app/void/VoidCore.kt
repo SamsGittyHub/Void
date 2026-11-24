@@ -214,7 +214,7 @@ object VoidCore {
      * Blocks until the callee connects, the answer window closes, or
      * [callHostCancel]. Never call on the main thread. 0 on failure.
      */
-    @JvmStatic external fun callHostAccept(hostHandle: Long, mediaSecret: ByteArray, callId: ByteArray): Long
+    @JvmStatic external fun callHostAccept(hostHandle: Long, mediaSecret: ByteArray, callId: ByteArray, video: Boolean): Long
 
     /** Wake a blocked [callHostAccept]. */
     @JvmStatic external fun callHostCancel(hostHandle: Long)
@@ -229,6 +229,7 @@ object VoidCore {
         port: Int,
         mediaSecret: ByteArray,
         callId: ByteArray,
+        video: Boolean,
     ): Long
 
     /** Encrypt and send one encoded audio frame. Empty means silence. False once the connection is gone. */
@@ -255,23 +256,28 @@ object VoidCore {
     /** Largest encoded audio frame one media frame can carry. */
     @JvmStatic external fun callPayloadLen(): Int
 
-    /** Places a call, filling the 16-byte id and 32-byte secret arrays. `now` is in seconds. */
+    /** Places a call — a video call if [video] — filling the 16-byte id and 32-byte secret arrays. `now` is in seconds. */
     @JvmStatic external fun enginePlaceCall(
         engineHandle: Long,
         fingerprint: ByteArray,
         onionAddress: String,
         port: Int,
+        video: Boolean,
         now: Long,
         outCallId: ByteArray,
         outMediaSecret: ByteArray,
     ): Boolean
 
-    /** Answers a call, returning the caller's address, or "" on failure. */
+    /**
+     * Answers a call, returning the caller's address, or "" on failure.
+     * `outPortAndVideo[0]` gets the port and `[1]` is 1 for a video call.
+     */
     @JvmStatic external fun engineAnswerCall(
         engineHandle: Long,
         fingerprint: ByteArray,
         outCallId: ByteArray,
         outMediaSecret: ByteArray,
+        outPortAndVideo: IntArray,
     ): String
 
     /** Ends a call. `reason` matches [CallEndReason.code]. */
@@ -282,6 +288,89 @@ object VoidCore {
 
     /** Drains call events; parse with [CallEvent.parseAll]. */
     @JvmStatic external fun engineTakeCallEvents(engineHandle: Long): ByteArray
+
+    // --- video calls (D-033) ------------------------------------------------
+    //
+    // Encoded H.264 units (Annex B, parameter sets before every keyframe — the
+    // apps' agreement; the core never parses them) cross as byte arrays, the
+    // way encoded audio does. The lanes, the padding and the keyframe
+    // bookkeeping are the core's.
+
+    /** Queue one encoded unit. Returns the [VoidStatus] ordinal: 0 queued, 2 dropped — encode a keyframe next. */
+    @JvmStatic external fun callVideoPush(
+        mediaHandle: Long,
+        data: ByteArray,
+        keyframe: Boolean,
+        rotation: Int,
+        timestampMs: Int,
+    ): Int
+
+    /**
+     * The next whole unit the other end sent, or an empty array. Framed as
+     * `u8(flags: bit 0 keyframe) | u8(rotation) | u32 LE(timestamp_ms) | data`.
+     */
+    @JvmStatic external fun callVideoTake(mediaHandle: Long): ByteArray
+
+    /** Whether the next encoded frame should be a keyframe. */
+    @JvmStatic external fun callVideoNeedsKeyframe(mediaHandle: Long): Boolean
+
+    /** Tell the other end the camera is on or off. The wire is the same size either way. */
+    @JvmStatic external fun callVideoSetCamera(mediaHandle: Long, on: Boolean)
+
+    /** Whether the other end says its camera is off. */
+    @JvmStatic external fun callVideoPeerCameraOff(mediaHandle: Long): Boolean
+
+    /** What the user must also be told before a video call. From the core, so it cannot drift. */
+    @JvmStatic external fun callVideoDisclosure(): String
+
+    // --- attachments (D-032) ------------------------------------------------
+    //
+    // A file crosses as a path; its token and key stay in the core's handle and
+    // the encrypted database. Upload and download block for the whole
+    // transfer — never on the main thread or the engine's.
+
+    /** The largest file Void sends, in bytes. */
+    @JvmStatic external fun attachmentMaxBytes(): Long
+
+    /** Seal the file at [path] for sending. 0 on failure; `outStatus[0]` gets the [VoidStatus] ordinal. */
+    @JvmStatic external fun enginePrepareAttachment(
+        engineHandle: Long,
+        path: String,
+        name: String,
+        mime: String,
+        width: Int,
+        height: Int,
+        caption: String,
+        outStatus: IntArray,
+    ): Long
+
+    /** The attachment's 16-byte id, its relay address. */
+    @JvmStatic external fun attachmentId(handle: Long): ByteArray
+
+    /** Chunks done in the high 32 bits, chunks in all in the low 32. Any thread. */
+    @JvmStatic external fun attachmentProgress(handle: Long): Long
+
+    @JvmStatic external fun attachmentCancel(handle: Long)
+
+    @JvmStatic external fun attachmentFree(handle: Long)
+
+    /** Upload over a circuit of its own. Blocks. Returns the [VoidStatus] ordinal. */
+    @JvmStatic external fun attachmentUpload(torHandle: Long, onionAddress: String, port: Int, handle: Long): Int
+
+    /** Download over a circuit of its own, every chunk checked. Blocks. Returns the [VoidStatus] ordinal. */
+    @JvmStatic external fun attachmentDownload(torHandle: Long, onionAddress: String, port: Int, handle: Long): Int
+
+    /** Send an uploaded attachment's pointer. Returns the [VoidStatus] ordinal. */
+    @JvmStatic external fun engineSendAttachment(engineHandle: Long, fingerprint: ByteArray, handle: Long, now: Long): Int
+
+    /** A handle to an attachment in the history, by id, or 0. */
+    @JvmStatic external fun engineAttachmentOpen(engineHandle: Long, id: ByteArray): Long
+
+    /** A file this phone holds, opened into memory; empty if not here or not intact. */
+    @JvmStatic external fun engineAttachmentRead(engineHandle: Long, id: ByteArray): ByteArray
+
+    /** Write an attachment out in the clear to [destPath]. Returns the [VoidStatus] ordinal. */
+    @JvmStatic external fun engineAttachmentExport(engineHandle: Long, id: ByteArray, destPath: String): Int
 }
 
 // --- parsing -----------------------------------------------------------------
@@ -391,12 +480,39 @@ sealed class ContactEvent {
     }
 }
 
+/** A file in the history, as `void_engine_messages` describes it. Never its key. */
+data class AttachmentInfo(
+    /** Its relay address, which is how the core names it. */
+    val id: ByteArray,
+    val size: Long,
+    val width: Int,
+    val height: Int,
+    val name: String,
+    val mime: String,
+    /** Whether this phone holds the sealed copy, so it can be opened now. */
+    val isLocal: Boolean,
+) {
+    val key: String get() = id.toHex()
+    val isImage: Boolean get() = mime.startsWith("image/")
+    val isVideo: Boolean get() = mime.startsWith("video/")
+
+    override fun equals(other: Any?): Boolean =
+        other is AttachmentInfo && id.contentEquals(other.id) && isLocal == other.isLocal &&
+            name == other.name && size == other.size
+
+    override fun hashCode(): Int = id.contentHashCode() * 31 + isLocal.hashCode()
+}
+
 /** One message from the stored history. */
 data class StoredMessage(
+    /** The engine's record id: stable for the message's life. */
+    val id: Long,
     val isOutgoing: Boolean,
     val delivery: DeliveryState,
     val timestampSeconds: Long,
+    /** The message, or a file's caption. */
     val text: String,
+    val attachment: AttachmentInfo? = null,
 ) {
     companion object {
         /** Layout documented on `void_ffi::void_engine_messages`. */
@@ -404,11 +520,26 @@ data class StoredMessage(
             val reader = ByteReader(buf)
             val out = mutableListOf<StoredMessage>()
             while (!reader.isAtEnd) {
+                val id = reader.u64() ?: break
                 val direction = reader.u8() ?: break
                 val delivery = reader.u8() ?: break
                 val timestamp = reader.u64() ?: break
                 val text = reader.u32()?.asLength()?.let { reader.string(it) } ?: break
-                out.add(StoredMessage(direction == 1, DeliveryState.fromCode(delivery), timestamp, text))
+                val kind = reader.u8() ?: break
+                var attachment: AttachmentInfo? = null
+                if (kind == 1) {
+                    val fileId = reader.bytes(16) ?: break
+                    val size = reader.u64() ?: break
+                    val width = reader.u16() ?: break
+                    val height = reader.u16() ?: break
+                    val name = reader.u16()?.let { reader.string(it) } ?: break
+                    val mime = reader.u16()?.let { reader.string(it) } ?: break
+                    val local = reader.u8() ?: break
+                    attachment = AttachmentInfo(fileId, size, width, height, name, mime, local == 1)
+                } else if (kind != 0) {
+                    break
+                }
+                out.add(StoredMessage(id, direction == 1, DeliveryState.fromCode(delivery), timestamp, text, attachment))
             }
             return out
         }
@@ -451,6 +582,7 @@ sealed class CallEvent {
         override val callId: ByteArray,
         val address: String,
         val port: Int,
+        val video: Boolean,
     ) : CallEvent()
 
     class Answered(override val fingerprint: ByteArray, override val callId: ByteArray) : CallEvent()
@@ -473,7 +605,7 @@ sealed class CallEvent {
          * event, matching `void_ffi::void_engine_take_call_events`:
          *
          *   u8(kind) | 32 fingerprint | 16 call_id | u8(reason)
-         *   | u32 LE(address_len) | address | u16 LE(port)
+         *   | u32 LE(address_len) | address | u16 LE(port) | u8(flags: bit 0 video)
          */
         fun parseAll(buf: ByteArray): List<CallEvent> {
             val reader = ByteReader(buf)
@@ -485,9 +617,10 @@ sealed class CallEvent {
                 val reason = reader.u8() ?: break
                 val address = reader.u32()?.asLength()?.let { reader.string(it) } ?: break
                 val port = reader.u16() ?: break
+                val flags = reader.u8() ?: break
                 out.add(
                     when (kind) {
-                        1 -> Incoming(fingerprint, callId, address, port)
+                        1 -> Incoming(fingerprint, callId, address, port, flags and 1 != 0)
                         2 -> Answered(fingerprint, callId)
                         3 -> Ended(fingerprint, callId, CallEndReason.from(reason))
                         4 -> Missed(fingerprint, callId)
@@ -539,7 +672,7 @@ class NativeTickResult(val outcome: Int, val messages: ByteArray)
 /** Mirrors `void_ffi::VoidStatus`. */
 enum class VoidStatus {
     OK, BAD_ARGUMENT, FAILED, OFFLINE, KEY_CHANGED, LOCKED, INTERNAL, EXPIRED, ALREADY_CONNECTED, OWN_INVITE,
-    WRONG_RELAY;
+    WRONG_RELAY, TOO_LARGE, CANCELLED;
 
     companion object {
         fun from(ordinal: Int): VoidStatus = entries.getOrElse(ordinal) { FAILED }

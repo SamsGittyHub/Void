@@ -580,3 +580,75 @@ fn a_renamed_contact_keeps_its_name_after_a_restart() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn an_attachment_and_its_key_survive_a_restart_at_both_ends() {
+    // D-032: the key that opens a file's sealed copy lives in the encrypted
+    // database with its message, so a restart loses neither — and destroying
+    // the database is destroying the file.
+    use void_proto::attachment::{Attachment, AttachmentSecrets};
+    use void_store::model::Direction;
+
+    let alice_path = temp_db_path("attachment-alice");
+    let bob_path = temp_db_path("attachment-bob");
+    let vault = SoftwareVault::from_raw([4u8; 32]);
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = persisted_bob(&alice_path, &vault, &relay, &clock);
+    let mut bob = persisted_bob(&bob_path, &vault, &relay, &clock);
+
+    let (bundle, bob_queue) = bob.create_bundle(b"relay.onion").unwrap();
+    let bob_fp = alice
+        .start_conversation(&bundle, "Bob", "hi", 1_000_000)
+        .unwrap();
+    let t = drain(&mut alice, 0, 40);
+    let initial = collect_raw(&relay, &bob_queue).unwrap();
+    let (alice_fp, _) = bob
+        .accept_conversation(bundle.queue.queue_id, &initial, 1_000_000)
+        .unwrap();
+
+    let secrets = AttachmentSecrets::generate().unwrap();
+    let attachment = Attachment::new(
+        &secrets,
+        9_000,
+        "notes.txt",
+        "text/plain",
+        0,
+        0,
+        "the notes",
+    )
+    .unwrap();
+    let blob = attachment.blob_id();
+    alice
+        .send_attachment(&bob_fp, attachment.clone(), 1_000_100)
+        .unwrap();
+    let t = drain(&mut alice, t, 40);
+    let (t, got) = pump(&mut bob, t, 40);
+    assert!(got.contains(&"the notes".to_string()));
+
+    drop(alice);
+    drop(bob);
+    let alice = restored(&alice_path, &vault, &relay, &clock, t);
+    let bob = restored(&bob_path, &vault, &relay, &clock, t);
+
+    let (theirs, peer, direction) = bob.attachment(&blob).expect("bob still has it");
+    assert_eq!(theirs, attachment);
+    assert_eq!((peer, direction), (alice_fp, Direction::Incoming));
+    let (ours, peer, direction) = alice.attachment(&blob).expect("alice still has it");
+    assert_eq!(ours, attachment);
+    assert_eq!((peer, direction), (bob_fp, Direction::Outgoing));
+    assert_eq!(bob.attachment_ids(), vec![blob]);
+
+    // History shows it with its caption, and ids are stable across reads.
+    let history = bob.messages_with_ids(&alice_fp).unwrap();
+    let (id, message) = history
+        .iter()
+        .find(|(_, m)| m.attachment.is_some())
+        .unwrap();
+    assert_eq!(message.body, "the notes");
+    let again = bob.messages_with_ids(&alice_fp).unwrap();
+    assert!(again.iter().any(|(i, _)| i == id));
+
+    let _ = std::fs::remove_file(&alice_path);
+    let _ = std::fs::remove_file(&bob_path);
+}

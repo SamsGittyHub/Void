@@ -11,7 +11,7 @@ package app.void
  * iOS's `RelayConfig` holds the same values.
  */
 object RelayConfig {
-    const val ONION_ADDRESS = "hxxfawyq3xymghgqkalw4ut6emtt5nhaimquyrvi7ngyeecrri4qy5qd.onion"
+    const val ONION_ADDRESS = "viptz6o5rgzml3ky6v5oddli4kchyrhkqfgqrh44b3ijikzggh4pbmid.onion"
     const val PORT = 9443
 
     /**

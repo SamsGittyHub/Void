@@ -1,10 +1,11 @@
-# Void Protocol Specification v3
+# Void Protocol Specification v4
 
 **Status:** Draft, for review before implementation freeze (PRD §11 Phase 1
 deliverable)
-**Protocol identifier:** `void/v3/pqxdh/x25519+mlkem1024/ed25519+mldsa87` —
+**Protocol identifier:** `void/v4/pqxdh/x25519+mlkem1024/ed25519+mldsa87` —
 `v2` added message content framing (§13a); `v3` added call offer timestamps and
-the busy signal (§13b).
+the busy signal (§13b); `v4` added attachments (§9, §13a, §13c) and video calls
+(§13b).
 
 This document specifies the bytes on the wire. It is written so that an
 independent implementation could be built from it, and so that a reviewer can
@@ -537,12 +538,25 @@ Frame = u8(type) || u8(0) || u16(0) || u32(body_len) || raw(body) || raw(padding
 | 7 Refuse | R→C | empty |
 | 8 Padding | both | random |
 | 9 WakeRegister | C→R | `WakeRegistration` |
+| 10 BlobPut | C→R | `raw(token : 32) \|\| u32(index) \|\| u32(count) \|\| raw(sealed_chunk : 2000)` |
+| 11 BlobGet | C→R | `raw(token : 32) \|\| u32(index)` |
+| 12 BlobChunk | R→C | `raw(sealed_chunk : 2000)` |
+| 13 BlobDelete | C→R | `raw(token : 32)` |
 
 **Refusals carry no reason.** A relay distinguishing "bad proof" from "unknown
 queue" from "rate limited" is an oracle for probing which queues exist.
 
 **An empty queue returns a Delivery with an empty body**, not a Refuse — same
 type, same size, so "nothing waiting" is not observable.
+
+**Blob frames** (types 10–13) carry attachments (§13c). `BlobPut` is answered
+with Ack or Refuse, `BlobGet` with BlobChunk or Refuse, and `BlobDelete` always
+with Ack, whether or not there was anything to delete, so the answer says
+nothing about what the relay held. A blob that does not exist and a chunk that
+has not arrived are refused alike. `BlobPut` fills a frame body exactly:
+`CHUNK_LEN` was chosen so that it does. A client sends blob frames on a stream
+of their own, over a Tor circuit isolated from its messaging stream, never
+interleaved with deposits and retrievals.
 
 ---
 
@@ -626,8 +640,9 @@ Every ratchet plaintext carries a kind byte before its body:
 
 ```
 plaintext = u8(kind) || body
-kind 1 = Text   body = UTF-8
-kind 2 = Call   body = CallSignal (§13b)
+kind 1 = Text         body = UTF-8
+kind 2 = Call         body = CallSignal (§13b)
+kind 3 = Attachment   body = Attachment (§13c)
 ```
 
 An unknown kind is an error, never a silent drop — a message a client cannot
@@ -642,6 +657,10 @@ This framing is why `PROTOCOL_ID` is `v2`. It changes no key derivation, but a
 v1 and a v2 client would decrypt each other successfully and then misread every
 message, so the handshake must fail instead.
 
+Kind 3 is half of why it is now `v4`: a `v3` client cannot read an attachment,
+so a `v3` and a `v4` client must not be able to complete a handshake at all.
+The offer's flags byte (§13b) is the other half.
+
 ---
 
 ## 13b. Calls (D-024)
@@ -653,16 +672,18 @@ Two channels with opposite requirements, carried differently.
 ```
 CallSignal = u8(1) || raw(call_id : 16) || bytes16(onion_address)
            || u16(port) || raw(media_secret : 32)
-           || u64(sent_at)                              -- Offer
+           || u64(sent_at) || u8(flags)                 -- Offer
            = u8(2) || raw(call_id : 16) || u8(accepted) -- Answer
            = u8(3) || raw(call_id : 16) || u8(reason)   -- End
 
+flags      = bit 0: video call; every other bit must be zero
 reason     = 1 hung up | 2 declined | 3 missed | 4 failed | 5 busy
 ```
 
-`sent_at` is Unix seconds by the caller's clock, inside the ciphertext. A
-signal naming a `call_id` other than the call in progress with that contact is
-ignored, so a late `End` from a finished call cannot tear down the next one.
+`sent_at` is Unix seconds by the caller's clock, inside the ciphertext. An offer
+with an unknown flag bit is refused, not read as a voice call. A signal naming
+a `call_id` other than the call in progress with that contact is ignored, so a
+late `End` from a finished call cannot tear down the next one.
 
 **Timing.** Offers wait in the mailbox like any message, so the receiver judges
 each one on arrival:
@@ -728,8 +749,57 @@ mid-frame keeps what it has and resumes; a send finishes a partly written frame
 before starting the next, and drops new frames rather than queue behind a
 stalled circuit, since late audio is only delay.
 
-*Tests:* `call::tests::*` in `void-proto` and `void-tor`, and the call tests
-in `void-client/tests/end_to_end.rs` (see D-028).
+**Video calls (D-033)** are the same call with a bigger frame. The offer's
+video flag fixes the frame size for the whole call, at both ends:
+
+```
+voice frame = u32(seq) || AEAD(k_dir, nonce = seq, aad = call_id,
+                              u16(len) || audio || padding)            -- 142 bytes
+video frame = u32(seq) || AEAD(k_dir, nonce = seq, aad = call_id,
+                              u16(len) || audio || padding             -- 120 + 2
+                              || u16(vlen) || slice || padding)        -- 560 + 2
+                                                                       -- 704 bytes
+```
+
+Audio is padded to `MEDIA_PAYLOAD_LEN` and the slice to `VIDEO_SLICE_LEN`
+inside the encryption, so a frame is one size whatever either carries: about
+282 kbit/s each way, against a voice call's 57. Video does not get packets of
+its own, because an encoder's output tracks motion the way a variable-bitrate
+voice codec tracks speech.
+
+A slice carries a piece of one encoded video *unit* (a frame of video), and the
+sender's state:
+
+```
+slice = u8(sflags) || u16(unit_seq) || u32(offset) || raw(unit_bytes)
+      | u8(sflags) || raw(zeros : 6)                    -- nothing to send
+
+sflags = 0x01 has data | 0x02 wants a keyframe | 0x04 camera off
+unit   = u8(uflags) || u32(timestamp_ms) || u32(len) || raw(data : len)
+uflags = 0x01 keyframe | bits 1–2: quarter turns clockwise to display upright
+```
+
+A unit is cut into slices in order, `offset` counting bytes of the encoded unit
+(header included), and is complete when `9 + len` bytes have arrived. `data` is
+opaque to the protocol; the apps carry H.264 in Annex B form with the sequence
+and picture parameter sets before every keyframe, so a receiver can begin at
+any keyframe. Anything malformed in a slice (a flag bit not listed, a unit over
+512 KiB, a piece that does not continue the unit in progress) is treated as
+loss, never as an error that could end the call.
+
+Loss is handled by the sequence numbers the frames already carry. Any gap
+discards the unit in progress and every unit after it until a keyframe arrives,
+and while it waits the receiver sets *wants a keyframe* in its own slices. The
+sender makes one unless one is queued, in flight, or finished less than
+`KEYFRAME_HOLDOFF_SLICES` (one second) ago, so two ends cannot ask each other
+into a loop. A sender more than a second of slices behind drops delta frames
+and makes the next one a keyframe. *Camera off* is a flag inside the
+encryption: the other end shows a placeholder rather than a frozen picture,
+and the frame on the wire is unchanged.
+
+*Tests:* `call::tests::*` and `video::tests::*` in `void-proto`,
+`call::tests::*` in `void-tor`, and the call tests in
+`void-client/tests/end_to_end.rs` (see D-028, D-033).
 
 **Measured cost.** `experiments/onion-call/RESULTS.md`: 0% loss over 4,500
 packets, round-trip p50 376–528 ms, p95 635–1112 ms, mouth-to-ear 470–870 ms.
@@ -746,6 +816,77 @@ sustained stream where messaging is one fixed-size record every
 `PAD_INTERVAL_MS` regardless of activity, which is a materially better
 correlation target. Any claim that a call exposes location would be false and is
 asserted against in `the_call_disclosure_says_what_is_true_and_not_what_is_not`.
+
+---
+
+## 13c. Attachments (D-032)
+
+A file does not travel as a message: the messaging lane carries one record per
+`PAD_INTERVAL_MS`, about 200 bytes a second. Its bytes are sealed under a key
+made for that file and parked on the relay as a *blob*; what travels through
+the ratchet is a pointer to it, content kind 3 (§13a).
+
+**Secrets.** Each file gets a fresh random 32-byte `token`, which addresses the
+blob, and a fresh random 32-byte `key`, which opens it. Both leave the sender's
+phone only inside the ratchet.
+
+```
+blob_id     = BLAKE3-derive_key("void/v1/attachment/blob-id", token)[0..16]
+data_chunks = max(1, ceil(size / CHUNK_LEN))
+count       = padme(max(data_chunks, MIN_CHUNKS))
+chunk_i     = file[i·CHUNK_LEN ..][..CHUNK_LEN], zero-filled to CHUNK_LEN
+              (all zeros for i ≥ data_chunks)
+sealed_i    = AEAD(key, nonce = i, aad = blob_id || u32(i) || u32(count), chunk_i)
+```
+
+Every sealed chunk is `SEALED_CHUNK_LEN` bytes. The associated data binds each
+chunk to its place and to its blob, so a relay cannot reorder, drop, swap or
+truncate chunks, or splice two blobs, without the recipient noticing. Each
+`(key, nonce)` pair is used once: a file sent twice gets a new key.
+
+`padme(n)` (Nikitin et al., PETS 2019) is `n` for `n ≤ 2`; otherwise, with
+`E = floor(log2 n)` and `S = floor(log2 E) + 1`, it is `n` rounded up to a
+multiple of `2^(E − S)`. It leaks O(log log n) bits of the size and costs at
+most about 12%; with the floor of `MIN_CHUNKS`, every file up to 15,872 bytes
+has the same count.
+
+**The pointer:**
+
+```
+Attachment = raw(token : 32) || raw(key : 32) || u64(size) || u32(count)
+          || bytes16(name) || bytes16(mime) || u16(width) || u16(height)
+          || bytes16(caption)
+```
+
+`size` is at most `MAX_ATTACHMENT_BYTES`; `count` must hold `size` (at least
+`data_chunks`) and be at most `MAX_CHUNKS`, and a sender pads it as above. `name` is at most 255 bytes, `mime` 127, `caption` 4,096.
+`width` and `height` are pixels for an image or video, else zero. The receiver
+sanitises `name` and `mime` on decode, whatever the sender did: a name becomes
+its last path component with control and bidirectional-override characters
+removed (`file` if nothing is left), and a media type not of the form
+`type/subtype` becomes `application/octet-stream`.
+
+**On the relay** (§9, types 10–13), a blob is keyed by `blob_id`, so the
+relay's table holds addresses and never the capability that names them. The
+first chunk to arrive fixes `count`; chunks are write-once, and an identical
+resend is acknowledged, so an interrupted upload is simply run again. An upload
+not finished within an hour is deleted, as is every blob after `Blob TTL`. The
+relay holds a bounded number of blob bytes in all, counted as chunks arrive
+rather than as blobs are announced, and refuses chunks past it.
+
+**Transfer.** The sender uploads every chunk, padding included, and only then
+queues the pointer. The receiver fetches every chunk, padding included, opens
+each, keeps the first `size` bytes, and deletes the blob. Both send their blob
+frames on a stream of their own over an isolated circuit (§9).
+
+**At rest,** each end keeps the sealed chunks as they travelled, and the
+`Attachment` — with its key — in the encrypted store (§12), so destroying the
+store's key leaves every kept file unreadable.
+
+*Tests:* `attachment::tests::*` in `void-proto`, `blobs::tests::*` in
+`void-relay`, `attachment::tests::*` and the attachment tests in
+`tests/end_to_end.rs` and `tests/persistence.rs` in `void-client`, and
+`a_file_crosses_the_boundary_end_to_end` in `void-ffi`.
 
 ---
 
@@ -767,6 +908,17 @@ asserted against in `the_call_disclosure_says_what_is_true_and_not_what_is_not`.
 | Deposit rate limit | 600/queue/hour |
 | Wake epoch | 6 hours |
 | Invitation TTL | 24 hours |
+| `MEDIA_FRAME_LEN` (voice call frame) | 142 |
+| `VIDEO_SLICE_LEN` | 560 |
+| `VIDEO_FRAME_LEN` | 704 |
+| `KEYFRAME_HOLDOFF_SLICES` | 50 (one second) |
+| `CHUNK_LEN` | 1,984 |
+| `SEALED_CHUNK_LEN` | 2,000 |
+| `MIN_CHUNKS` | 8 |
+| `MAX_ATTACHMENT_BYTES` | 48 MiB |
+| Blob TTL | 7 days |
+| Blob upload window | 1 hour |
+| Blob capacity, per relay (default) | 1 GiB |
 
 ---
 
@@ -786,6 +938,12 @@ asserted against in `the_call_disclosure_says_what_is_true_and_not_what_is_not`.
 | Relay cannot destroy a session by replay | receive commits after the tag (§6.5.1) | `a_relay_redelivering_an_old_record_cannot_kill_a_conversation` |
 | Relay cannot tell a call from a message | content kind is inside the ciphertext | `call_signalling_is_indistinguishable_from_a_message_to_the_relay` |
 | Call media is confidential to the two ends | keys derive from a secret sent inside the ratchet | `the_two_directions_use_different_keys` |
+| Camera off is invisible on the wire | fixed-size video slices, padded inside the encryption | `every_slice_fits_the_lane_whatever_is_queued`, `a_video_frame_carries_audio_and_a_slice_at_one_size` |
+| A broken video stream costs pictures, never the call | malformed slices are loss | `hostile_slices_cost_pictures_never_the_call` |
+| Relay cannot tell a file's pointer from a message | content kind is inside the ciphertext | `an_attachment_pointer_is_indistinguishable_from_a_message_to_the_relay` |
+| Relay cannot rearrange or splice a file | blob id, index and count are AEAD associated data | `a_relay_cannot_reorder_truncate_or_move_chunks` |
+| A seized relay's table cannot fetch a file | blobs keyed by a hash of the token | `the_table_holds_the_id_not_the_token` |
+| Small files are one size | chunk count padded, floor of 8 | `padding_hides_small_files_entirely` |
 | Relay cannot stall delivery with partial messages | reassembly evicts, never fails | `a_flood_of_stalled_messages_does_not_block_a_real_one` |
 | Relay holds no key material | intrinsic proof verification | `a_key_that_does_not_address_the_queue_is_refused` |
 | No message-length leak | fixed record size | `every_deposit_the_relay_sees_is_the_same_size` |
@@ -808,5 +966,10 @@ is misleading:
 - It does not prevent Apple or Google from observing push delivery timing.
 - It does not defeat an adversary who can watch both endpoints over a long
   period and correlate.
+- It does not hide from someone watching your connection that you sent or
+  fetched a file, or roughly how big it was: a transfer is a burst about the
+  size of the padded file (D-032).
+- It does not hide a video call from a voice call: a video call's stream is
+  five times the size (D-033).
 - It provides no plausible deniability. It provides fast, verifiable destruction
   instead.

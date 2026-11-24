@@ -863,10 +863,13 @@ fn the_relay_never_sees_plaintext() {
     let m = relay.metrics().unwrap();
     assert!(m.records > 0);
     // The relay's own store exposes no plaintext accessor at all; the strongest
-    // available check is that its aggregate view is a pair of counts.
+    // available check is that its aggregate view is counts and nothing else.
     assert_eq!(
         format!("{m:?}"),
-        format!("Metrics {{ queues: {}, records: {} }}", m.queues, m.records)
+        format!(
+            "Metrics {{ queues: {}, records: {}, blobs: {}, blob_bytes: {} }}",
+            m.queues, m.records, m.blobs, m.blob_bytes
+        )
     );
 }
 
@@ -1041,7 +1044,9 @@ fn a_call_rings_answers_and_ends_through_the_relay() {
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
     // Alice's platform layer has published a service and hands the address in.
-    let call = alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    let call = alice
+        .place_call(&bob_fp, ONION, 9999, false, t / 1000)
+        .unwrap();
     assert_eq!(call.role, void_proto::call::Role::Caller);
     assert!(!call.answered);
 
@@ -1100,7 +1105,9 @@ fn a_declined_call_leaves_no_message_and_no_state() {
     let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 74);
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
-    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, t / 1000)
+        .unwrap();
     let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
     assert_eq!(events.len(), 1);
 
@@ -1140,7 +1147,9 @@ fn call_signalling_is_indistinguishable_from_a_message_to_the_relay() {
     let (t2, _) = drain(&mut alice, t, 40);
     let after_text = relay.metrics().unwrap().records;
 
-    alice.place_call(&bob_fp, ONION, 9999, t2 / 1000).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, t2 / 1000)
+        .unwrap();
     let (_t3, _) = drain(&mut alice, t2, 40);
     let after_call = relay.metrics().unwrap().records;
 
@@ -1161,12 +1170,14 @@ fn a_second_offer_from_the_same_contact_is_refused_not_silently_swapped() {
     let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 78);
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
-    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, t / 1000)
+        .unwrap();
     let first_id = alice.active_call(&bob_fp).unwrap().call_id;
 
     // Placing a second call while one is live is refused locally.
     assert!(alice
-        .place_call(&bob_fp, "other.onion", 9999, t / 1000)
+        .place_call(&bob_fp, "other.onion", 9999, false, t / 1000)
         .is_err());
     assert_eq!(alice.active_call(&bob_fp).unwrap().call_id, first_id);
 
@@ -1188,7 +1199,7 @@ fn a_stale_offer_is_missed_not_ringing() {
     // Alice's offer says it was sent at `sent`; Bob collects it well past
     // OFFER_MAX_AGE_SECONDS later.
     let sent = t / 1000;
-    let call = alice.place_call(&bob_fp, ONION, 9999, sent).unwrap();
+    let call = alice.place_call(&bob_fp, ONION, 9999, false, sent).unwrap();
     let (t2, _) = drain(&mut alice, t, 40);
     let late = t2.max((sent + OFFER_MAX_AGE_SECONDS + 5) * 1000);
     let (_, events, _) = until_call_event(&mut alice, &mut bob, late, 40);
@@ -1211,7 +1222,9 @@ fn an_unanswered_call_times_out_as_missed_at_both_ends() {
     let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 84);
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
-    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, t / 1000)
+        .unwrap();
     let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
     assert!(matches!(&events[..], [CallEvent::Incoming(_)]));
 
@@ -1261,7 +1274,9 @@ fn a_callee_that_stops_ringing_tells_the_caller() {
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
     let ahead = t / 1000 + 10 * CALLER_TIMEOUT_SECONDS;
-    alice.place_call(&bob_fp, ONION, 9999, ahead).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, ahead)
+        .unwrap();
     let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
     assert!(
         matches!(&events[..], [CallEvent::Incoming(_)]),
@@ -1308,13 +1323,15 @@ fn an_offer_during_a_call_is_declined_busy() {
     // start from the later one: before it, one of them has no slot to send in.
     let t = t_alice.max(t_carol);
 
-    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, t / 1000)
+        .unwrap();
     let (t2, events, _) = until_call_event(&mut alice, &mut bob, t, 40);
     assert!(matches!(&events[..], [CallEvent::Incoming(_)]));
     bob.answer_call(&alice_fp).unwrap();
 
     let carols = carol
-        .place_call(&bob_fp, "carol.onion", 9999, t2 / 1000)
+        .place_call(&bob_fp, "carol.onion", 9999, false, t2 / 1000)
         .unwrap();
     let (t3, events, _) = until_call_event(&mut carol, &mut bob, t2, 40);
     assert!(
@@ -1356,7 +1373,9 @@ fn call_signals_go_ahead_of_queued_messages() {
     let long = "x".repeat(5_000);
     let message_id = alice.send(&bob_fp, &long, t / 1000).unwrap();
     assert!(alice.outbox_len() >= 5);
-    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, t / 1000)
+        .unwrap();
 
     let mut now = t;
     let first = loop {
@@ -1380,7 +1399,9 @@ fn media_that_connects_first_is_the_answer() {
     let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 110);
     let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
 
-    alice.place_call(&bob_fp, ONION, 9999, t / 1000).unwrap();
+    alice
+        .place_call(&bob_fp, ONION, 9999, false, t / 1000)
+        .unwrap();
     let (t2, _, _) = until_call_event(&mut alice, &mut bob, t, 40);
     bob.answer_call(&alice_fp).unwrap();
 
@@ -1801,4 +1822,128 @@ fn set_transport_is_the_hook_the_platform_layer_uses_after_bootstrapping_tor() {
     // A transport that reports Tor is accepted — this is the actual path
     // `TorHandle::connect`'s `TorTransport` takes.
     assert!(engine.set_transport(Box::new(NullTransport::new())).is_ok());
+}
+
+// --- attachments (D-032) and video calls (D-033) ---------------------------
+
+fn an_attachment(caption: &str) -> void_proto::attachment::Attachment {
+    use void_proto::attachment::{Attachment, AttachmentSecrets};
+    let secrets = AttachmentSecrets::generate().unwrap();
+    Attachment::new(
+        &secrets,
+        250_000,
+        "photo.jpg",
+        "image/jpeg",
+        1600,
+        1200,
+        caption,
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_attachment_pointer_arrives_like_any_message() {
+    // The pointer is one ratchet message on the constant-rate schedule; the
+    // file itself never touches this path.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 81);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 82);
+    let (t, alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let sent = an_attachment("look at this");
+    alice
+        .send_attachment(&bob_fp, sent.clone(), t / 1000)
+        .unwrap();
+    // A pointer is a short message: a record, or four when its ratchet chain
+    // carries an ML-KEM step (D-005) — never anything sized like the file.
+    assert!(alice.outbox_len() <= 4, "{} records", alice.outbox_len());
+
+    let mut got = None;
+    let mut now = t;
+    for _ in 0..40 {
+        alice.tick(now).unwrap();
+        if let TickOutcome::Retrieved(messages) = bob.tick(now).unwrap() {
+            if let Some(m) = messages.into_iter().find(|m| m.attachment.is_some()) {
+                got = Some(m);
+                break;
+            }
+        }
+        now += PAD_INTERVAL_MS;
+    }
+    let got = got.expect("bob should receive the attachment pointer");
+    assert_eq!(got.contact_fingerprint, alice_fp);
+    assert_eq!(got.text, "look at this");
+    let received = got.attachment.unwrap();
+    assert_eq!(
+        received, sent,
+        "every field arrives, key and token included"
+    );
+    assert_eq!(received.blob_id(), sent.blob_id());
+}
+
+#[test]
+fn an_attachment_to_a_contact_whose_key_changed_is_blocked() {
+    // FR-DISC-05 covers files exactly as it covers text.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(0u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 83);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 84);
+    let (bundle, _q) = bob.create_bundle(b"r").unwrap();
+    let bob_fp = alice.start_conversation(&bundle, "Bob", "hi", 0).unwrap();
+
+    let impostor = Identity::from_seeds(&[91u8; 32], &[92u8; 32], &[93u8; 32]);
+    alice
+        .note_key_change(&bob_fp, impostor.public.clone())
+        .unwrap();
+    let before = alice.outbox_len();
+    assert!(matches!(
+        alice.send_attachment(&bob_fp, an_attachment(""), 0),
+        Err(ClientError::ContactKeyChanged)
+    ));
+    assert_eq!(alice.outbox_len(), before, "nothing was queued");
+}
+
+#[test]
+fn an_attachment_pointer_is_indistinguishable_from_a_message_to_the_relay() {
+    // The kind byte is inside the ratchet ciphertext: a pointer and a short
+    // text both leave as one fixed-size record.
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 85);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 86);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    alice
+        .send(&bob_fp, "a short text message", t / 1000)
+        .unwrap();
+    let text_records = alice.outbox_len();
+    let (t, _) = drain(&mut alice, t, 20);
+    alice
+        .send_attachment(&bob_fp, an_attachment(""), t / 1000)
+        .unwrap();
+    assert_eq!(alice.outbox_len(), text_records);
+}
+
+#[test]
+fn a_video_offer_rings_as_a_video_call() {
+    let relay = relay();
+    let clock = Arc::new(Mutex::new(1_000_000u64));
+    let mut alice = engine(Arc::clone(&relay), Arc::clone(&clock), 87);
+    let mut bob = engine(Arc::clone(&relay), Arc::clone(&clock), 88);
+    let (t, _alice_fp, bob_fp) = connect(&relay, &mut alice, &mut bob);
+
+    let call = alice
+        .place_call(&bob_fp, ONION, 9999, true, t / 1000)
+        .unwrap();
+    assert!(call.video);
+    let (_, events, msgs) = until_call_event(&mut alice, &mut bob, t, 40);
+    assert!(msgs.is_empty());
+    match &events[..] {
+        [CallEvent::Incoming(incoming)] => {
+            assert!(incoming.video, "the callee must know to open a video call");
+            assert_eq!(incoming.call_id, call.call_id);
+        }
+        other => panic!("expected one incoming call, got {other:?}"),
+    }
 }

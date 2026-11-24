@@ -80,10 +80,12 @@ struct ProtectionScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 28) {
+                VStack(alignment: .leading, spacing: 24) {
+                    hero
+
                     Text("What Void protects, and what it doesn't")
-                        .font(.largeTitle.bold())
-                        .padding(.top, 24)
+                        .font(.title.bold())
+                        .fixedSize(horizontal: false, vertical: true)
 
                     Text(
                         "Please read this. It is the honest version, and it is short."
@@ -94,14 +96,16 @@ struct ProtectionScreen: View {
                     section(
                         title: "What Void protects",
                         symbol: "checkmark.shield.fill",
-                        tint: .green,
+                        tint: Theme.verified,
+                        bullet: "checkmark.circle.fill",
                         items: protects
                     )
 
                     section(
                         title: "What Void does not protect",
                         symbol: "exclamationmark.triangle.fill",
-                        tint: .orange,
+                        tint: Theme.warning,
+                        bullet: "minus.circle.fill",
                         items: doesNotProtect
                     )
 
@@ -118,15 +122,15 @@ struct ProtectionScreen: View {
             }
 
             if onAcknowledge != nil {
-                Divider()
                 Button(action: { onAcknowledge?() }) {
                     Text(scrolledToEnd ? "I've read this" : "Scroll to the end")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 14)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(PrimaryButtonStyle(tint: scrolledToEnd ? Theme.accent : .secondary))
                 .disabled(!scrolledToEnd)
-                .padding(20)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+                .background(.bar)
+                .animation(.easeInOut(duration: 0.2), value: scrolledToEnd)
             }
         }
         // FR-UI-05 and NFR-COMP-04: this screen must be usable with VoiceOver,
@@ -135,28 +139,62 @@ struct ProtectionScreen: View {
         .accessibilityElement(children: .contain)
     }
 
+    /// Void's mark on deep space: what the app is, before what it does.
+    private var hero: some View {
+        VStack(spacing: 14) {
+            VoidMark(size: 78)
+                .padding(.top, 26)
+            Text("Void")
+                .font(.system(size: 34, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+            Text("Messages, calls and files that go only where you send them — over Tor, end to end.")
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.75))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 26)
+        }
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(Theme.callBackground))
+        .padding(.top, 12)
+        .accessibilityElement(children: .combine)
+    }
+
     private func section(
         title: String,
         symbol: String,
         tint: Color,
+        bullet: String,
         items: [(String, String)]
     ) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 16) {
             Label(title, systemImage: symbol)
-                .font(.title2.bold())
+                .font(.title3.bold())
                 .foregroundStyle(tint)
 
             ForEach(items, id: \.0) { item in
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(item.0).font(.headline)
-                    Text(item.1)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: bullet)
+                        .foregroundStyle(tint)
+                        .padding(.top, 2)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.0).font(.headline)
+                        Text(item.1)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .accessibilityElement(children: .combine)
             }
         }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(tint.opacity(0.07)))
     }
 }
 
@@ -173,8 +211,10 @@ struct DeviceLossScreen: View {
             Spacer(minLength: 20)
 
             Image(systemName: "iphone.slash")
-                .font(.system(size: 44))
-                .foregroundStyle(.orange)
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(Theme.warning)
+                .frame(width: 76, height: 76)
+                .background(Circle().fill(Theme.warning.opacity(0.14)))
 
             Text("If you lose this phone")
                 .font(.largeTitle.bold())
@@ -197,6 +237,9 @@ struct DeviceLossScreen: View {
                 Text("I understand that losing this phone means losing my messages and my identity.")
                     .font(.subheadline)
             }
+            .tint(Theme.accent)
+            .padding(16)
+            .background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground)))
             .padding(.top, 8)
 
             Spacer()
@@ -204,10 +247,8 @@ struct DeviceLossScreen: View {
             VStack(spacing: 12) {
                 Button(action: onSetUpRecovery) {
                     Text("Set up a recovery file")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(PrimaryButtonStyle(tint: understood ? Theme.accent : .secondary))
                 .disabled(!understood)
 
                 // Both options are real choices and are presented as such.
@@ -215,10 +256,12 @@ struct DeviceLossScreen: View {
                 // Persona A, "no recovery file" may be exactly right.
                 Button(action: onAcceptTheRisk) {
                     Text("Continue without one")
+                        .font(.headline)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+                        .padding(.vertical, 14)
                 }
                 .buttonStyle(.bordered)
+                .tint(Theme.accent)
                 .disabled(!understood)
             }
         }
@@ -239,16 +282,21 @@ struct OnboardingFlow: View {
     var onFinished: () -> Void
 
     var body: some View {
-        switch step {
-        case .protection:
-            ProtectionScreen { step = .deviceLoss }
-        case .deviceLoss:
-            DeviceLossScreen(
-                onSetUpRecovery: { step = .done },
-                onAcceptTheRisk: { step = .done }
-            )
-        case .done:
-            Color.clear.onAppear(perform: onFinished)
+        Group {
+            switch step {
+            case .protection:
+                ProtectionScreen { step = .deviceLoss }
+                    .transition(.asymmetric(insertion: .opacity, removal: .move(edge: .leading)))
+            case .deviceLoss:
+                DeviceLossScreen(
+                    onSetUpRecovery: { step = .done },
+                    onAcceptTheRisk: { step = .done }
+                )
+                .transition(.move(edge: .trailing))
+            case .done:
+                Color.clear.onAppear(perform: onFinished)
+            }
         }
+        .animation(.easeInOut(duration: 0.3), value: step)
     }
 }
